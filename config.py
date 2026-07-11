@@ -49,6 +49,49 @@ DURATION_PRESETS = {
 }
 DEFAULT_DURATION_MINUTES = DURATION_PRESETS["medium"]
 
+# Voice gender presets, mapped to ElevenLabs' public premade voice IDs (used when
+# ELEVENLABS_API_KEY is set). gTTS has no gender control, so the free fallback
+# voice is the same regardless of the selection below.
+VOICE_PRESETS = {
+    "female": "21m00Tcm4TlvDq8ikWAM",  # "Rachel" - premade ElevenLabs voice
+    "male": "pNInz6obpgDQGcFmaJgB",    # "Adam" - premade ElevenLabs voice
+}
+DEFAULT_VOICE_GENDER = "female"
+
+# Video style presets: each shapes the narrator's tone (via the script prompt)
+# and the visual treatment (intro/outro color + Ken Burns zoom speed).
+VIDEO_STYLES = {
+    "documentary": {
+        "name": "Documentary",
+        "narrator_style": "a measured, informative documentary narrator building intrigue, "
+                           "similar to Real Stories or History Channel specials",
+        "bg_color": "0x141E30",
+        "zoom_rate": 0.0008,
+    },
+    "cinematic": {
+        "name": "Cinematic / Dramatic",
+        "narrator_style": "a dramatic, suspenseful narrator slowly building tension, "
+                           "similar to true-crime or mystery documentaries",
+        "bg_color": "0x1A1A2E",
+        "zoom_rate": 0.0005,
+    },
+    "motivational": {
+        "name": "Motivational",
+        "narrator_style": "an energetic, inspiring motivational voice, "
+                           "similar to top self-improvement or success channels",
+        "bg_color": "0x8A5A00",
+        "zoom_rate": 0.0012,
+    },
+    "educational": {
+        "name": "Educational / Explainer",
+        "narrator_style": "a friendly, clear narrator explaining things simply, "
+                           "similar to popular science explainer channels",
+        "bg_color": "0x1B4332",
+        "zoom_rate": 0.0007,
+    },
+}
+DEFAULT_VIDEO_STYLE = "documentary"
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")

@@ -26,6 +26,7 @@ from flask import Flask, request, jsonify, render_template_string, send_from_dir
 from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
+    VOICE_PRESETS, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -67,6 +68,25 @@ PAGE = """
     </label>
   </div>
   <div style="margin-bottom:8px">
+    <label>Voiceover:
+      <select id="voiceGender" name="voiceGender">
+        {% for gender in voice_genders %}
+        <option value="{{ gender }}" {% if gender == default_voice_gender %}selected{% endif %}>{{ gender|capitalize }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <small>(gender applies only when ElevenLabs is configured; the free fallback voice is neutral)</small>
+  </div>
+  <div style="margin-bottom:8px">
+    <label>Video style:
+      <select id="videoStyle" name="videoStyle">
+        {% for key, style in video_styles.items() %}
+        <option value="{{ key }}" {% if key == default_video_style %}selected{% endif %}>{{ style.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+  <div style="margin-bottom:8px">
     <label><input type="checkbox" id="includeIntro" checked> Add intro title card</label>
     &nbsp;&nbsp;
     <label><input type="checkbox" id="includeOutro" checked> Add outro / subscribe card</label>
@@ -97,6 +117,8 @@ form.addEventListener("submit", async (e) => {
   const topic = document.getElementById("topic").value;
   const language = document.getElementById("language").value;
   const duration = document.getElementById("duration").value;
+  const voiceGender = document.getElementById("voiceGender").value;
+  const videoStyle = document.getElementById("videoStyle").value;
   const includeIntro = document.getElementById("includeIntro").checked;
   const includeOutro = document.getElementById("includeOutro").checked;
   btn.disabled = true;
@@ -109,6 +131,8 @@ form.addEventListener("submit", async (e) => {
     body: JSON.stringify({
       topic, language,
       duration_minutes: duration,
+      voice_gender: voiceGender,
+      style: videoStyle,
       include_intro: includeIntro,
       include_outro: includeOutro
     })
@@ -163,6 +187,8 @@ def run_pipeline_job(
     topic: str,
     language: str = DEFAULT_LANGUAGE,
     duration_minutes: float = DEFAULT_DURATION_MINUTES,
+    voice_gender: str = DEFAULT_VOICE_GENDER,
+    style: str = DEFAULT_VIDEO_STYLE,
     include_intro: bool = True,
     include_outro: bool = True,
 ):
@@ -171,12 +197,12 @@ def run_pipeline_job(
         work_dir = ensure_work_dir(job_id)
 
         _set_job(job_id, step="script")
-        print(f"[1/4] Generating script for: {topic} (lang={language}, ~{duration_minutes}min)")
-        script = generate_script(topic, language=language, duration_minutes=duration_minutes)
+        print(f"[1/4] Generating script for: {topic} (lang={language}, ~{duration_minutes}min, style={style})")
+        script = generate_script(topic, language=language, duration_minutes=duration_minutes, style=style)
 
         _set_job(job_id, step="audio")
-        print(f"[2/4] Generating narration audio ({len(script['scenes'])} scenes)")
-        script["scenes"] = generate_all_scene_audio(script["scenes"], work_dir, language=language)
+        print(f"[2/4] Generating narration audio ({len(script['scenes'])} scenes, voice={voice_gender})")
+        script["scenes"] = generate_all_scene_audio(script["scenes"], work_dir, language=language, voice_gender=voice_gender)
 
         _set_job(job_id, step="images")
         print("[3/4] Fetching scene images")
@@ -190,6 +216,7 @@ def run_pipeline_job(
             channel_name=CHANNEL_NAME,
             include_intro=include_intro,
             include_outro=include_outro,
+            style=style,
         )
 
         result = {
@@ -223,6 +250,10 @@ def index():
         default_language=DEFAULT_LANGUAGE,
         duration_presets=DURATION_PRESETS,
         default_duration=DEFAULT_DURATION_MINUTES,
+        voice_genders=list(VOICE_PRESETS.keys()),
+        default_voice_gender=DEFAULT_VOICE_GENDER,
+        video_styles=VIDEO_STYLES,
+        default_video_style=DEFAULT_VIDEO_STYLE,
     )
 
 
@@ -236,6 +267,14 @@ def generate_endpoint():
     language = request.form.get("language") or body.get("language") or DEFAULT_LANGUAGE
     if language not in LANGUAGES:
         return jsonify({"error": f"Unsupported language '{language}'"}), 400
+
+    voice_gender = request.form.get("voice_gender") or body.get("voice_gender") or DEFAULT_VOICE_GENDER
+    if voice_gender not in VOICE_PRESETS:
+        return jsonify({"error": f"Unsupported voice_gender '{voice_gender}'"}), 400
+
+    style = request.form.get("style") or body.get("style") or DEFAULT_VIDEO_STYLE
+    if style not in VIDEO_STYLES:
+        return jsonify({"error": f"Unsupported style '{style}'"}), 400
 
     try:
         duration_minutes = float(request.form.get("duration_minutes") or body.get("duration_minutes") or DEFAULT_DURATION_MINUTES)
@@ -259,7 +298,7 @@ def generate_endpoint():
 
     thread = threading.Thread(
         target=run_pipeline_job,
-        args=(job_id, topic, language, duration_minutes, include_intro, include_outro),
+        args=(job_id, topic, language, duration_minutes, voice_gender, style, include_intro, include_outro),
         daemon=True,
     )
     thread.start()

@@ -32,7 +32,7 @@ def _get_audio_duration(audio_path: str) -> float:
     return float(result.stdout.strip())
 
 
-def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height=1080) -> str:
+def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008) -> str:
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
     out_path = os.path.join(clip_dir, f"clip_{index:03d}.mp4")
@@ -49,7 +49,7 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
     # Ken Burns zoom (slow zoom-in) + burned-in caption at the bottom
     vf = (
         f"scale={width * 2}:{height * 2},"
-        f"zoompan=z='min(zoom+0.0008,1.15)':d={total_frames}:s={width}x{height}:fps={fps},"
+        f"zoompan=z='min(zoom+{zoom_rate},1.15)':d={total_frames}:s={width}x{height}:fps={fps},"
         f"drawtext=text='{caption}':fontcolor=white:fontsize=42:borderw=3:bordercolor=black@0.8:"
         f"x=(w-text_w)/2:y=h-160"
     )
@@ -117,12 +117,19 @@ def assemble_video(
     channel_name: str = None,
     include_intro: bool = True,
     include_outro: bool = True,
+    style: str = "documentary",
 ) -> str:
     """
     Builds one clip per scene (plus optional intro/outro title cards for a more
     polished, human-produced feel) and concatenates them into the final MP4.
-    Returns the path to the final video.
+    `style` is a key from config.VIDEO_STYLES controlling the title-card color
+    and Ken Burns zoom speed. Returns the path to the final video.
     """
+    from config import VIDEO_STYLES, DEFAULT_VIDEO_STYLE
+    style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
+    bg_color = style_conf["bg_color"]
+    zoom_rate = style_conf["zoom_rate"]
+
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
 
@@ -135,11 +142,12 @@ def assemble_video(
                 [title or "", subtitle],
                 os.path.join(clip_dir, "intro.mp4"),
                 duration=3.5,
+                bg_color=bg_color,
             )
         )
 
     clip_paths += [
-        _build_scene_clip(scene, i, work_dir) for i, scene in enumerate(scenes)
+        _build_scene_clip(scene, i, work_dir, zoom_rate=zoom_rate) for i, scene in enumerate(scenes)
     ]
 
     if include_outro:
@@ -149,6 +157,7 @@ def assemble_video(
                 ["Thanks for watching!", subtitle],
                 os.path.join(clip_dir, "outro.mp4"),
                 duration=4.0,
+                bg_color=bg_color,
             )
         )
 
