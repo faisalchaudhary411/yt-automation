@@ -102,7 +102,7 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
-                model="openai/gpt-oss-120b",
+                model="qwen/qwen3.6-27b",  # Groq recommended replacement (Aug 2026)
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -117,7 +117,14 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
             else:
                 raise
 
-    raw = response.choices[0].message.content.strip()
+    raw = response.choices[0].message.content
+    if raw is None or not raw.strip():
+        raise RuntimeError(
+            "Groq returned an empty response. "
+            "Check your API key at console.groq.com and try again in a moment."
+        )
+
+    raw = raw.strip()
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
 
     try:
