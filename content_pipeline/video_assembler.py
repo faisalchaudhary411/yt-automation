@@ -37,6 +37,13 @@ FFMPEG_TIMEOUT_SECONDS = 600
 # Length of the dissolve between consecutive clips (intro/scenes/outro).
 CROSSFADE_SECONDS = 0.6
 
+# Faster preset used only for the per-scene/title-card intermediate renders —
+# these get fully re-encoded again during the final crossfade join anyway, so
+# spending extra encode time on them twice isn't worth it. The final join
+# keeps the higher-quality X264_PRESET since that pass determines what the
+# viewer actually sees, and is the one pass that can't be sped up this way.
+INTERMEDIATE_PRESET = "ultrafast"
+
 
 def _run(cmd: list, step_name: str) -> None:
     """
@@ -146,14 +153,20 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
     fontsize = 40
     caption_filters = _caption_filters(scene["narration"], width, fontsize, bottom_margin=90)
 
-    # Ken Burns zoom (slow zoom-in) + boxed, word-wrapped captions at the bottom.
+    # Ken Burns zoom (slow zoom-in) + boxed, word-wrapped captions at the bottom,
+    # then a frozen-frame pad appended at the tail. That pad exists purely so the
+    # crossfade dissolve into the next scene has something silent/static to eat
+    # into — without it, the dissolve blended directly into the last half-second
+    # of this scene's own narration/caption, so the next scene's picture (and
+    # caption) visibly appeared while this scene's voiceover was still speaking.
     # Scale is a modest 1.3x (not 2x) before zoompan — the zoom is subtle enough
     # that the extra resolution wasn't visibly needed, and halving the pixel
     # count here meaningfully cuts encode time.
     vf = (
         f"scale={int(width * 1.3)}:{int(height * 1.3)},"
         f"zoompan=z='min(zoom+{zoom_rate},1.15)':d={total_frames}:s={width}x{height}:fps={fps},"
-        f"{caption_filters}"
+        f"{caption_filters},"
+        f"tpad=stop_mode=clone:stop_duration={CROSSFADE_SECONDS}"
     )
 
     cmd = [
@@ -163,11 +176,13 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
         "-vf", vf,
         # loudnorm brings every scene's narration to the same target loudness,
         # so volume doesn't visibly jump between scenes voiced at slightly
-        # different levels by the TTS engine — a small but noticeable polish
-        # detail on multi-scene videos.
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
+        # different levels by the TTS engine. apad adds silence matching the
+        # video's frozen-frame tail pad above, so the crossfade blends silence
+        # into silence instead of clipping the tail of this scene's speech.
+        "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11,apad=pad_dur={CROSSFADE_SECONDS}",
+        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET,
+        "-t", str(duration + CROSSFADE_SECONDS), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
         out_path,
     ]
@@ -209,7 +224,7 @@ def _build_title_card(
         "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-vf", vf,
-        "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
         out_path,
     ]
