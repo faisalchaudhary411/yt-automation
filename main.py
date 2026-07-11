@@ -20,8 +20,9 @@ import json
 import time
 import uuid
 import threading
+import secrets as pysecrets
 import traceback
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
+from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
 from config import (
     ensure_work_dir, github_write_json, github_read_json,
@@ -32,6 +33,9 @@ from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
 from content_pipeline.image_fetcher import fetch_all_scene_images
 from content_pipeline.video_assembler import assemble_video
+from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL
+from youtube_uploader import upload_video, publish_video
+from telegram_notifier import send_approval_request
 
 app = Flask(__name__)
 
@@ -41,8 +45,9 @@ JOBS_LOCK = threading.Lock()
 
 PAGE = """
 <!doctype html>
-<title>YT Automation - Stage 1</title>
+<title>YT Automation</title>
 <h2>Generate a video draft</h2>
+<p><a href="/authorize" target="_blank">Connect / reconnect YouTube channel</a></p>
 <form id="genForm">
   <div style="margin-bottom:8px">
     <input id="topic" name="topic" style="width:400px" placeholder="e.g. The Tulip Mania bubble of 1637" required>
@@ -108,6 +113,8 @@ const STEP_LABELS = {
   audio: "Generating narration audio…",
   images: "Fetching scene images…",
   video: "Assembling final video (incl. intro/outro)…",
+  uploading: "Uploading to YouTube (private)…",
+  pending_approval: "Uploaded! Check Telegram to approve publishing.",
   done: "Done!",
   error: "Failed."
 };
@@ -153,12 +160,18 @@ async function poll(jobId) {
     const data = await resp.json();
     statusEl.textContent = STEP_LABELS[data.step] || data.step;
 
-    if (data.step === "done") {
+    if (data.step === "done" || data.step === "pending_approval") {
       const r = data.result;
+      let extra = "";
+      if (r.preview_url) {
+        extra = "<p>Uploaded to YouTube as <b>private</b>. A Telegram message with an " +
+                "Approve &amp; Publish button has been sent.<br>" +
+                "Private preview: <a href='" + r.preview_url + "' target='_blank'>" + r.preview_url + "</a></p>";
+      }
       resultEl.innerHTML =
         "<h3>" + r.title + "</h3><p>" + r.description + "</p>" +
         "<video controls width='480' src='" + r.video_url + "'></video><br>" +
-        "<a href='" + r.video_url + "' download>Download MP4</a>";
+        "<a href='" + r.video_url + "' download>Download MP4</a>" + extra;
       btn.disabled = false;
       return;
     }
@@ -228,6 +241,39 @@ def run_pipeline_job(
             "status": "ready_for_review",
         }
 
+        # --- Stage 2: upload as private + Telegram approval gate ---
+        try:
+            _set_job(job_id, step="uploading")
+            print("[5/5] Uploading to YouTube as private")
+            access_token = get_access_token()
+            video_id = upload_video(
+                video_path=video_path,
+                title=script["title"],
+                description=script["description"],
+                tags=script["tags"],
+                access_token=access_token,
+            )
+
+            approval_token = pysecrets.token_urlsafe(16)
+            approve_url = f"{REPL_URL}/approve/{video_id}?token={approval_token}"
+            preview_url = f"https://youtube.com/watch?v={video_id}"
+
+            result.update({
+                "video_id": video_id,
+                "preview_url": preview_url,
+                "status": "pending_approval",
+                "approval_token": approval_token,
+            })
+
+            send_approval_request(script["title"], approve_url, preview_url)
+            job_step = "pending_approval"
+        except Exception as e:
+            # Upload failing shouldn't hide the fact that the video itself rendered fine —
+            # the local file is still downloadable from the UI either way.
+            print(f"Warning: YouTube upload/notify failed ({e}). Video is still available locally.")
+            result["upload_error"] = str(e)
+            job_step = "done"
+
         # Log this draft to the GitHub state repo so nothing is lost between runs
         try:
             history = github_read_json("drafts.json", default=[])
@@ -236,7 +282,7 @@ def run_pipeline_job(
         except Exception as e:
             print(f"Warning: could not log draft to GitHub ({e}). Continuing anyway.")
 
-        _set_job(job_id, step="done", result=result)
+        _set_job(job_id, step=job_step, result=result)
     except Exception as e:
         traceback.print_exc()
         _set_job(job_id, step="error", error=str(e))
@@ -319,6 +365,42 @@ def status_endpoint(job_id):
 def output_file(job_id, filename):
     directory = os.path.join(os.getcwd(), "output", job_id)
     return send_from_directory(directory, filename)
+
+
+@app.route("/authorize")
+def authorize():
+    return redirect(build_authorize_url())
+
+
+@app.route("/oauth2callback")
+def oauth2callback():
+    code = request.args.get("code")
+    if not code:
+        return "Missing 'code' from Google — authorization may have failed.", 400
+    exchange_code_for_tokens(code)
+    return "YouTube channel connected. You can close this tab and return to the app."
+
+
+@app.route("/approve/<video_id>")
+def approve(video_id):
+    submitted_token = request.args.get("token", "")
+
+    history = github_read_json("drafts.json", default=[])
+    matching = [d for d in history if d.get("video_id") == video_id]
+    if not matching:
+        return "No pending draft found for this video ID.", 404
+
+    draft = matching[-1]
+    if not submitted_token or submitted_token != draft.get("approval_token"):
+        return "Invalid or expired approval link.", 403
+
+    access_token = get_access_token()
+    publish_video(video_id, access_token)
+
+    draft["status"] = "published"
+    github_write_json("drafts.json", history, message=f"Mark published: {draft['title']}")
+
+    return f"Published: {draft['title']} - https://youtube.com/watch?v={video_id}"
 
 
 if __name__ == "__main__":
