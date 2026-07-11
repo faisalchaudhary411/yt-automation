@@ -1,41 +1,21 @@
 """
 Turns a topic into a scene-by-scene documentary narration script.
 Each scene has: narration text, an image search keyword, and estimated duration.
-
-The script is generated in chunks of a few scenes at a time (see CHUNK_TARGET_WORDS
-below) rather than as one single Groq request. This matters a lot for two reasons:
-1. Groq's llama-3.3-70b-versatile caps a single response at 8,192 tokens. A 6-10
-   minute script easily needs more output than that in one shot.
-2. Non-Latin scripts (Urdu, Hindi, Arabic, etc.) take roughly 3-5x more tokens per
-   word to encode than English, so a request sized correctly for an English script
-   can silently overflow the token cap for the same word count in Urdu, cutting the
-   JSON off mid-string. Chunking keeps every individual request comfortably under
-   that ceiling no matter which language or how long the target video is.
 """
 
 import json
 import math
 import re
 import time
-from groq import Groq, RateLimitError
+from groq import Groq, RateLimitError, APIError
 from config import (
     GROQ_API_KEY, CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_DURATION_MINUTES,
     VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
 )
 
-# Average narration speaking pace used to size the script. This matters a lot:
-# the actual final video length is whatever edge-tts takes to *speak* the
-# narration text out loud — the "duration_seconds" field written per scene is
-# never enforced anywhere downstream, so the total narration word count is
-# what actually determines final video length.
 WORDS_PER_MINUTE = 150
-MIN_ACCEPTABLE_RATIO = 0.85  # retry a chunk once if it comes in under 85% of its target
-
-# Each Groq request targets at most this many words of new narration. Kept
-# small enough that even Urdu/Hindi/Arabic-level token density stays well
-# under Groq's 8,192-token response cap, with room to spare for JSON syntax
-# and the image_keywords/duration_seconds fields.
-CHUNK_TARGET_WORDS = 120
+MIN_ACCEPTABLE_RATIO = 0.85
+CHUNK_TARGET_WORDS = 100  # smaller = safer against truncation
 
 
 def _target_word_count(duration_minutes: float) -> int:
@@ -43,7 +23,6 @@ def _target_word_count(duration_minutes: float) -> int:
 
 
 def _scene_count_for_words(word_budget: int) -> tuple:
-    # Roughly 50-90 words per scene (~20-35s of narration at ~150 words/min).
     scene_low = max(2, round(word_budget / 90))
     scene_high = max(scene_low + 1, round(word_budget / 50))
     return scene_low, scene_high
@@ -105,11 +84,9 @@ def _count_narration_words(scenes: list) -> int:
 
 def _repair_json(raw: str) -> str:
     """Attempt to repair truncated JSON by closing open strings/brackets."""
-    # Close unterminated strings
     if raw.count('"') % 2 != 0:
         raw = raw + '"'
 
-    # Close open arrays/objects
     open_brackets = raw.count('[') - raw.count(']')
     open_braces = raw.count('{') - raw.count('}')
     for _ in range(open_brackets):
@@ -117,7 +94,6 @@ def _repair_json(raw: str) -> str:
     for _ in range(open_braces):
         raw = raw + '}'
 
-    # Remove trailing commas before closing brackets/braces
     raw = re.sub(r',\s*([\}\]])', r'\1', raw)
     return raw
 
@@ -131,7 +107,7 @@ def _extract_scenes_from_truncated(raw: str) -> list:
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    # Fallback: extract using regex (handles escaped quotes)
+    # Fallback: extract using regex
     scenes = []
     narrations = re.findall(r'"narration"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
     keywords = re.findall(r'"image_keywords"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
@@ -150,42 +126,31 @@ def _extract_scenes_from_truncated(raw: str) -> list:
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
     for attempt in range(3):
         try:
-            # Use max_completion_tokens (new standard). gpt-oss-120b supports 65,536.
             response = client.chat.completions.create(
-                model="openai/gpt-oss-120b",
+                model="qwen/qwen3.6-27b",  # Confirmed working on Groq free tier
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.8,
-                max_completion_tokens=max_tokens,
+                max_tokens=max_tokens,
             )
             break
-        except TypeError as e:
-            # Older groq SDK doesn't know max_completion_tokens — fall back to max_tokens
-            if "max_completion_tokens" in str(e):
-                response = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content},
-                    ],
-                    temperature=0.8,
-                    max_tokens=max_tokens,
-                )
-                break
-            raise
         except RateLimitError:
             if attempt < 2:
                 time.sleep(8 + attempt * 4)
             else:
                 raise
+        except APIError as e:
+            # Catch auth errors, model not found, etc.
+            raise RuntimeError(f"Groq API error: {e}")
 
     raw = response.choices[0].message.content
     if raw is None or not raw.strip():
         raise RuntimeError(
             "Groq returned an empty response. "
-            "Check your API key at console.groq.com and try again in a moment."
+            "Your API key may not have access to qwen/qwen3.6-27b. "
+            "Verify your key at console.groq.com"
         )
 
     raw = raw.strip()
@@ -227,8 +192,8 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    # gpt-oss-120b supports 65,536 completion tokens — use a generous amount
-    max_tokens = 20000
+    # qwen/qwen3.6-27b supports 32,768 completion tokens. Use 12,000 for safety.
+    max_tokens = 12000
 
     if is_first_chunk:
         user_content = f"Topic: {topic}"
@@ -259,7 +224,7 @@ def _generate_scenes_chunk(
             if "scenes" in retry_part and _count_narration_words(retry_part["scenes"]) > actual_words:
                 part = retry_part
         except RuntimeError:
-            pass  # keep the first attempt rather than fail the whole job over one retry hiccup
+            pass
 
     return part
 
@@ -270,13 +235,6 @@ def generate_script(
     duration_minutes: float = DEFAULT_DURATION_MINUTES,
     style: str = DEFAULT_VIDEO_STYLE,
 ) -> dict:
-    """
-    topic: e.g. "Spain's 16th century silver defaults"
-    language: a language code from config.LANGUAGES (e.g. "en", "es", "hi", "ur")
-    duration_minutes: target length of the narration, in minutes
-    style: a key from config.VIDEO_STYLES (e.g. "documentary", "cinematic")
-    Returns a dict with title, description, tags, and a list of scenes.
-    """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in Replit Secrets.")
 
@@ -286,10 +244,10 @@ def generate_script(
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    # Call 1: Metadata only (title, description, tags) — small, never overflows
+    # Call 1: Metadata only
     metadata = _generate_metadata(client, topic, language_name, style)
 
-    # Call 2+: Scenes only — no metadata overhead, full token budget for narration
+    # Call 2+: Scenes only
     all_scenes = []
     remaining_words = total_target_words
 
@@ -319,6 +277,26 @@ def generate_script(
         "tags": metadata["tags"],
         "scenes": all_scenes,
     }
+
+
+def test_groq_key():
+    """Run this to verify your API key and model access."""
+    import os
+    key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY)
+    if not key:
+        print("No GROQ_API_KEY found!")
+        return
+
+    client = Groq(api_key=key)
+    try:
+        response = client.chat.completions.create(
+            model="qwen/qwen3.6-27b",
+            messages=[{"role": "user", "content": "Say hello"}],
+            max_tokens=50,
+        )
+        print("API key works! Response:", response.choices[0].message.content)
+    except Exception as e:
+        print("API key FAILED:", type(e).__name__, str(e))
 
 
 if __name__ == "__main__":
