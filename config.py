@@ -5,11 +5,13 @@ committed to a GitHub repo via the Contents API.
 
 Required Replit Secrets:
   GROQ_API_KEY        - Groq API key (script generation)
-  ELEVENLABS_API_KEY  - optional, for premium narration voice
   PEXELS_API_KEY      - free, for stock visuals
   GITHUB_TOKEN        - a fine-grained PAT with contents:write on your state repo
   GITHUB_REPO         - e.g. "yourusername/yt-automation-state"
   GITHUB_BRANCH       - defaults to "main"
+
+Narration voice is generated with edge-tts (free, no API key, supports male/female
+neural voices per language) — see EDGE_VOICES below.
 """
 
 import os
@@ -18,12 +20,11 @@ import base64
 import requests
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
 CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "WealthThroughAges")
 
-# Narration languages offered in the UI. Keys are gTTS language codes (also used
+# Narration languages offered in the UI. Keys are standard language codes (also used
 # to tell Groq which language to write the script in via their display name).
 LANGUAGES = {
     "en": "English",
@@ -49,12 +50,21 @@ DURATION_PRESETS = {
 }
 DEFAULT_DURATION_MINUTES = DURATION_PRESETS["medium"]
 
-# Voice gender presets, mapped to ElevenLabs' public premade voice IDs (used when
-# ELEVENLABS_API_KEY is set). gTTS has no gender control, so the free fallback
-# voice is the same regardless of the selection below.
-VOICE_PRESETS = {
-    "female": "21m00Tcm4TlvDq8ikWAM",  # "Rachel" - premade ElevenLabs voice
-    "male": "pNInz6obpgDQGcFmaJgB",    # "Adam" - premade ElevenLabs voice
+# Voice gender presets, mapped to Microsoft Edge TTS neural voices (free, no API
+# key required, one male + one female per supported language).
+EDGE_VOICES = {
+    "en": {"female": "en-US-AriaNeural", "male": "en-US-GuyNeural"},
+    "es": {"female": "es-ES-ElviraNeural", "male": "es-ES-AlvaroNeural"},
+    "fr": {"female": "fr-FR-DeniseNeural", "male": "fr-FR-HenriNeural"},
+    "de": {"female": "de-DE-KatjaNeural", "male": "de-DE-ConradNeural"},
+    "pt": {"female": "pt-BR-FranciscaNeural", "male": "pt-BR-AntonioNeural"},
+    "hi": {"female": "hi-IN-SwaraNeural", "male": "hi-IN-MadhurNeural"},
+    "ur": {"female": "ur-PK-UzmaNeural", "male": "ur-PK-AsadNeural"},
+    "ar": {"female": "ar-SA-ZariyahNeural", "male": "ar-SA-HamedNeural"},
+    "tr": {"female": "tr-TR-EmelNeural", "male": "tr-TR-AhmetNeural"},
+    "ru": {"female": "ru-RU-SvetlanaNeural", "male": "ru-RU-DmitryNeural"},
+    "it": {"female": "it-IT-ElsaNeural", "male": "it-IT-DiegoNeural"},
+    "id": {"female": "id-ID-GadisNeural", "male": "id-ID-ArdiNeural"},
 }
 DEFAULT_VOICE_GENDER = "female"
 

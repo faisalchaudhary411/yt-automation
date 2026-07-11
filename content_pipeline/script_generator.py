@@ -51,7 +51,7 @@ def generate_script(
 ) -> dict:
     """
     topic: e.g. "Spain's 16th century silver defaults"
-    language: a gTTS-style language code from config.LANGUAGES (e.g. "en", "es", "hi")
+    language: a language code from config.LANGUAGES (e.g. "en", "es", "hi")
     duration_minutes: target length of the narration, in minutes
     style: a key from config.VIDEO_STYLES (e.g. "documentary", "cinematic")
     Returns a dict with title, description, tags, and a list of scenes.

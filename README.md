@@ -1,6 +1,6 @@
 # YouTube Automation — Stage 1 (Content Generation)
 
-Topic → Script (Groq) → Voiceover (ElevenLabs/gTTS) → Images (Pexels) → Final MP4 (FFmpeg).
+Topic → Script (Groq) → Voiceover (edge-tts) → Images (Pexels) → Final MP4 (FFmpeg).
 
 ## Setup on Replit
 
@@ -18,8 +18,6 @@ Topic → Script (Groq) → Voiceover (ElevenLabs/gTTS) → Images (Pexels) → 
 3. In the Repl's **Secrets** tab (padlock icon), add:
    - `GROQ_API_KEY` — from console.groq.com
    - `PEXELS_API_KEY` — free, from pexels.com/api
-   - `ELEVENLABS_API_KEY` — optional, only if you want premium narration
-   - `ELEVENLABS_VOICE_ID` — optional, your cloned voice ID
    - `GITHUB_TOKEN` — a fine-grained personal access token with contents:read/write
      on a small repo you create just for this (e.g. `yt-automation-state`)
    - `GITHUB_REPO` — e.g. `yourusername/yt-automation-state`
@@ -41,8 +39,9 @@ Topic → Script (Groq) → Voiceover (ElevenLabs/gTTS) → Images (Pexels) → 
   so nothing is lost if the Repl restarts.
 
 ## Notes
-- First run will take a few minutes (script + ~15 audio clips + ~15 images + video render).
-- If ElevenLabs isn't configured, narration automatically falls back to free Google TTS (gTTS) —
-  lower quality but works with zero extra setup.
+- Narration uses edge-tts (Microsoft's free neural TTS, no API key needed) with a male and
+  female neural voice for each supported language.
+- Scene audio, images, and video clips are all generated concurrently, so total generation
+  time is well under the sum of each step's time — see `replit.md` for current benchmarks.
 - Nothing here uploads to YouTube yet. Review the MP4 first — Stage 2 (upload with your
   approval step) comes next once you're happy with the video quality/style.

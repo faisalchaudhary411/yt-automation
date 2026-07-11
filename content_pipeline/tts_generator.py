@@ -1,74 +1,64 @@
 """
-Generates narration audio for each scene.
-Tries ElevenLabs first (better quality, uses your existing voice clone if you have one).
-Falls back to gTTS (free, no API key) if ElevenLabs isn't configured or fails.
+Generates narration audio for each scene using edge-tts (Microsoft Edge's free,
+no-API-key neural TTS). Supports one male + one female neural voice per
+supported language, unlike gTTS which has no gender control.
+
+Scenes are generated concurrently (I/O-bound network calls) to keep total
+generation time low on longer videos.
 """
 
 import os
-import requests
-from gtts import gTTS
-from config import ELEVENLABS_API_KEY, DEFAULT_LANGUAGE, VOICE_PRESETS, DEFAULT_VOICE_GENDER
+import asyncio
+import edge_tts
+from concurrent.futures import ThreadPoolExecutor
+from config import EDGE_VOICES, DEFAULT_LANGUAGE, DEFAULT_VOICE_GENDER
 
-# Falls back to a custom cloned voice ID (env var) if set and no gender preset matches.
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
-ELEVENLABS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-
-
-def _tts_elevenlabs(text: str, out_path: str, voice_gender: str = DEFAULT_VOICE_GENDER) -> bool:
-    voice_id = VOICE_PRESETS.get(voice_gender) or ELEVENLABS_VOICE_ID
-    if not ELEVENLABS_API_KEY or not voice_id:
-        return False
-
-    url = ELEVENLABS_URL.format(voice_id=voice_id)
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-    }
-    resp = requests.post(url, headers=headers, json=payload)
-    if resp.status_code != 200:
-        return False
-
-    with open(out_path, "wb") as f:
-        f.write(resp.content)
-    return True
+MAX_CONCURRENT_TTS = 6
 
 
-def _tts_gtts(text: str, out_path: str, language: str = DEFAULT_LANGUAGE):
-    tts = gTTS(text=text, lang=language)
-    tts.save(out_path)
+def _resolve_voice(language: str, voice_gender: str) -> str:
+    lang_voices = EDGE_VOICES.get(language, EDGE_VOICES[DEFAULT_LANGUAGE])
+    return lang_voices.get(voice_gender) or lang_voices.get(DEFAULT_VOICE_GENDER)
+
+
+async def _tts_edge_async(text: str, out_path: str, voice: str):
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(out_path)
 
 
 def generate_scene_audio(text: str, out_path: str, language: str = DEFAULT_LANGUAGE, voice_gender: str = DEFAULT_VOICE_GENDER):
-    """Writes an mp3 to out_path. Tries ElevenLabs, falls back to gTTS.
+    """Writes an mp3 to out_path using edge-tts."""
+    voice = _resolve_voice(language, voice_gender)
+    asyncio.run(_tts_edge_async(text, out_path, voice))
 
-    ElevenLabs' multilingual model auto-detects the language from the text itself,
-    so `language` (a gTTS-style code) is only used for the gTTS fallback path.
-    `voice_gender` picks between ElevenLabs' male/female preset voices; gTTS has
-    no gender control, so the free fallback voice sounds the same either way.
-    """
-    ok = _tts_elevenlabs(text, out_path, voice_gender)
-    if not ok:
-        _tts_gtts(text, out_path, language)
+
+async def _generate_all_async(scenes: list, audio_dir: str, language: str, voice_gender: str):
+    voice = _resolve_voice(language, voice_gender)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
+
+    async def run_one(i, scene):
+        out_path = os.path.join(audio_dir, f"scene_{i:03d}.mp3")
+        async with semaphore:
+            await _tts_edge_async(scene["narration"], out_path, voice)
+        scene["audio_path"] = out_path
+
+    await asyncio.gather(*(run_one(i, scene) for i, scene in enumerate(scenes)))
 
 
 def generate_all_scene_audio(scenes: list, work_dir: str, language: str = DEFAULT_LANGUAGE, voice_gender: str = DEFAULT_VOICE_GENDER) -> list:
     """
     scenes: list of scene dicts from script_generator (each with "narration")
-    language: gTTS-style language code (used for the free fallback voice)
-    voice_gender: "male" or "female" (only affects ElevenLabs narration)
-    Returns the same list with an added "audio_path" key per scene.
+    language: language code from config.LANGUAGES
+    voice_gender: "male" or "female" — picks an edge-tts neural voice for that language
+    Returns the same list with an added "audio_path" key per scene, generated concurrently.
     """
     audio_dir = os.path.join(work_dir, "audio")
     os.makedirs(audio_dir, exist_ok=True)
 
-    for i, scene in enumerate(scenes):
-        out_path = os.path.join(audio_dir, f"scene_{i:03d}.mp3")
-        generate_scene_audio(scene["narration"], out_path, language, voice_gender)
-        scene["audio_path"] = out_path
+    # Run the async batch on its own thread so this stays a plain sync function
+    # callable from the pipeline thread (which already has no running event loop,
+    # but this keeps it safe if that ever changes).
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(lambda: asyncio.run(_generate_all_async(scenes, audio_dir, language, voice_gender))).result()
 
     return scenes

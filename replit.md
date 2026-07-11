@@ -21,7 +21,7 @@ Nothing here uploads to YouTube yet — Stage 2 (upload) comes later.
 ## Generation options (web UI)
 - **Language** — narration language for the script + voiceover (English, Spanish, French, German, Portuguese, Hindi, Urdu, Arabic, Turkish, Russian, Italian, Indonesian). See `config.LANGUAGES`.
 - **Video length** — Short (~3 min) / Medium (~6 min) / Long (~10 min); steers scene count and pacing in the script prompt.
-- **Voiceover gender** — Male/Female. Only affects narration when `ELEVENLABS_API_KEY` is set (maps to ElevenLabs' premade "Adam"/"Rachel" voices in `config.VOICE_PRESETS`); the free gTTS fallback has no gender control, so both sound the same without ElevenLabs.
+- **Voiceover gender** — Male/Female, fully supported for free via edge-tts (Microsoft's neural TTS) — see `config.EDGE_VOICES` for the voice picked per language/gender.
 - **Video style** — Documentary / Cinematic / Motivational / Educational (`config.VIDEO_STYLES`). Changes the narrator's tone in the script prompt, the intro/outro title-card color, and the Ken Burns zoom speed.
 - **Intro/outro toggles** — add a title-card intro (video title) and an outro ("Thanks for watching, subscribe to `CHANNEL_NAME`") for a more polished, less obviously AI-generated feel. `CHANNEL_NAME` env var controls the name used (defaults to "WealthThroughAges").
 
@@ -31,9 +31,15 @@ Required:
 - `PEXELS_API_KEY` — stock images (configured)
 
 Optional (app degrades gracefully without these):
-- `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` — premium narration voice; falls back to free gTTS if unset. When set, the UI's male/female selection picks ElevenLabs' preset voice IDs rather than `ELEVENLABS_VOICE_ID`.
 - `GITHUB_TOKEN` / `GITHUB_REPO` / `GITHUB_BRANCH` — logs each draft as a row in `drafts.json` in a GitHub repo; without these the app just prints a warning and continues (no draft history is kept)
 - `CHANNEL_NAME` — used in intro/outro cards and the script prompt; defaults to "WealthThroughAges"
+
+Narration no longer needs any secret — it's generated with edge-tts (free, no API key), which replaced both gTTS and the earlier ElevenLabs integration.
+
+## Notes / performance & quality fixes (2026-07-11)
+- **Generation speed**: a 6-min video was taking 15+ minutes because narration TTS, scene image downloads, and per-scene ffmpeg encodes all ran strictly sequentially. Parallelized all three: TTS (edge-tts) and image fetches (Pexels) now run concurrently via asyncio/ThreadPoolExecutor since they're network I/O, and scene video clips render concurrently too (CPU-bound but still benefits on a multi-core box). Also switched ffmpeg's x264 encode preset from the default "medium" to "veryfast" and reduced the pre-zoompan upscale from 2x to 1.3x resolution (the Ken Burns zoom didn't visibly need the extra pixels). A 3-min video now finishes in ~2 minutes end-to-end.
+- **Subtitle bug**: captions were rendered as one unbroken drawtext line for the whole scene's narration, so long lines ran off-screen and only a fragment was ever visible. Fixed by word-wrapping narration into up to 3 lines sized to fit the frame width, each rendered as its own drawtext filter (ffmpeg's drawtext does not reliably honor an embedded "\n" as a newline — chaining separate drawtext filters per line is the only escaping-safe way to get multi-line captions), with a semi-transparent background box for readability over busy photos.
+- **Voice engine**: replaced both gTTS (no gender control) and the ElevenLabs integration (a paid API) with edge-tts — Microsoft's free, keyless neural TTS. `config.EDGE_VOICES` maps each supported language to one male + one female neural voice, so gender selection now works with zero API key setup.
 
 ## Notes / fixes made during import setup
 - The `content_pipeline` module directory was imported as `content-pipeline` (hyphen), which doesn't match Python import syntax used in `main.py`. Renamed to `content_pipeline` (underscore).

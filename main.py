@@ -26,7 +26,7 @@ from flask import Flask, request, jsonify, render_template_string, send_from_dir
 from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
-    VOICE_PRESETS, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
+    EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -75,7 +75,7 @@ PAGE = """
         {% endfor %}
       </select>
     </label>
-    <small>(gender applies only when ElevenLabs is configured; the free fallback voice is neutral)</small>
+    <small>(free edge-tts neural voice — male/female both fully supported)</small>
   </div>
   <div style="margin-bottom:8px">
     <label>Video style:
@@ -250,7 +250,7 @@ def index():
         default_language=DEFAULT_LANGUAGE,
         duration_presets=DURATION_PRESETS,
         default_duration=DEFAULT_DURATION_MINUTES,
-        voice_genders=list(VOICE_PRESETS.keys()),
+        voice_genders=["female", "male"],
         default_voice_gender=DEFAULT_VOICE_GENDER,
         video_styles=VIDEO_STYLES,
         default_video_style=DEFAULT_VIDEO_STYLE,
@@ -269,7 +269,7 @@ def generate_endpoint():
         return jsonify({"error": f"Unsupported language '{language}'"}), 400
 
     voice_gender = request.form.get("voice_gender") or body.get("voice_gender") or DEFAULT_VOICE_GENDER
-    if voice_gender not in VOICE_PRESETS:
+    if voice_gender not in ("female", "male"):
         return jsonify({"error": f"Unsupported voice_gender '{voice_gender}'"}), 400
 
     style = request.form.get("style") or body.get("style") or DEFAULT_VIDEO_STYLE

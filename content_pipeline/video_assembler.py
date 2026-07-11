@@ -12,6 +12,17 @@ or simply enable it via Replit's "Nix" packages panel).
 import os
 import subprocess
 import re
+import textwrap
+from concurrent.futures import ThreadPoolExecutor
+
+# Scene clips are CPU-bound (ffmpeg encode); a couple of workers helps even on
+# a 2-core box since ffmpeg itself doesn't saturate a core the whole time.
+MAX_CONCURRENT_CLIPS = 3
+
+# x264 encode speed preset for clip/title-card rendering. "veryfast" trades a
+# little file-size efficiency for a large wall-clock speedup versus the
+# libx264 default ("medium") — this draft pipeline optimizes for turnaround.
+X264_PRESET = "veryfast"
 
 
 def _escape_for_drawtext(text: str) -> str:
@@ -19,6 +30,48 @@ def _escape_for_drawtext(text: str) -> str:
     text = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\u2019")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _wrap_caption_lines(text: str, width: int, fontsize: int, max_chars_per_line: int = None) -> list:
+    """
+    Wraps narration text into a list of lines so drawtext never renders one
+    giant line that overflows off-screen (previously the whole scene's
+    narration was drawn as a single unbroken line, so only a fragment of it
+    was ever visible on screen, cut off mid-word). ffmpeg's drawtext filter
+    does not reliably honor an embedded "\\n" as a newline in this build, so
+    each line is rendered as its own chained drawtext filter instead (see
+    `_caption_filters`).
+    """
+    if max_chars_per_line is None:
+        # Rough estimate: a bold-ish sans glyph averages ~0.55x fontsize wide.
+        max_chars_per_line = max(20, int(width * 0.9 / (fontsize * 0.55)))
+    lines = textwrap.wrap(text, width=max_chars_per_line, break_long_words=False)
+    if not lines:
+        lines = [text]
+    # Cap at 3 lines so captions never eat too much of the frame; if the
+    # narration is longer than that it still reads fine without every word.
+    return lines[:3]
+
+
+def _caption_filters(text: str, width: int, fontsize: int, bottom_margin: int) -> str:
+    """
+    Builds a chain of drawtext filters (one per wrapped line), stacked upward
+    from `bottom_margin` pixels above the bottom edge, each with its own
+    semi-transparent background box for readability over busy photos.
+    """
+    lines = _wrap_caption_lines(text, width, fontsize)
+    line_height = fontsize + 22
+    filters = []
+    # Lines are drawn from the bottom line up, so the last wrapped line sits
+    # closest to bottom_margin and earlier lines stack above it.
+    for i, line in enumerate(reversed(lines)):
+        y_from_bottom = bottom_margin + i * line_height
+        filters.append(
+            f"drawtext=text='{_escape_for_drawtext(line)}':fontcolor=white:fontsize={fontsize}:"
+            f"box=1:boxcolor=black@0.55:boxborderw=12:"
+            f"x=(w-text_w)/2:y=h-{y_from_bottom}"
+        )
+    return ",".join(reversed(filters))
 
 
 def _get_audio_duration(audio_path: str) -> float:
@@ -44,14 +97,17 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
     fps = 30
     total_frames = int(duration * fps)
 
-    caption = _escape_for_drawtext(scene["narration"])
+    fontsize = 40
+    caption_filters = _caption_filters(scene["narration"], width, fontsize, bottom_margin=90)
 
-    # Ken Burns zoom (slow zoom-in) + burned-in caption at the bottom
+    # Ken Burns zoom (slow zoom-in) + boxed, word-wrapped captions at the bottom.
+    # Scale is a modest 1.3x (not 2x) before zoompan — the zoom is subtle enough
+    # that the extra resolution wasn't visibly needed, and halving the pixel
+    # count here meaningfully cuts encode time.
     vf = (
-        f"scale={width * 2}:{height * 2},"
+        f"scale={int(width * 1.3)}:{int(height * 1.3)},"
         f"zoompan=z='min(zoom+{zoom_rate},1.15)':d={total_frames}:s={width}x{height}:fps={fps},"
-        f"drawtext=text='{caption}':fontcolor=white:fontsize=42:borderw=3:bordercolor=black@0.8:"
-        f"x=(w-text_w)/2:y=h-160"
+        f"{caption_filters}"
     )
 
     cmd = [
@@ -59,7 +115,7 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
         "-loop", "1", "-i", scene["image_path"],
         "-i", scene["audio_path"],
         "-vf", vf,
-        "-c:v", "libx264", "-t", str(duration), "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", "44100", "-shortest",
         out_path,
     ]
@@ -101,7 +157,7 @@ def _build_title_card(
         "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-vf", vf,
-        "-c:v", "libx264", "-t", str(duration), "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", "44100", "-shortest",
         out_path,
     ]
@@ -146,9 +202,18 @@ def assemble_video(
             )
         )
 
-    clip_paths += [
-        _build_scene_clip(scene, i, work_dir, zoom_rate=zoom_rate) for i, scene in enumerate(scenes)
-    ]
+    # Scene clips are independent of each other, so render them concurrently —
+    # this is the single biggest win for total generation time on longer videos.
+    scene_clip_paths = [None] * len(scenes)
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLIPS) as executor:
+        futures = {
+            executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate): i
+            for i, scene in enumerate(scenes)
+        }
+        for future in futures:
+            i = futures[future]
+            scene_clip_paths[i] = future.result()
+    clip_paths += scene_clip_paths
 
     if include_outro:
         subtitle = f"Subscribe to {channel_name} for more" if channel_name else "Subscribe for more stories like this"
