@@ -32,3 +32,9 @@ outputType = "webview"
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[userenv]
+
+[userenv.shared]
+GITHUB_BRANCH = "main"
+GITHUB_REPO = "faisalchaudhary411/yt-lite"
