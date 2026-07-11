@@ -119,6 +119,8 @@ def generate_script(
 
     script = _call_groq(client, system_prompt, f"Topic: {topic}", max_tokens)
     actual_words = _count_narration_words(script["scenes"])
+    print(f"[script_generator] target={target_words} words, first attempt={actual_words} words "
+          f"({len(script['scenes'])} scenes)")
 
     # If the model undershot noticeably, retry once with an explicit callback
     # telling it exactly how short it was. This is what actually fixes the
@@ -140,10 +142,16 @@ def generate_script(
                 max_tokens,
             )
             retry_words = _count_narration_words(retry_script["scenes"])
+            print(f"[script_generator] retry attempt={retry_words} words "
+                  f"({len(retry_script['scenes'])} scenes)")
             if retry_words > actual_words:
                 script, actual_words = retry_script, retry_words
-        except RuntimeError:
-            pass  # keep the first script rather than fail the whole job over a retry hiccup
+        except RuntimeError as e:
+            print(f"[script_generator] retry failed, keeping first attempt: {e}")
+
+    if actual_words < target_words * MIN_ACCEPTABLE_RATIO:
+        print(f"[script_generator] WARNING: final script still short — {actual_words}/{target_words} words, "
+              f"video will run shorter than the selected preset.")
 
     return script
 
