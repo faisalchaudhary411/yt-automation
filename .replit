@@ -38,3 +38,7 @@ externalPort = 80
 [userenv.shared]
 GITHUB_BRANCH = "main"
 GITHUB_REPO = "faisalchaudhary411/yt-lite"
+
+[deployment]
+deploymentTarget = "vm"
+run = ["python3", "main.py"]
