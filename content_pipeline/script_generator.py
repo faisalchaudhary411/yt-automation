@@ -1,6 +1,5 @@
 """
 Turns a topic into a scene-by-scene documentary narration script.
-Each scene has: narration text, an image search keyword, and estimated duration.
 """
 
 import json
@@ -15,7 +14,7 @@ from config import (
 
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
-CHUNK_TARGET_WORDS = 100  # smaller = safer against truncation
+CHUNK_TARGET_WORDS = 80  # Small chunks = never hit token ceiling
 
 
 def _target_word_count(duration_minutes: float) -> int:
@@ -69,6 +68,7 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
   ]
 }}
 
+CRITICAL: Do NOT include title, description, or tags. Only include the "scenes" array.
 CRITICAL LENGTH REQUIREMENT: the combined narration across every scene in THIS response \
 must add up to approximately {word_budget} words in total (aim for {word_budget}-\
 {int(word_budget * 1.15)} words — never less). Use {scene_low}-{scene_high} scenes to hit \
@@ -107,7 +107,6 @@ def _extract_scenes_from_truncated(raw: str) -> list:
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    # Fallback: extract using regex
     scenes = []
     narrations = re.findall(r'"narration"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
     keywords = re.findall(r'"image_keywords"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
@@ -124,33 +123,44 @@ def _extract_scenes_from_truncated(raw: str) -> list:
 
 
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
+    # Build kwargs with new API parameters
+    kwargs = {
+        "model": "llama-3.3-70b-versatile",  # 32,768 tokens, proven to work
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.7,
+        "max_completion_tokens": max_tokens,
+        "response_format": {"type": "json_object"},  # Forces valid JSON output
+    }
+
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(
-                model="qwen/qwen3.6-27b",  # Confirmed working on Groq free tier
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.8,
-                max_tokens=max_tokens,
-            )
+            response = client.chat.completions.create(**kwargs)
             break
+        except TypeError as e:
+            # Older groq SDK fallback (no response_format or max_completion_tokens)
+            if "max_completion_tokens" in str(e) or "response_format" in str(e):
+                kwargs.pop("max_completion_tokens", None)
+                kwargs.pop("response_format", None)
+                kwargs["max_tokens"] = max_tokens
+                response = client.chat.completions.create(**kwargs)
+                break
+            raise
         except RateLimitError:
             if attempt < 2:
                 time.sleep(8 + attempt * 4)
             else:
                 raise
         except APIError as e:
-            # Catch auth errors, model not found, etc.
             raise RuntimeError(f"Groq API error: {e}")
 
     raw = response.choices[0].message.content
     if raw is None or not raw.strip():
         raise RuntimeError(
             "Groq returned an empty response. "
-            "Your API key may not have access to qwen/qwen3.6-27b. "
-            "Verify your key at console.groq.com"
+            "Check your API key and model access at console.groq.com"
         )
 
     raw = raw.strip()
@@ -192,7 +202,7 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    # qwen/qwen3.6-27b supports 32,768 completion tokens. Use 12,000 for safety.
+    # llama-3.3-70b-versatile now supports 32,768 completion tokens
     max_tokens = 12000
 
     if is_first_chunk:
@@ -277,26 +287,6 @@ def generate_script(
         "tags": metadata["tags"],
         "scenes": all_scenes,
     }
-
-
-def test_groq_key():
-    """Run this to verify your API key and model access."""
-    import os
-    key = os.environ.get("GROQ_API_KEY", GROQ_API_KEY)
-    if not key:
-        print("No GROQ_API_KEY found!")
-        return
-
-    client = Groq(api_key=key)
-    try:
-        response = client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
-            messages=[{"role": "user", "content": "Say hello"}],
-            max_tokens=50,
-        )
-        print("API key works! Response:", response.choices[0].message.content)
-    except Exception as e:
-        print("API key FAILED:", type(e).__name__, str(e))
 
 
 if __name__ == "__main__":
