@@ -14,7 +14,7 @@ from config import (
 
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
-CHUNK_TARGET_WORDS = 80  # Small chunks = never hit token ceiling
+CHUNK_TARGET_WORDS = 80
 
 
 def _target_word_count(duration_minutes: float) -> int:
@@ -83,23 +83,19 @@ def _count_narration_words(scenes: list) -> int:
 
 
 def _repair_json(raw: str) -> str:
-    """Attempt to repair truncated JSON by closing open strings/brackets."""
     if raw.count('"') % 2 != 0:
         raw = raw + '"'
-
     open_brackets = raw.count('[') - raw.count(']')
     open_braces = raw.count('{') - raw.count('}')
     for _ in range(open_brackets):
         raw = raw + ']'
     for _ in range(open_braces):
         raw = raw + '}'
-
     raw = re.sub(r',\s*([\}\]])', r'\1', raw)
     return raw
 
 
 def _extract_scenes_from_truncated(raw: str) -> list:
-    """Try to extract partial scene data from a truncated JSON response."""
     try:
         repaired = _repair_json(raw)
         data = json.loads(repaired)
@@ -123,31 +119,19 @@ def _extract_scenes_from_truncated(raw: str) -> list:
 
 
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    # Build kwargs with new API parameters
-    kwargs = {
-        "model": "llama-3.3-70b-versatile",  # 32,768 tokens, proven to work
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0.7,
-        "max_completion_tokens": max_tokens,
-        "response_format": {"type": "json_object"},  # Forces valid JSON output
-    }
-
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.7,
+                max_completion_tokens=max_tokens,
+                response_format={"type": "json_object"},
+            )
             break
-        except TypeError as e:
-            # Older groq SDK fallback (no response_format or max_completion_tokens)
-            if "max_completion_tokens" in str(e) or "response_format" in str(e):
-                kwargs.pop("max_completion_tokens", None)
-                kwargs.pop("response_format", None)
-                kwargs["max_tokens"] = max_tokens
-                response = client.chat.completions.create(**kwargs)
-                break
-            raise
         except RateLimitError:
             if attempt < 2:
                 time.sleep(8 + attempt * 4)
@@ -169,16 +153,13 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     try:
         part = json.loads(raw)
     except json.JSONDecodeError as e:
-        # Try repair
         repaired = _repair_json(raw)
         try:
             part = json.loads(repaired)
         except json.JSONDecodeError:
-            # Extract partial scenes if possible
             scenes = _extract_scenes_from_truncated(raw)
             if scenes:
                 return {"scenes": scenes}
-            # Retry with more tokens
             if attempt < 2:
                 time.sleep(2)
                 return _call_groq(client, system_prompt, user_content, max_tokens + 4000)
@@ -202,7 +183,6 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    # llama-3.3-70b-versatile now supports 32,768 completion tokens
     max_tokens = 12000
 
     if is_first_chunk:
@@ -254,10 +234,8 @@ def generate_script(
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    # Call 1: Metadata only
     metadata = _generate_metadata(client, topic, language_name, style)
 
-    # Call 2+: Scenes only
     all_scenes = []
     remaining_words = total_target_words
 
