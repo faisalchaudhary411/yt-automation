@@ -93,6 +93,25 @@ def _count_narration_words(scenes: list) -> int:
     return sum(len(scene.get("narration", "").split()) for scene in scenes)
 
 
+def _repair_json(raw: str) -> str:
+    """Attempt to repair truncated JSON by closing open strings/brackets."""
+    # Close unterminated strings
+    if raw.count('"') % 2 != 0:
+        raw = raw + '"'
+
+    # Close open arrays/objects
+    open_brackets = raw.count('[') - raw.count(']')
+    open_braces = raw.count('{') - raw.count('}')
+    for _ in range(open_brackets):
+        raw = raw + ']'
+    for _ in range(open_braces):
+        raw = raw + '}'
+
+    # Remove trailing commas before closing brackets/braces
+    raw = re.sub(r',\s*([\}\]])', r'\1', raw)
+    return raw
+
+
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
     # Chunking means several requests per job in quick succession, which can
     # bump into Groq's free-tier per-minute token limit (shared across all
@@ -127,10 +146,18 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     raw = raw.strip()
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
 
+    # Try to parse; if truncated, attempt repair; if repair fails, retry with 2x tokens
     try:
         part = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Groq did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
+        repaired = _repair_json(raw)
+        try:
+            part = json.loads(repaired)
+        except json.JSONDecodeError:
+            if attempt == 0:
+                time.sleep(2)
+                return _call_groq(client, system_prompt, user_content, max_tokens * 2)
+            raise RuntimeError(f"Groq did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
 
     if "scenes" not in part or not part["scenes"]:
         raise RuntimeError("Generated script chunk has no scenes.")
@@ -143,9 +170,10 @@ def _generate_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_system_prompt(language_name, style, word_budget, is_first_chunk)
-    # Comfortably above what even a high token-density language needs for this
-    # small a word budget, while staying well clear of Groq's 8,192 cap.
-    max_tokens = min(6000, max(1200, word_budget * 12))
+
+    # qwen/qwen3.6-27b supports 32,768 completion tokens.
+    # First chunk needs extra headroom for title/description/tags + token-dense languages.
+    max_tokens = 10000 if is_first_chunk else 6000
 
     if is_first_chunk:
         user_content = f"Topic: {topic}"
