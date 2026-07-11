@@ -30,7 +30,9 @@ Optional (app degrades gracefully without these):
 ## Notes / fixes made during import setup
 - The `content_pipeline` module directory was imported as `content-pipeline` (hyphen), which doesn't match Python import syntax used in `main.py`. Renamed to `content_pipeline` (underscore).
 - `groq==0.9.0` (pinned in requirements.txt) was incompatible with the current `httpx` release (`Client.__init__() got an unexpected keyword argument 'proxies'`). Upgraded to `groq==1.5.0`.
-- Generated files (audio clips, images, final MP4) land in `output/`, which is gitignored-worthy scratch space — not committed.
+- `/generate` originally ran the whole pipeline (script + narration + images + video, a few minutes) synchronously inside one HTTP request. Replit's preview proxy times out long-lived requests, so the browser reported "could not reach app" even though the backend was still working. Reworked into a background-job model: `POST /generate` returns a `job_id` immediately, a background thread runs the pipeline into `output/<job_id>/`, and the page polls `GET /status/<job_id>` every 2s until `done`/`error`. The finished video is served from `/output/<job_id>/final_video.mp4`.
+- GitHub draft-history logging is wired up: `GITHUB_PERSONAL_ACCESS_TOKEN` secret (read as a `GITHUB_TOKEN` fallback in `config.py`) + `GITHUB_REPO=faisalchaudhary411/yt-lite` env var. Verified a draft actually lands in `drafts.json` in that repo.
+- Generated files (audio clips, images, final MP4) land in `output/<job_id>/`, which is gitignored scratch space — not committed.
 
 ## User preferences
 None recorded yet.

@@ -67,6 +67,7 @@ def github_write_json(path, data, message="update state"):
     return put_resp.json()
 
 
-def ensure_work_dir():
-    os.makedirs(WORK_DIR, exist_ok=True)
-    return WORK_DIR
+def ensure_work_dir(job_id=None):
+    work_dir = os.path.join(WORK_DIR, job_id) if job_id else WORK_DIR
+    os.makedirs(work_dir, exist_ok=True)
+    return work_dir
