@@ -102,7 +102,7 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-120b",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
