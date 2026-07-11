@@ -1,7 +1,9 @@
 """
 Assembles per-scene images + narration audio into one final MP4.
 Each scene gets a slow Ken-Burns zoom on its still image, with the narration
-audio and a burned-in caption of the narration text.
+audio and a burned-in caption of the narration text. Scenes are joined with
+short crossfade dissolves (instead of hard cuts) for a more polished,
+less obviously auto-generated feel.
 
 Requires ffmpeg to be installed on the Replit environment (add "ffmpeg" to
 replit.nix or use the nix package manager in the Replit shell:
@@ -31,6 +33,9 @@ X264_PRESET = "veryfast"
 # hang a job forever (longer videos have more clips, so more chances for one
 # process to wedge on a bad input).
 FFMPEG_TIMEOUT_SECONDS = 600
+
+# Length of the dissolve between consecutive clips (intro/scenes/outro).
+CROSSFADE_SECONDS = 0.6
 
 
 def _run(cmd: list, step_name: str) -> None:
@@ -109,11 +114,11 @@ def _caption_filters(text: str, width: int, fontsize: int, bottom_margin: int) -
     return ",".join(reversed(filters))
 
 
-def _get_audio_duration(audio_path: str) -> float:
+def _get_media_duration(path: str) -> float:
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
         ],
         capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS,
     )
@@ -121,7 +126,7 @@ def _get_audio_duration(audio_path: str) -> float:
     if not duration_str:
         stderr_tail = (result.stderr or "").strip().splitlines()[-10:]
         raise RuntimeError(
-            f"ffprobe could not read duration for {audio_path}: " + " | ".join(stderr_tail)
+            f"ffprobe could not read duration for {path}: " + " | ".join(stderr_tail)
         )
     return float(duration_str)
 
@@ -134,7 +139,7 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
     if not scene.get("image_path") or not scene.get("audio_path"):
         raise RuntimeError(f"Scene {index} is missing an image or audio file.")
 
-    duration = _get_audio_duration(scene["audio_path"])
+    duration = _get_media_duration(scene["audio_path"])
     fps = 30
     total_frames = int(duration * fps)
 
@@ -156,6 +161,11 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
         "-loop", "1", "-i", scene["image_path"],
         "-i", scene["audio_path"],
         "-vf", vf,
+        # loudnorm brings every scene's narration to the same target loudness,
+        # so volume doesn't visibly jump between scenes voiced at slightly
+        # different levels by the TTS engine — a small but noticeable polish
+        # detail on multi-scene videos.
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
@@ -177,7 +187,7 @@ def _build_title_card(
     """
     Renders a simple text-on-color title card (used for intro/outro) with a
     fade in/out, matching the codec/resolution/audio format of scene clips so
-    it concatenates cleanly. `lines` is a list of 1-2 strings (title + subtitle).
+    it joins cleanly. `lines` is a list of 1-2 strings (title + subtitle).
     """
     title = _escape_for_drawtext(lines[0])
     filters = [
@@ -207,6 +217,74 @@ def _build_title_card(
     return out_path
 
 
+def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: float = CROSSFADE_SECONDS) -> str:
+    """
+    Joins clips into one video using ffmpeg's xfade/acrossfade filters instead
+    of the concat demuxer, so consecutive scenes dissolve into each other
+    rather than hard-cutting — this alone is one of the biggest visible
+    differences between an obviously auto-generated video and a polished one.
+    Falls back to a straight re-encode (no dissolves) if there's only one clip.
+    """
+    n = len(clip_paths)
+    if n == 0:
+        raise RuntimeError("No clips to assemble into a final video.")
+
+    if n == 1:
+        cmd = [
+            "ffmpeg", "-y", "-i", clip_paths[0],
+            "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart",
+            final_path,
+        ]
+        _run(cmd, "Final render")
+        return final_path
+
+    durations = [_get_media_duration(p) for p in clip_paths]
+
+    inputs = []
+    for p in clip_paths:
+        inputs += ["-i", p]
+
+    filter_parts = []
+
+    prev_v_label = "0:v"
+    running_duration = durations[0]
+    for i in range(1, n):
+        offset = max(0.0, running_duration - crossfade_seconds)
+        out_label = f"v{i}"
+        filter_parts.append(
+            f"[{prev_v_label}][{i}:v]xfade=transition=fade:"
+            f"duration={crossfade_seconds}:offset={offset:.3f}[{out_label}]"
+        )
+        prev_v_label = out_label
+        running_duration = running_duration + durations[i] - crossfade_seconds
+
+    prev_a_label = "0:a"
+    for i in range(1, n):
+        out_label = f"a{i}"
+        filter_parts.append(
+            f"[{prev_a_label}][{i}:a]acrossfade=d={crossfade_seconds}[{out_label}]"
+        )
+        prev_a_label = out_label
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", f"[{prev_v_label}]",
+        "-map", f"[{prev_a_label}]",
+        "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
+        final_path,
+    ]
+    _run(cmd, "Final crossfade render")
+    return final_path
+
+
 def assemble_video(
     scenes: list,
     work_dir: str,
@@ -219,9 +297,10 @@ def assemble_video(
 ) -> str:
     """
     Builds one clip per scene (plus optional intro/outro title cards for a more
-    polished, human-produced feel) and concatenates them into the final MP4.
-    `style` is a key from config.VIDEO_STYLES controlling the title-card color
-    and Ken Burns zoom speed. Returns the path to the final video.
+    polished, human-produced feel) and joins them with short crossfade
+    dissolves into the final MP4. `style` is a key from config.VIDEO_STYLES
+    controlling the title-card color and Ken Burns zoom speed. Returns the
+    path to the final video.
     """
     from config import VIDEO_STYLES, DEFAULT_VIDEO_STYLE
     style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
@@ -270,28 +349,6 @@ def assemble_video(
             )
         )
 
-    concat_list_path = os.path.join(work_dir, "concat_list.txt")
-    with open(concat_list_path, "w") as f:
-        for path in clip_paths:
-            f.write(f"file '{os.path.abspath(path)}'\n")
-
     final_path = os.path.join(work_dir, output_name)
-    # Re-encode on concat instead of "-c copy". Stream-copy concat is brittle
-    # once there are more than a handful of segments (this pipeline's own
-    # symptom: a 3-scene ~3-min video concatenated fine, but a 10-16 scene
-    # ~6-min video did not) — small per-clip timestamp/keyframe mismatches
-    # between many independently-encoded segments can make the concat demuxer
-    # produce a truncated or corrupt final file, or make ffmpeg exit non-zero,
-    # with the failure only showing up once enough clips are chained together.
-    # Re-encoding here guarantees one consistent timeline regardless of scene
-    # count, at the cost of one extra (fast, "veryfast" preset) encode pass.
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat", "-safe", "0", "-i", concat_list_path,
-        "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",
-        "-movflags", "+faststart",
-        final_path,
-    ]
-    _run(cmd, "Final concat/render")
+    _join_with_crossfades(clip_paths, final_path)
     return final_path
