@@ -35,7 +35,7 @@ MIN_ACCEPTABLE_RATIO = 0.85  # retry a chunk once if it comes in under 85% of it
 # small enough that even Urdu/Hindi/Arabic-level token density stays well
 # under Groq's 8,192-token response cap, with room to spare for JSON syntax
 # and the image_keywords/duration_seconds fields.
-CHUNK_TARGET_WORDS = 180
+CHUNK_TARGET_WORDS = 120
 
 
 def _target_word_count(duration_minutes: float) -> int:
@@ -122,22 +122,62 @@ def _repair_json(raw: str) -> str:
     return raw
 
 
+def _extract_scenes_from_truncated(raw: str) -> list:
+    """Try to extract partial scene data from a truncated JSON response."""
+    try:
+        repaired = _repair_json(raw)
+        data = json.loads(repaired)
+        return data.get("scenes", [])
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    # Fallback: extract using regex (handles escaped quotes)
+    scenes = []
+    narrations = re.findall(r'"narration"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
+    keywords = re.findall(r'"image_keywords"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
+    durations = re.findall(r'"duration_seconds"\s*:\s*(\d+)', raw)
+
+    for i, narration in enumerate(narrations):
+        if narration.strip():
+            scenes.append({
+                "narration": narration,
+                "image_keywords": keywords[i] if i < len(keywords) else "historical scene",
+                "duration_seconds": int(durations[i]) if i < len(durations) else 25,
+            })
+    return scenes
+
+
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    for attempt in range(2):
+    for attempt in range(3):
         try:
+            # Use max_completion_tokens (new standard). gpt-oss-120b supports 65,536.
             response = client.chat.completions.create(
-                model="qwen/qwen3.6-27b",  # Groq recommended replacement (Aug 2026)
+                model="openai/gpt-oss-120b",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.8,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
             )
             break
+        except TypeError as e:
+            # Older groq SDK doesn't know max_completion_tokens — fall back to max_tokens
+            if "max_completion_tokens" in str(e):
+                response = client.chat.completions.create(
+                    model="openai/gpt-oss-120b",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.8,
+                    max_tokens=max_tokens,
+                )
+                break
+            raise
         except RateLimitError:
-            if attempt == 0:
-                time.sleep(8)
+            if attempt < 2:
+                time.sleep(8 + attempt * 4)
             else:
                 raise
 
@@ -151,17 +191,22 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     raw = raw.strip()
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
 
-    # Try to parse; if truncated, attempt repair; if repair fails, retry with 2x tokens
     try:
         part = json.loads(raw)
     except json.JSONDecodeError as e:
+        # Try repair
         repaired = _repair_json(raw)
         try:
             part = json.loads(repaired)
         except json.JSONDecodeError:
-            if attempt == 0:
+            # Extract partial scenes if possible
+            scenes = _extract_scenes_from_truncated(raw)
+            if scenes:
+                return {"scenes": scenes}
+            # Retry with more tokens
+            if attempt < 2:
                 time.sleep(2)
-                return _call_groq(client, system_prompt, user_content, max_tokens * 2)
+                return _call_groq(client, system_prompt, user_content, max_tokens + 4000)
             raise RuntimeError(f"Groq did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
 
     return part
@@ -169,7 +214,7 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
 
 def _generate_metadata(client: Groq, topic: str, language_name: str, style: str) -> dict:
     system_prompt = _build_metadata_prompt(language_name, style)
-    part = _call_groq(client, system_prompt, f"Topic: {topic}", max_tokens=2048)
+    part = _call_groq(client, system_prompt, f"Topic: {topic}", max_tokens=4096)
     return {
         "title": part.get("title") or topic,
         "description": part.get("description") or "",
@@ -182,7 +227,8 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    max_tokens = 6000
+    # gpt-oss-120b supports 65,536 completion tokens — use a generous amount
+    max_tokens = 20000
 
     if is_first_chunk:
         user_content = f"Topic: {topic}"
@@ -196,6 +242,10 @@ def _generate_scenes_chunk(
         )
 
     part = _call_groq(client, system_prompt, user_content, max_tokens)
+    
+    if "scenes" not in part or not part["scenes"]:
+        raise RuntimeError("Generated script chunk has no scenes.")
+    
     actual_words = _count_narration_words(part["scenes"])
 
     if actual_words < word_budget * MIN_ACCEPTABLE_RATIO:
@@ -206,7 +256,7 @@ def _generate_scenes_chunk(
                 f"write more this time, aiming for at least {word_budget} words.)",
                 max_tokens,
             )
-            if _count_narration_words(retry_part["scenes"]) > actual_words:
+            if "scenes" in retry_part and _count_narration_words(retry_part["scenes"]) > actual_words:
                 part = retry_part
         except RuntimeError:
             pass  # keep the first attempt rather than fail the whole job over one retry hiccup
