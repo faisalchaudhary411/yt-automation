@@ -17,12 +17,47 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Scene clips are CPU-bound (ffmpeg encode); a couple of workers helps even on
 # a 2-core box since ffmpeg itself doesn't saturate a core the whole time.
+# Kept modest (not scaled up with scene count) so longer videos (more scenes)
+# don't pile on more *simultaneous* encodes and risk OOM on a small Replit VM
+# — they just take a proportionally longer total time instead.
 MAX_CONCURRENT_CLIPS = 3
 
 # x264 encode speed preset for clip/title-card rendering. "veryfast" trades a
 # little file-size efficiency for a large wall-clock speedup versus the
 # libx264 default ("medium") — this draft pipeline optimizes for turnaround.
 X264_PRESET = "veryfast"
+
+# Hard ceiling on any single ffmpeg/ffprobe call so a stuck process can never
+# hang a job forever (longer videos have more clips, so more chances for one
+# process to wedge on a bad input).
+FFMPEG_TIMEOUT_SECONDS = 600
+
+
+def _run(cmd: list, step_name: str) -> None:
+    """
+    Runs a subprocess command and raises a RuntimeError with the actual
+    ffmpeg/ffprobe stderr on failure. subprocess.run(check=True) alone only
+    surfaces the exit code ("returned non-zero exit status 1"), which makes
+    real failures (bad filter graph, corrupt input, disk full, etc.) almost
+    impossible to diagnose from the job's error field. This keeps the same
+    behavior but attaches the last part of stderr so failures are readable
+    directly in the /status/<job_id> response.
+    """
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr_tail = (e.stderr or "").strip().splitlines()[-15:]
+        raise RuntimeError(
+            f"{step_name} failed (exit {e.returncode}): " + " | ".join(stderr_tail)
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"{step_name} timed out after {FFMPEG_TIMEOUT_SECONDS}s") from e
 
 
 def _escape_for_drawtext(text: str) -> str:
@@ -80,9 +115,15 @@ def _get_audio_duration(audio_path: str) -> float:
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
         ],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS,
     )
-    return float(result.stdout.strip())
+    duration_str = (result.stdout or "").strip()
+    if not duration_str:
+        stderr_tail = (result.stderr or "").strip().splitlines()[-10:]
+        raise RuntimeError(
+            f"ffprobe could not read duration for {audio_path}: " + " | ".join(stderr_tail)
+        )
+    return float(duration_str)
 
 
 def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008) -> str:
@@ -116,10 +157,11 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
         "-i", scene["audio_path"],
         "-vf", vf,
         "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-shortest",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
+        "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
         out_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    _run(cmd, f"Scene {index} render")
     return out_path
 
 
@@ -158,10 +200,10 @@ def _build_title_card(
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-vf", vf,
         "-c:v", "libx264", "-preset", X264_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-shortest",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
         out_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    _run(cmd, "Title card render")
     return out_path
 
 
@@ -204,6 +246,8 @@ def assemble_video(
 
     # Scene clips are independent of each other, so render them concurrently —
     # this is the single biggest win for total generation time on longer videos.
+    # A failure in any one scene is surfaced immediately (future.result() below
+    # re-raises it) rather than silently producing a broken/incomplete video.
     scene_clip_paths = [None] * len(scenes)
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLIPS) as executor:
         futures = {
@@ -232,11 +276,22 @@ def assemble_video(
             f.write(f"file '{os.path.abspath(path)}'\n")
 
     final_path = os.path.join(work_dir, output_name)
+    # Re-encode on concat instead of "-c copy". Stream-copy concat is brittle
+    # once there are more than a handful of segments (this pipeline's own
+    # symptom: a 3-scene ~3-min video concatenated fine, but a 10-16 scene
+    # ~6-min video did not) — small per-clip timestamp/keyframe mismatches
+    # between many independently-encoded segments can make the concat demuxer
+    # produce a truncated or corrupt final file, or make ffmpeg exit non-zero,
+    # with the failure only showing up once enough clips are chained together.
+    # Re-encoding here guarantees one consistent timeline regardless of scene
+    # count, at the cost of one extra (fast, "veryfast" preset) encode pass.
     cmd = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", concat_list_path,
-        "-c", "copy",
+        "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
         final_path,
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    _run(cmd, "Final concat/render")
     return final_path
