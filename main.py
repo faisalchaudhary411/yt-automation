@@ -23,7 +23,10 @@ import threading
 import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
 
-from config import ensure_work_dir, github_write_json, github_read_json
+from config import (
+    ensure_work_dir, github_write_json, github_read_json,
+    CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
+)
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
 from content_pipeline.image_fetcher import fetch_all_scene_images
@@ -40,7 +43,34 @@ PAGE = """
 <title>YT Automation - Stage 1</title>
 <h2>Generate a video draft</h2>
 <form id="genForm">
-  <input id="topic" name="topic" style="width:400px" placeholder="e.g. The Tulip Mania bubble of 1637" required>
+  <div style="margin-bottom:8px">
+    <input id="topic" name="topic" style="width:400px" placeholder="e.g. The Tulip Mania bubble of 1637" required>
+  </div>
+  <div style="margin-bottom:8px">
+    <label>Voiceover language:
+      <select id="language" name="language">
+        {% for code, name in languages.items() %}
+        <option value="{{ code }}" {% if code == default_language %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+  <div style="margin-bottom:8px">
+    <label>Video length:
+      <select id="duration" name="duration">
+        {% for key, minutes in duration_presets.items() %}
+        <option value="{{ minutes }}" {% if minutes == default_duration %}selected{% endif %}>
+          {{ key|capitalize }} (~{{ minutes }} min)
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+  <div style="margin-bottom:8px">
+    <label><input type="checkbox" id="includeIntro" checked> Add intro title card</label>
+    &nbsp;&nbsp;
+    <label><input type="checkbox" id="includeOutro" checked> Add outro / subscribe card</label>
+  </div>
   <button type="submit" id="genBtn">Generate</button>
 </form>
 <p id="status"></p>
@@ -57,7 +87,7 @@ const STEP_LABELS = {
   script: "Generating script…",
   audio: "Generating narration audio…",
   images: "Fetching scene images…",
-  video: "Assembling final video…",
+  video: "Assembling final video (incl. intro/outro)…",
   done: "Done!",
   error: "Failed."
 };
@@ -65,6 +95,10 @@ const STEP_LABELS = {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const topic = document.getElementById("topic").value;
+  const language = document.getElementById("language").value;
+  const duration = document.getElementById("duration").value;
+  const includeIntro = document.getElementById("includeIntro").checked;
+  const includeOutro = document.getElementById("includeOutro").checked;
   btn.disabled = true;
   resultEl.innerHTML = "";
   statusEl.textContent = "Starting…";
@@ -72,7 +106,12 @@ form.addEventListener("submit", async (e) => {
   const resp = await fetch("/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ topic })
+    body: JSON.stringify({
+      topic, language,
+      duration_minutes: duration,
+      include_intro: includeIntro,
+      include_outro: includeOutro
+    })
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({error: "Unknown error"}));
@@ -119,18 +158,25 @@ def _set_job(job_id: str, **fields):
         JOBS[job_id].update(fields)
 
 
-def run_pipeline_job(job_id: str, topic: str):
+def run_pipeline_job(
+    job_id: str,
+    topic: str,
+    language: str = DEFAULT_LANGUAGE,
+    duration_minutes: float = DEFAULT_DURATION_MINUTES,
+    include_intro: bool = True,
+    include_outro: bool = True,
+):
     """Runs the full Stage 1 pipeline for one topic inside a background thread."""
     try:
         work_dir = ensure_work_dir(job_id)
 
         _set_job(job_id, step="script")
-        print(f"[1/4] Generating script for: {topic}")
-        script = generate_script(topic)
+        print(f"[1/4] Generating script for: {topic} (lang={language}, ~{duration_minutes}min)")
+        script = generate_script(topic, language=language, duration_minutes=duration_minutes)
 
         _set_job(job_id, step="audio")
         print(f"[2/4] Generating narration audio ({len(script['scenes'])} scenes)")
-        script["scenes"] = generate_all_scene_audio(script["scenes"], work_dir)
+        script["scenes"] = generate_all_scene_audio(script["scenes"], work_dir, language=language)
 
         _set_job(job_id, step="images")
         print("[3/4] Fetching scene images")
@@ -138,7 +184,13 @@ def run_pipeline_job(job_id: str, topic: str):
 
         _set_job(job_id, step="video")
         print("[4/4] Assembling final video")
-        video_path = assemble_video(script["scenes"], work_dir)
+        video_path = assemble_video(
+            script["scenes"], work_dir,
+            title=script["title"],
+            channel_name=CHANNEL_NAME,
+            include_intro=include_intro,
+            include_outro=include_outro,
+        )
 
         result = {
             "topic": topic,
@@ -165,20 +217,51 @@ def run_pipeline_job(job_id: str, topic: str):
 
 @app.route("/")
 def index():
-    return render_template_string(PAGE)
+    return render_template_string(
+        PAGE,
+        languages=LANGUAGES,
+        default_language=DEFAULT_LANGUAGE,
+        duration_presets=DURATION_PRESETS,
+        default_duration=DEFAULT_DURATION_MINUTES,
+    )
 
 
 @app.route("/generate", methods=["POST"])
 def generate_endpoint():
-    topic = request.form.get("topic") or (request.get_json(silent=True) or {}).get("topic")
+    body = request.get_json(silent=True) or {}
+    topic = request.form.get("topic") or body.get("topic")
     if not topic:
         return jsonify({"error": "Missing 'topic'"}), 400
+
+    language = request.form.get("language") or body.get("language") or DEFAULT_LANGUAGE
+    if language not in LANGUAGES:
+        return jsonify({"error": f"Unsupported language '{language}'"}), 400
+
+    try:
+        duration_minutes = float(request.form.get("duration_minutes") or body.get("duration_minutes") or DEFAULT_DURATION_MINUTES)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid duration_minutes"}), 400
+    duration_minutes = max(2, min(20, duration_minutes))  # sane guardrails
+
+    def _as_bool(value, default=True):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() not in ("false", "0", "no")
+
+    include_intro = _as_bool(request.form.get("include_intro") if "include_intro" in request.form else body.get("include_intro"))
+    include_outro = _as_bool(request.form.get("include_outro") if "include_outro" in request.form else body.get("include_outro"))
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[job_id] = {"step": "queued", "topic": topic, "created_at": time.time()}
 
-    thread = threading.Thread(target=run_pipeline_job, args=(job_id, topic), daemon=True)
+    thread = threading.Thread(
+        target=run_pipeline_job,
+        args=(job_id, topic, language, duration_minutes, include_intro, include_outro),
+        daemon=True,
+    )
     thread.start()
 
     return jsonify({"job_id": job_id})

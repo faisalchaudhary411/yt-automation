@@ -21,6 +21,34 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
+CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "WealthThroughAges")
+
+# Narration languages offered in the UI. Keys are gTTS language codes (also used
+# to tell Groq which language to write the script in via their display name).
+LANGUAGES = {
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "pt": "Portuguese",
+    "hi": "Hindi",
+    "ur": "Urdu",
+    "ar": "Arabic",
+    "tr": "Turkish",
+    "ru": "Russian",
+    "it": "Italian",
+    "id": "Indonesian",
+}
+DEFAULT_LANGUAGE = "en"
+
+# Video length presets shown in the UI (minutes of narration to aim for).
+DURATION_PRESETS = {
+    "short": 3,
+    "medium": 6,
+    "long": 10,
+}
+DEFAULT_DURATION_MINUTES = DURATION_PRESETS["medium"]
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")

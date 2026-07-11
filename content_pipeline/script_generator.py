@@ -6,45 +6,59 @@ Each scene has: narration text, an image search keyword, and estimated duration.
 import json
 import re
 from groq import Groq
-from config import GROQ_API_KEY
+from config import GROQ_API_KEY, CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_DURATION_MINUTES
 
-SYSTEM_PROMPT = """You are a scriptwriter for a documentary-style YouTube channel about \
-history and finance (channel: WealthThroughAges). Write in a clear, engaging, slightly \
+
+def _build_system_prompt(language_name: str, duration_minutes: float) -> str:
+    # Roughly one scene per 22-35s of narration, clamped to a sane range.
+    scene_low = max(4, round(duration_minutes * 60 / 35))
+    scene_high = max(scene_low + 2, round(duration_minutes * 60 / 22))
+
+    return f"""You are a scriptwriter for a documentary-style YouTube channel about \
+history and finance (channel: {CHANNEL_NAME}). Write in a clear, engaging, slightly \
 dramatic narrator voice, similar to Real Stories or Business Casual style channels.
 
+Write the ENTIRE script — title, description, and every scene's narration — in \
+{language_name}. Do not mix in another language unless {language_name} is English.
+
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
-{
-  "title": "SEO-friendly YouTube title, under 100 characters",
-  "description": "2-3 sentence YouTube description",
+{{
+  "title": "SEO-friendly YouTube title, under 100 characters, written in {language_name}",
+  "description": "2-3 sentence YouTube description, written in {language_name}",
   "tags": ["tag1", "tag2", "..."],
   "scenes": [
-    {
-      "narration": "1-3 sentences of narration for this scene",
-      "image_keywords": "2-4 words describing what image should show for this scene",
+    {{
+      "narration": "1-3 sentences of narration for this scene, written in {language_name}",
+      "image_keywords": "2-4 words IN ENGLISH describing what image should show for this scene",
       "duration_seconds": 8
-    }
+    }}
   ]
-}
+}}
 
-Aim for 12-20 scenes totaling 6-10 minutes of narration. Keep each scene's narration \
-tight enough to read aloud in roughly duration_seconds. Do not include any text outside \
-the JSON object."""
+Aim for {scene_low}-{scene_high} scenes totaling approximately {duration_minutes:g} minutes \
+of spoken narration in total. Keep each scene's narration tight enough to read aloud in \
+roughly duration_seconds. Do not include any text outside the JSON object."""
 
 
-def generate_script(topic: str) -> dict:
+def generate_script(topic: str, language: str = DEFAULT_LANGUAGE, duration_minutes: float = DEFAULT_DURATION_MINUTES) -> dict:
     """
     topic: e.g. "Spain's 16th century silver defaults"
+    language: a gTTS-style language code from config.LANGUAGES (e.g. "en", "es", "hi")
+    duration_minutes: target length of the narration, in minutes
     Returns a dict with title, description, tags, and a list of scenes.
     """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in Replit Secrets.")
+
+    language_name = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])
+    system_prompt = _build_system_prompt(language_name, duration_minutes)
 
     client = Groq(api_key=GROQ_API_KEY)
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Topic: {topic}"},
         ],
         temperature=0.8,
