@@ -49,29 +49,39 @@ def _scene_count_for_words(word_budget: int) -> tuple:
     return scene_low, scene_high
 
 
-def _build_system_prompt(
+def _build_metadata_prompt(language_name: str, style_key: str) -> str:
+    narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
+    return f"""You are a scriptwriter for a YouTube channel about history and finance \
+(channel: {CHANNEL_NAME}). Write as {narrator_style}.
+
+Write the ENTIRE response in {language_name}. Do not mix in another language unless \
+{language_name} is English.
+
+Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
+{{
+  "title": "SEO-friendly YouTube title, under 100 characters, written in {language_name}",
+  "description": "2-3 sentence YouTube description, written in {language_name}",
+  "tags": ["tag1", "tag2", "..."]
+}}
+
+Do not include any text outside the JSON object."""
+
+
+def _build_scenes_prompt(
     language_name: str, style_key: str, word_budget: int, is_first_chunk: bool
 ) -> str:
     scene_low, scene_high = _scene_count_for_words(word_budget)
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
 
-    metadata_shape = ""
-    if is_first_chunk:
-        metadata_shape = f"""  "title": "SEO-friendly YouTube title, under 100 characters, written in {language_name}",
-  "description": "2-3 sentence YouTube description, written in {language_name}",
-  "tags": ["tag1", "tag2", "..."],
-"""
-
     return f"""You are a scriptwriter for a YouTube channel about history and finance \
 (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response — {"title, description, and " if is_first_chunk else ""}every \
-scene's narration — in {language_name}. Do not mix in another language unless \
+Write the ENTIRE response in {language_name}. Do not mix in another language unless \
 {language_name} is English.
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
-{metadata_shape}  "scenes": [
+  "scenes": [
     {{
       "narration": "2-4 sentences of narration for this scene, written in {language_name}",
       "image_keywords": "2-4 words IN ENGLISH describing what image should show for this scene",
@@ -113,11 +123,6 @@ def _repair_json(raw: str) -> str:
 
 
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    # Chunking means several requests per job in quick succession, which can
-    # bump into Groq's free-tier per-minute token limit (shared across all
-    # calls in that window) even though each individual chunk is small. A
-    # short backoff and one retry handles that instead of failing the whole
-    # job over a transient 429.
     for attempt in range(2):
         try:
             response = client.chat.completions.create(
@@ -159,21 +164,25 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
                 return _call_groq(client, system_prompt, user_content, max_tokens * 2)
             raise RuntimeError(f"Groq did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
 
-    if "scenes" not in part or not part["scenes"]:
-        raise RuntimeError("Generated script chunk has no scenes.")
-
     return part
 
 
-def _generate_chunk(
+def _generate_metadata(client: Groq, topic: str, language_name: str, style: str) -> dict:
+    system_prompt = _build_metadata_prompt(language_name, style)
+    part = _call_groq(client, system_prompt, f"Topic: {topic}", max_tokens=2048)
+    return {
+        "title": part.get("title") or topic,
+        "description": part.get("description") or "",
+        "tags": part.get("tags") or [],
+    }
+
+
+def _generate_scenes_chunk(
     client: Groq, topic: str, language_name: str, style: str,
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
-    system_prompt = _build_system_prompt(language_name, style, word_budget, is_first_chunk)
-
-    # qwen/qwen3.6-27b supports 32,768 completion tokens.
-    # First chunk needs extra headroom for title/description/tags + token-dense languages.
-    max_tokens = 10000 if is_first_chunk else 6000
+    system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
+    max_tokens = 6000
 
     if is_first_chunk:
         user_content = f"Topic: {topic}"
@@ -227,7 +236,10 @@ def generate_script(
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    title, description, tags = None, None, []
+    # Call 1: Metadata only (title, description, tags) — small, never overflows
+    metadata = _generate_metadata(client, topic, language_name, style)
+
+    # Call 2+: Scenes only — no metadata overhead, full token budget for narration
     all_scenes = []
     remaining_words = total_target_words
 
@@ -240,14 +252,9 @@ def generate_script(
         if all_scenes:
             previous_tail = all_scenes[-1]["narration"][-300:]
 
-        part = _generate_chunk(
+        part = _generate_scenes_chunk(
             client, topic, language_name, style, word_budget, is_first, previous_tail,
         )
-
-        if is_first:
-            title = part.get("title") or topic
-            description = part.get("description") or ""
-            tags = part.get("tags") or []
 
         all_scenes.extend(part["scenes"])
         remaining_words -= _count_narration_words(part["scenes"])
@@ -257,9 +264,9 @@ def generate_script(
           f"{len(all_scenes)} scenes across {num_chunks} chunk(s)")
 
     return {
-        "title": title,
-        "description": description,
-        "tags": tags,
+        "title": metadata["title"],
+        "description": metadata["description"],
+        "tags": metadata["tags"],
         "scenes": all_scenes,
     }
 
