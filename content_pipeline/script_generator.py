@@ -355,7 +355,14 @@ def generate_script(
     language: str = DEFAULT_LANGUAGE,
     duration_minutes: float = DEFAULT_DURATION_MINUTES,
     style: str = DEFAULT_VIDEO_STYLE,
+    progress_callback=None,
 ) -> dict:
+    """
+    progress_callback, if given, is called as progress_callback(chunks_done, total_chunks)
+    after every chunk (and once with (0, total_chunks) before the first chunk starts),
+    so a caller (e.g. the Flask job status) can report fine-grained progress instead
+    of just "script step in progress".
+    """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in Replit Secrets.")
 
@@ -370,6 +377,9 @@ def generate_script(
 
     metadata = _generate_metadata(client, topic, language_name, style)
     print(f"[script_generator] Metadata generated: \"{metadata['title']}\"")
+
+    if progress_callback:
+        progress_callback(0, num_chunks)
 
     all_scenes = []
     remaining_words = total_target_words
@@ -395,6 +405,9 @@ def generate_script(
         words_so_far = _count_narration_words(all_scenes)
         print(f"[script_generator] Chunk {chunk_index + 1}/{num_chunks} done in {chunk_elapsed:.1f}s "
               f"— {words_so_far}/{total_target_words} words, {len(all_scenes)} scenes so far")
+
+        if progress_callback:
+            progress_callback(chunk_index + 1, num_chunks)
 
     actual_total_words = _count_narration_words(all_scenes)
     print(f"[script_generator] target={total_target_words} words, actual={actual_total_words} words, "

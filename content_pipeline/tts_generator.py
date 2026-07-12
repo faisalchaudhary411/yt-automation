@@ -32,24 +32,36 @@ def generate_scene_audio(text: str, out_path: str, language: str = DEFAULT_LANGU
     asyncio.run(_tts_edge_async(text, out_path, voice))
 
 
-async def _generate_all_async(scenes: list, audio_dir: str, language: str, voice_gender: str):
+async def _generate_all_async(scenes: list, audio_dir: str, language: str, voice_gender: str, progress_callback=None):
     voice = _resolve_voice(language, voice_gender)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
+    total = len(scenes)
+    done_count = 0  # safe without a lock: coroutine steps between awaits run
+                     # one at a time on this single event loop thread.
 
     async def run_one(i, scene):
+        nonlocal done_count
         out_path = os.path.join(audio_dir, f"scene_{i:03d}.mp3")
         async with semaphore:
             await _tts_edge_async(scene["narration"], out_path, voice)
         scene["audio_path"] = out_path
+        done_count += 1
+        if progress_callback:
+            progress_callback(done_count, total)
 
     await asyncio.gather(*(run_one(i, scene) for i, scene in enumerate(scenes)))
 
 
-def generate_all_scene_audio(scenes: list, work_dir: str, language: str = DEFAULT_LANGUAGE, voice_gender: str = DEFAULT_VOICE_GENDER) -> list:
+def generate_all_scene_audio(
+    scenes: list, work_dir: str, language: str = DEFAULT_LANGUAGE,
+    voice_gender: str = DEFAULT_VOICE_GENDER, progress_callback=None,
+) -> list:
     """
     scenes: list of scene dicts from script_generator (each with "narration")
     language: language code from config.LANGUAGES
     voice_gender: "male" or "female" — picks an edge-tts neural voice for that language
+    progress_callback, if given, is called as progress_callback(done, total) once
+    per scene as its audio finishes generating.
     Returns the same list with an added "audio_path" key per scene, generated concurrently.
     """
     audio_dir = os.path.join(work_dir, "audio")
@@ -59,6 +71,8 @@ def generate_all_scene_audio(scenes: list, work_dir: str, language: str = DEFAUL
     # callable from the pipeline thread (which already has no running event loop,
     # but this keeps it safe if that ever changes).
     with ThreadPoolExecutor(max_workers=1) as executor:
-        executor.submit(lambda: asyncio.run(_generate_all_async(scenes, audio_dir, language, voice_gender))).result()
+        executor.submit(
+            lambda: asyncio.run(_generate_all_async(scenes, audio_dir, language, voice_gender, progress_callback))
+        ).result()
 
     return scenes

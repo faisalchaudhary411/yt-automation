@@ -15,7 +15,7 @@ import os
 import subprocess
 import re
 import textwrap
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Scene clips are CPU-bound (ffmpeg encode); a couple of workers helps even on
 # a 2-core box since ffmpeg itself doesn't saturate a core the whole time.
@@ -309,6 +309,7 @@ def assemble_video(
     include_intro: bool = True,
     include_outro: bool = True,
     style: str = "documentary",
+    progress_callback=None,
 ) -> str:
     """
     Builds one clip per scene (plus optional intro/outro title cards for a more
@@ -316,6 +317,12 @@ def assemble_video(
     dissolves into the final MP4. `style` is a key from config.VIDEO_STYLES
     controlling the title-card color and Ken Burns zoom speed. Returns the
     path to the final video.
+
+    progress_callback, if given, is called as progress_callback(phase, done, total)
+    where phase is "clips" while scene clips render (done/total = clips finished
+    out of all scenes) and "join" once the final crossfade render starts/finishes
+    (done/total = 0/1 then 1/1), so a caller can show fine-grained progress
+    instead of just "video step in progress".
     """
     from config import VIDEO_STYLES, DEFAULT_VIDEO_STYLE
     style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
@@ -342,15 +349,26 @@ def assemble_video(
     # this is the single biggest win for total generation time on longer videos.
     # A failure in any one scene is surfaced immediately (future.result() below
     # re-raises it) rather than silently producing a broken/incomplete video.
-    scene_clip_paths = [None] * len(scenes)
+    total_scenes = len(scenes)
+    scene_clip_paths = [None] * total_scenes
+    clips_done = 0
+
+    if progress_callback:
+        progress_callback("clips", 0, total_scenes)
+
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLIPS) as executor:
         futures = {
             executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate): i
             for i, scene in enumerate(scenes)
         }
-        for future in futures:
+        # as_completed (not iterating futures in submission order) so progress
+        # reflects actual completions, not just submission order.
+        for future in as_completed(futures):
             i = futures[future]
             scene_clip_paths[i] = future.result()
+            clips_done += 1
+            if progress_callback:
+                progress_callback("clips", clips_done, total_scenes)
     clip_paths += scene_clip_paths
 
     if include_outro:
@@ -364,6 +382,13 @@ def assemble_video(
             )
         )
 
+    if progress_callback:
+        progress_callback("join", 0, 1)
+
     final_path = os.path.join(work_dir, output_name)
     _join_with_crossfades(clip_paths, final_path)
+
+    if progress_callback:
+        progress_callback("join", 1, 1)
+
     return final_path

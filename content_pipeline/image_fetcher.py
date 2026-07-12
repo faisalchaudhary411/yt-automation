@@ -6,6 +6,7 @@ with the same photo unless there's truly no other option.
 """
 
 import os
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from config import PEXELS_API_KEY
@@ -66,7 +67,7 @@ def _download(url: str, out_path: str) -> bool:
     return True
 
 
-def fetch_all_scene_images(scenes: list, work_dir: str) -> list:
+def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) -> list:
     """
     scenes: list of scene dicts (each with "image_keywords")
     Returns the same list with an added "image_path" key per scene.
@@ -78,21 +79,34 @@ def fetch_all_scene_images(scenes: list, work_dir: str) -> list:
     falls back to reusing a photo if a scene's whole candidate pool is
     already exhausted by earlier scenes, and only falls back to the previous
     scene's image entirely if a scene's search returned nothing at all.
+
+    progress_callback, if given, is called as progress_callback(phase, done, total)
+    where phase is "search" during the concurrent Pexels lookups and "download"
+    during the concurrent image downloads (each phase counts 0..len(scenes)).
     """
     image_dir = os.path.join(work_dir, "images")
     os.makedirs(image_dir, exist_ok=True)
+    total = len(scenes)
 
-    candidate_lists = [None] * len(scenes)
+    candidate_lists = [None] * total
+    search_done = 0
+    search_lock = threading.Lock()
 
     def search_one(i, scene):
+        nonlocal search_done
         candidate_lists[i] = _candidates_for_scene(scene["image_keywords"])
+        if progress_callback:
+            with search_lock:
+                search_done += 1
+                done_snapshot = search_done
+            progress_callback("search", done_snapshot, total)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as executor:
         list(executor.map(lambda args: search_one(*args), enumerate(scenes)))
 
     # Sequential assignment so "already used" can be tracked without races.
     used_ids = set()
-    chosen_urls = [None] * len(scenes)
+    chosen_urls = [None] * total
     for i, candidates in enumerate(candidate_lists):
         if not candidates:
             continue
@@ -100,17 +114,24 @@ def fetch_all_scene_images(scenes: list, work_dir: str) -> list:
         used_ids.add(pick["id"])
         chosen_urls[i] = pick["url"]
 
-    results = [None] * len(scenes)
+    results = [None] * total
+    download_done = 0
+    download_lock = threading.Lock()
 
     def download_one(i):
-        if not chosen_urls[i]:
-            return
-        out_path = os.path.join(image_dir, f"scene_{i:03d}.jpg")
-        if _download(chosen_urls[i], out_path):
-            results[i] = out_path
+        nonlocal download_done
+        if chosen_urls[i]:
+            out_path = os.path.join(image_dir, f"scene_{i:03d}.jpg")
+            if _download(chosen_urls[i], out_path):
+                results[i] = out_path
+        if progress_callback:
+            with download_lock:
+                download_done += 1
+                done_snapshot = download_done
+            progress_callback("download", done_snapshot, total)
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as executor:
-        list(executor.map(download_one, range(len(scenes))))
+        list(executor.map(download_one, range(total)))
 
     last_good_path = None
     for i, scene in enumerate(scenes):
