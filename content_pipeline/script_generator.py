@@ -1,12 +1,14 @@
 """
 Turns a topic into a scene-by-scene documentary narration script.
 
-Primary LLM: OpenRouter (free tier, no rate-limit trouble seen so far).
-Falls back to Groq if OpenRouter fails (rate limit exhausted, API
+Primary LLM: SambaNova Cloud (OpenAI-compatible endpoint, running the
+open-weight gpt-oss-120b model — fast RDU-hosted inference).
+Falls back to Groq if SambaNova fails (rate limit/quota exhausted, API
 error, or unparseable output after retries).
 
-Gemini support was removed: the free-tier key hit a permanent
-"limit: 0" quota wall that made it useless as a fallback.
+Gemini and SambaNova support were both removed: Gemini's free-tier key
+hit a permanent "limit: 0" quota wall, and SambaNova's free-tier quota
+was also getting exhausted, wasting retry time on every chunk.
 """
 
 import json
@@ -23,9 +25,9 @@ from config import (
 
 # Optional fallback key — fallback is simply skipped if not configured.
 try:
-    from config import OPENROUTER_API_KEY
+    from config import SAMBANOVA_API_KEY
 except ImportError:
-    OPENROUTER_API_KEY = None
+    SAMBANOVA_API_KEY = None
 
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
@@ -35,9 +37,9 @@ CHUNK_TARGET_WORDS = 200  # bigger chunks = fewer sequential API round-trips per
                           # of chunk size, so fewer/larger chunks finish faster
                           # overall). Was 80; a 450-word "short" script now
                           # takes ~3 chunks instead of ~6.
-OPENROUTER_MODEL_NAME = "openai/gpt-oss-120b:free"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MAX_TOKENS_CEILING = 8000  # hard cap so the +4000 retry growth in
+SAMBANOVA_MODEL_NAME = "gpt-oss-120b"
+SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions"
+SAMBANOVA_MAX_TOKENS_CEILING = 8000  # hard cap so the +4000 retry growth in
                                       # _parse_llm_json can't run away
 
 def _target_word_count(duration_minutes: float) -> int:
@@ -225,33 +227,33 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens, depth=depth)
 
 
-# Once OpenRouter reports quota/credit exhaustion, there's no point retrying
+# Once SambaNova reports quota/credit exhaustion, there's no point retrying
 # it on every subsequent chunk for the rest of this process's lifetime — that
 # was costing ~15-20+ seconds of dead retries per chunk. Skip straight to
 # Groq after the first confirmed exhaustion; a Repl restart re-checks it.
-_openrouter_quota_exhausted = False
+_samba_quota_exhausted = False
 
 
-def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
-    global _openrouter_quota_exhausted
+def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
+    global _samba_quota_exhausted
 
-    if not OPENROUTER_API_KEY:
+    if not SAMBANOVA_API_KEY:
         raise RuntimeError(
-            "OpenRouter unavailable: set OPENROUTER_API_KEY in "
+            "SambaNova unavailable: set SAMBANOVA_API_KEY in "
             "config.py / Replit Secrets."
         )
 
-    if _openrouter_quota_exhausted:
-        raise RuntimeError("OpenRouter skipped: quota already confirmed exhausted this run.")
+    if _samba_quota_exhausted:
+        raise RuntimeError("SambaNova skipped: quota already confirmed exhausted this run.")
 
-    max_tokens = min(max_tokens, OPENROUTER_MAX_TOKENS_CEILING)
+    max_tokens = min(max_tokens, SAMBANOVA_MAX_TOKENS_CEILING)
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {SAMBANOVA_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": OPENROUTER_MODEL_NAME,
+        "model": SAMBANOVA_MODEL_NAME,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -264,7 +266,7 @@ def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, dep
     last_error = None
     for attempt in range(3):
         try:
-            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+            resp = requests.post(SAMBANOVA_URL, headers=headers, json=payload, timeout=60)
 
             # Quota/credit exhaustion (402 Payment Required, or a 429 whose body
             # actually says "quota"/"credit" rather than a normal short-term rate
@@ -274,48 +276,48 @@ def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, dep
             if resp.status_code == 402 or (
                 resp.status_code == 429 and ("quota" in body_lower or "credit" in body_lower)
             ):
-                _openrouter_quota_exhausted = True
-                raise RuntimeError(f"OpenRouter quota/credits exhausted (HTTP {resp.status_code}): {resp.text[:200]}")
+                _samba_quota_exhausted = True
+                raise RuntimeError(f"SambaNova quota/credits exhausted (HTTP {resp.status_code}): {resp.text[:200]}")
 
             if resp.status_code == 429:
-                raise RuntimeError("OpenRouter rate limited")
+                raise RuntimeError("SambaNova rate limited")
             resp.raise_for_status()
             data = resp.json()
             raw = data["choices"][0]["message"]["content"]
 
             def _retry_with_more_tokens(new_max_tokens, new_depth):
-                return _call_openrouter(system_prompt, user_content, new_max_tokens, depth=new_depth)
+                return _call_samba(system_prompt, user_content, new_max_tokens, depth=new_depth)
 
             return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens, depth=depth)
 
         except Exception as e:
             last_error = e
-            if _openrouter_quota_exhausted:
+            if _samba_quota_exhausted:
                 # Fail immediately, no point sleeping and retrying a dead quota.
-                raise RuntimeError(f"OpenRouter fallback also failed: {e}")
+                raise RuntimeError(f"SambaNova call failed: {e}")
             if attempt < 2:
                 time.sleep(4 + attempt * 4)
             else:
-                raise RuntimeError(f"OpenRouter fallback also failed: {e}")
+                raise RuntimeError(f"SambaNova call failed: {e}")
 
-    raise RuntimeError(f"OpenRouter fallback failed after retries: {last_error}")
+    raise RuntimeError(f"SambaNova failed after retries: {last_error}")
 
 
 def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    """Tries OpenRouter first (primary); falls back to Groq if it fails."""
+    """Tries SambaNova first (primary); falls back to Groq if it fails."""
     errors = []
 
-    if not _openrouter_quota_exhausted:
+    if not _samba_quota_exhausted:
         or_start = time.time()
         try:
-            result = _call_openrouter(system_prompt, user_content, max_tokens)
-            print(f"[script_generator]   OpenRouter succeeded in {time.time() - or_start:.1f}s")
+            result = _call_samba(system_prompt, user_content, max_tokens)
+            print(f"[script_generator]   SambaNova succeeded in {time.time() - or_start:.1f}s")
             return result
         except Exception as e:
-            errors.append(f"OpenRouter: {e}")
-            print(f"[script_generator]   OpenRouter failed after {time.time() - or_start:.1f}s ({e}). Trying Groq...")
+            errors.append(f"SambaNova: {e}")
+            print(f"[script_generator]   SambaNova failed after {time.time() - or_start:.1f}s ({e}). Trying Groq...")
     else:
-        print("[script_generator]   Skipping OpenRouter (quota confirmed exhausted this run). Using Groq directly...")
+        print("[script_generator]   Skipping SambaNova (quota confirmed exhausted this run). Using Groq directly...")
 
     groq_start = time.time()
     try:
