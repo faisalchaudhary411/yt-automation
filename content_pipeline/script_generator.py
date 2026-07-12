@@ -1,9 +1,12 @@
 """
 Turns a topic into a scene-by-scene documentary narration script.
 
-Primary LLM: Groq. Falls back to Gemini, then OpenRouter, if the
-previous provider fails (rate limit exhausted, API error, or
-unparseable output after retries).
+Primary LLM: OpenRouter (free tier, no rate-limit trouble seen so far).
+Falls back to Groq if OpenRouter fails (rate limit exhausted, API
+error, or unparseable output after retries).
+
+Gemini support was removed: the free-tier key hit a permanent
+"limit: 0" quota wall that made it useless as a fallback.
 """
 
 import json
@@ -13,23 +16,12 @@ import time
 import requests
 from groq import Groq, RateLimitError, APIError
 
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-
 from config import (
     GROQ_API_KEY, CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_DURATION_MINUTES,
     VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
 )
 
-# Optional fallback keys — each fallback is simply skipped if not configured.
-try:
-    from config import GEMINI_API_KEY
-except ImportError:
-    GEMINI_API_KEY = None
-
+# Optional fallback key — fallback is simply skipped if not configured.
 try:
     from config import OPENROUTER_API_KEY
 except ImportError:
@@ -38,13 +30,10 @@ except ImportError:
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
 CHUNK_TARGET_WORDS = 80
-GEMINI_MODEL_NAME = "gemini-2.0-flash"
-OPENROUTER_MODEL_NAME = "meta-llama/llama-3.1-70b-instruct:free"
+OPENROUTER_MODEL_NAME = "openai/gpt-oss-120b:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-if GEMINI_AVAILABLE and GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
+OPENROUTER_MAX_TOKENS_CEILING = 8000  # hard cap so the +4000 retry growth in
+                                      # _parse_llm_json can't run away
 
 def _target_word_count(duration_minutes: float) -> int:
     return round(duration_minutes * WORDS_PER_MINUTE)
@@ -147,8 +136,18 @@ def _extract_scenes_from_truncated(raw: str) -> list:
     return scenes
 
 
-def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int = 0):
-    """Shared JSON parsing/repair logic used by every provider path."""
+MAX_JSON_RETRY_DEPTH = 2  # hard ceiling on how many times we'll re-call the LLM
+                          # for a bigger completion before giving up entirely.
+
+
+def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int = 0, depth: int = 0):
+    """Shared JSON parsing/repair logic used by every provider path.
+
+    `depth` guards against unbounded recursion: if the LLM keeps returning
+    unparseable JSON, attempt_more_tokens_callback would otherwise be called
+    again and again forever (each call itself doing its own multi-attempt
+    retry loop with sleeps), which is what caused the pipeline to hang.
+    """
     if raw is None or not raw.strip():
         raise RuntimeError("LLM returned an empty response.")
 
@@ -165,16 +164,29 @@ def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int
             scenes = _extract_scenes_from_truncated(raw)
             if scenes:
                 return {"scenes": scenes}
-            if attempt_more_tokens_callback and max_tokens:
-                return attempt_more_tokens_callback(max_tokens + 4000)
-            raise RuntimeError(f"LLM did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
+            if attempt_more_tokens_callback and max_tokens and depth < MAX_JSON_RETRY_DEPTH:
+                return attempt_more_tokens_callback(max_tokens + 4000, depth + 1)
+            raise RuntimeError(
+                f"LLM did not return valid JSON after {depth} retry attempt(s): "
+                f"{e}\nRaw output:\n{raw[:500]}"
+            )
 
 
-def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    for attempt in range(3):
+# This Groq account is on the "on_demand" tier, which caps requests at 8000
+# tokens per minute (prompt + max_completion_tokens counts against this,
+# whether or not the model actually uses that many). Stay comfortably under
+# that on every single call, no matter how large the request wanted to be.
+GROQ_TPM_LIMIT = 8000
+GROQ_SAFETY_MARGIN = 1500  # headroom for prompt tokens + estimation error
+
+
+def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
+    max_tokens = min(max_tokens, GROQ_TPM_LIMIT - GROQ_SAFETY_MARGIN)
+
+    for attempt in range(4):
         try:
             response = client.chat.completions.create(
-                model="qwen/qwen3.6-27b",  # Groq recommended replacement (Aug 2026)
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -185,67 +197,37 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
             )
             break
         except RateLimitError:
-            if attempt < 2:
+            if attempt < 3:
                 time.sleep(8 + attempt * 4)
             else:
                 raise
         except APIError as e:
+            msg = str(e)
+            if "rate_limit_exceeded" in msg or "tokens per minute" in msg or "413" in msg:
+                # Request was too large for the TPM budget: shrink it and retry
+                # rather than failing the whole job outright.
+                if attempt < 3 and max_tokens > 1000:
+                    max_tokens = max(1000, int(max_tokens * 0.6))
+                    time.sleep(6 + attempt * 4)
+                    continue
             raise RuntimeError(f"Groq API error: {e}")
 
     raw = response.choices[0].message.content
 
-    def _retry_with_more_tokens(new_max_tokens):
-        return _call_groq(client, system_prompt, user_content, new_max_tokens)
+    def _retry_with_more_tokens(new_max_tokens, new_depth):
+        return _call_groq(client, system_prompt, user_content, new_max_tokens, depth=new_depth)
 
-    return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens)
-
-
-def _call_gemini(system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    if not (GEMINI_AVAILABLE and GEMINI_API_KEY):
-        raise RuntimeError(
-            "Gemini fallback unavailable: install google-generativeai and set "
-            "GEMINI_API_KEY in config.py / Replit Secrets."
-        )
-
-    model = genai.GenerativeModel(
-        GEMINI_MODEL_NAME,
-        system_instruction=system_prompt,
-    )
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = model.generate_content(
-                user_content,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.7,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                ),
-            )
-            raw = response.text
-
-            def _retry_with_more_tokens(new_max_tokens):
-                return _call_gemini(system_prompt, user_content, new_max_tokens)
-
-            return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens)
-
-        except Exception as e:
-            last_error = e
-            if attempt < 2:
-                time.sleep(4 + attempt * 4)
-            else:
-                raise RuntimeError(f"Gemini fallback also failed: {e}")
-
-    raise RuntimeError(f"Gemini fallback failed after retries: {last_error}")
+    return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens, depth=depth)
 
 
-def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int) -> dict:
+def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
     if not OPENROUTER_API_KEY:
         raise RuntimeError(
-            "OpenRouter fallback unavailable: set OPENROUTER_API_KEY in "
+            "OpenRouter unavailable: set OPENROUTER_API_KEY in "
             "config.py / Replit Secrets."
         )
+
+    max_tokens = min(max_tokens, OPENROUTER_MAX_TOKENS_CEILING)
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -272,10 +254,10 @@ def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int) -> 
             data = resp.json()
             raw = data["choices"][0]["message"]["content"]
 
-            def _retry_with_more_tokens(new_max_tokens):
-                return _call_openrouter(system_prompt, user_content, new_max_tokens)
+            def _retry_with_more_tokens(new_max_tokens, new_depth):
+                return _call_openrouter(system_prompt, user_content, new_max_tokens, depth=new_depth)
 
-            return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens)
+            return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens, depth=depth)
 
         except Exception as e:
             last_error = e
@@ -288,25 +270,19 @@ def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int) -> 
 
 
 def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    """Tries Groq, then Gemini, then OpenRouter, in order."""
+    """Tries OpenRouter first (primary); falls back to Groq if it fails."""
     errors = []
-
-    try:
-        return _call_groq(client, system_prompt, user_content, max_tokens)
-    except Exception as e:
-        errors.append(f"Groq: {e}")
-        print(f"[script_generator] Groq failed ({e}). Trying Gemini...")
-
-    try:
-        return _call_gemini(system_prompt, user_content, max_tokens)
-    except Exception as e:
-        errors.append(f"Gemini: {e}")
-        print(f"[script_generator] Gemini failed ({e}). Trying OpenRouter...")
 
     try:
         return _call_openrouter(system_prompt, user_content, max_tokens)
     except Exception as e:
         errors.append(f"OpenRouter: {e}")
+        print(f"[script_generator] OpenRouter failed ({e}). Trying Groq...")
+
+    try:
+        return _call_groq(client, system_prompt, user_content, max_tokens)
+    except Exception as e:
+        errors.append(f"Groq: {e}")
 
     raise RuntimeError("All LLM providers failed.\n" + "\n".join(errors))
 
@@ -326,7 +302,12 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    max_tokens = 12000
+    # llama-3.3-70b-versatile has no hidden "reasoning" token overhead, so the
+    # completion budget can track the actual chunk size (roughly 6 tokens per
+    # word of narration, plus JSON overhead) instead of needing a huge flat
+    # floor. Still capped well under the account's 8000 TPM limit in
+    # _call_groq.
+    max_tokens = min(3000, max(600, word_budget * 6))
 
     if is_first_chunk:
         user_content = f"Topic: {topic}"
