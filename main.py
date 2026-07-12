@@ -45,78 +45,324 @@ JOBS_LOCK = threading.Lock()
 
 PAGE = """
 <!doctype html>
-<title>YT Automation</title>
-<h2>Generate a video draft</h2>
-<p><a href="/authorize" target="_blank">Connect / reconnect YouTube channel</a></p>
-<form id="genForm">
-  <div style="margin-bottom:8px">
-    <input id="topic" name="topic" style="width:400px" placeholder="e.g. The Tulip Mania bubble of 1637" required>
-  </div>
-  <div style="margin-bottom:8px">
-    <label>Voiceover language:
-      <select id="language" name="language">
-        {% for code, name in languages.items() %}
-        <option value="{{ code }}" {% if code == default_language %}selected{% endif %}>{{ name }}</option>
-        {% endfor %}
-      </select>
-    </label>
-  </div>
-  <div style="margin-bottom:8px">
-    <label>Video length:
-      <select id="duration" name="duration">
-        {% for key, minutes in duration_presets.items() %}
-        <option value="{{ minutes }}" {% if minutes == default_duration %}selected{% endif %}>
-          {{ key|capitalize }} (~{{ minutes }} min)
-        </option>
-        {% endfor %}
-      </select>
-    </label>
-  </div>
-  <div style="margin-bottom:8px">
-    <label>Voiceover:
-      <select id="voiceGender" name="voiceGender">
-        {% for gender in voice_genders %}
-        <option value="{{ gender }}" {% if gender == default_voice_gender %}selected{% endif %}>{{ gender|capitalize }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <small>(free edge-tts neural voice — male/female both fully supported)</small>
-  </div>
-  <div style="margin-bottom:8px">
-    <label>Video style:
-      <select id="videoStyle" name="videoStyle">
-        {% for key, style in video_styles.items() %}
-        <option value="{{ key }}" {% if key == default_video_style %}selected{% endif %}>{{ style.name }}</option>
-        {% endfor %}
-      </select>
-    </label>
-  </div>
-  <div style="margin-bottom:8px">
-    <label><input type="checkbox" id="includeIntro" checked> Add intro title card</label>
-    &nbsp;&nbsp;
-    <label><input type="checkbox" id="includeOutro" checked> Add outro / subscribe card</label>
-  </div>
-  <button type="submit" id="genBtn">Generate</button>
-</form>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WealthThroughAges — Video Studio</title>
+<style>
+  :root {
+    --ink: #0B1220;
+    --panel: #141B2D;
+    --panel-raised: #1B2436;
+    --hairline: rgba(198,164,84,0.22);
+    --gold: #C6A454;
+    --gold-bright: #DFC078;
+    --text: #EDEAE2;
+    --muted: #8B93A6;
+    --success: #34D399;
+    --error: #F87171;
+    --error-bg: #2A1212;
+    --error-border: #7F1D1D;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    padding: 0 0 48px 0;
+  }
+  .masthead {
+    padding: 22px 20px 18px 20px;
+    border-bottom: 1px solid var(--hairline);
+    background: linear-gradient(180deg, #101828 0%, var(--ink) 100%);
+  }
+  .eyebrow {
+    font-size: 12px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--gold);
+    font-weight: 600;
+    margin: 0 0 6px 0;
+  }
+  h1 {
+    font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+    font-size: 26px;
+    font-weight: 400;
+    margin: 0 0 12px 0;
+    color: var(--text);
+  }
+  .connect-link {
+    display: inline-block;
+    font-size: 13px;
+    color: var(--gold-bright);
+    text-decoration: none;
+    border: 1px solid var(--hairline);
+    padding: 6px 12px;
+    border-radius: 20px;
+  }
+  .connect-link:hover { border-color: var(--gold); }
 
-<div id="progressWrap" style="display:none; margin-top:16px;">
-  <div style="background:#2a2a2a; border-radius:6px; overflow:hidden; height:22px; width:100%; max-width:480px;">
-    <div id="progressFill" style="background:#3b82f6; height:100%; width:0%; transition:width 0.4s ease; text-align:right;"></div>
+  .container {
+    max-width: 560px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--hairline);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .field { margin-bottom: 18px; }
+  .field:last-of-type { margin-bottom: 0; }
+  label.field-label {
+    display: block;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  input[type=text], input:not([type]), select {
+    width: 100%;
+    background: var(--panel-raised);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    padding: 11px 12px;
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+  }
+  input:focus, select:focus {
+    outline: none;
+    border-color: var(--gold);
+    box-shadow: 0 0 0 3px rgba(198,164,84,0.15);
+  }
+  .row-2 { display: flex; gap: 12px; }
+  .row-2 .field { flex: 1; }
+  .hint {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+  .checkbox-row {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  .checkbox-row label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: var(--text);
+  }
+  input[type=checkbox] {
+    width: 18px; height: 18px;
+    accent-color: var(--gold);
+  }
+  .divider {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--hairline), transparent);
+    margin: 18px 0;
+  }
+  button#genBtn {
+    width: 100%;
+    background: var(--gold);
+    color: #1A1305;
+    border: none;
+    border-radius: 8px;
+    padding: 13px 16px;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    margin-top: 20px;
+  }
+  button#genBtn:hover:not(:disabled) { background: var(--gold-bright); }
+  button#genBtn:disabled {
+    background: #3A3F4A;
+    color: var(--muted);
+    cursor: not-allowed;
+  }
+
+  #progressWrap { margin-top: 18px; }
+  .progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+  }
+  #progressLabel { font-size: 13px; color: var(--text); }
+  #progressPercent { font-size: 13px; color: var(--gold-bright); font-weight: 600; }
+  .progress-track {
+    background: var(--panel-raised);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    overflow: hidden;
+    height: 10px;
+    width: 100%;
+  }
+  #progressFill {
+    background: linear-gradient(90deg, var(--gold) 0%, var(--gold-bright) 100%);
+    height: 100%;
+    width: 0%;
+    transition: width 0.4s ease;
+  }
+
+  #errorBox {
+    margin-top: 18px;
+    padding: 14px 16px;
+    border: 1px solid var(--error-border);
+    border-left: 4px solid var(--error);
+    border-radius: 8px;
+    background: var(--error-bg);
+  }
+  #errorBox strong {
+    color: var(--error);
+    font-size: 14px;
+  }
+  #errorStep {
+    margin: 6px 0 2px 0;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  #errorMessage {
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 8px 0 0 0;
+    font-size: 12.5px;
+    color: #FCA5A5;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  }
+
+  #result {
+    margin-top: 20px;
+  }
+  #result .card h3 {
+    font-family: Georgia, "Iowan Old Style", serif;
+    font-weight: 400;
+    font-size: 20px;
+    margin: 0 0 8px 0;
+    color: var(--text);
+  }
+  #result .card p { color: var(--muted); font-size: 14px; }
+  #result video {
+    width: 100%;
+    border-radius: 8px;
+    margin: 10px 0;
+    border: 1px solid var(--hairline);
+  }
+  #result a.action-link {
+    display: inline-block;
+    margin-top: 8px;
+    margin-right: 12px;
+    font-size: 13px;
+    color: var(--gold-bright);
+    text-decoration: none;
+    border: 1px solid var(--hairline);
+    padding: 8px 14px;
+    border-radius: 20px;
+  }
+  #result a.action-link:hover { border-color: var(--gold); }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <div class="container" style="padding:0;">
+    <p class="eyebrow">{{ channel_name }} · Video Studio</p>
+    <h1>Generate a video draft</h1>
+    <a class="connect-link" href="/authorize" target="_blank">Connect / reconnect YouTube channel</a>
   </div>
-  <p id="status" style="margin-top:6px;"></p>
 </div>
 
-<div id="errorBox" style="display:none; margin-top:16px; max-width:480px; padding:12px 16px; border:2px solid #dc2626; border-radius:6px; background:#2a1212; color:#fca5a5;">
-  <strong style="color:#f87171;">Generation failed</strong>
-  <p id="errorStep" style="margin:6px 0 2px 0; color:#fca5a5;"></p>
-  <pre id="errorMessage" style="white-space:pre-wrap; word-break:break-word; margin:4px 0 0 0; font-size:13px;"></pre>
-</div>
+<div class="container">
+  <div class="card">
+    <form id="genForm">
+      <div class="field">
+        <label class="field-label" for="topic">Topic</label>
+        <input id="topic" name="topic" placeholder="e.g. The Tulip Mania bubble of 1637" required>
+      </div>
 
-<div id="result"></div>
+      <div class="field">
+        <label class="field-label" for="language">Voiceover language</label>
+        <select id="language" name="language">
+          {% for code, name in languages.items() %}
+          <option value="{{ code }}" {% if code == default_language %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="row-2">
+        <div class="field">
+          <label class="field-label" for="duration">Video length</label>
+          <select id="duration" name="duration">
+            {% for key, minutes in duration_presets.items() %}
+            <option value="{{ minutes }}" {% if minutes == default_duration %}selected{% endif %}>
+              {{ key|capitalize }} (~{{ minutes }} min)
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label" for="voiceGender">Voiceover</label>
+          <select id="voiceGender" name="voiceGender">
+            {% for gender in voice_genders %}
+            <option value="{{ gender }}" {% if gender == default_voice_gender %}selected{% endif %}>{{ gender|capitalize }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <span class="hint">Free edge-tts neural voice — male and female both fully supported.</span>
+
+      <div class="field" style="margin-top:18px;">
+        <label class="field-label" for="videoStyle">Video style</label>
+        <select id="videoStyle" name="videoStyle">
+          {% for key, style in video_styles.items() %}
+          <option value="{{ key }}" {% if key == default_video_style %}selected{% endif %}>{{ style.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="field checkbox-row">
+        <label><input type="checkbox" id="includeIntro" checked> Add intro title card</label>
+        <label><input type="checkbox" id="includeOutro" checked> Add outro / subscribe card</label>
+      </div>
+
+      <button type="submit" id="genBtn">Generate</button>
+    </form>
+
+    <div id="progressWrap" style="display:none;">
+      <div class="progress-header">
+        <span id="progressLabel">Starting…</span>
+        <span id="progressPercent">0%</span>
+      </div>
+      <div class="progress-track">
+        <div id="progressFill"></div>
+      </div>
+    </div>
+
+    <div id="errorBox" style="display:none;">
+      <strong>Generation failed</strong>
+      <p id="errorStep"></p>
+      <pre id="errorMessage"></pre>
+    </div>
+  </div>
+
+  <div id="result"></div>
+</div>
 
 <script>
 const form = document.getElementById("genForm");
-const statusEl = document.getElementById("status");
+const progressLabel = document.getElementById("progressLabel");
+const progressPercent = document.getElementById("progressPercent");
 const resultEl = document.getElementById("result");
 const btn = document.getElementById("genBtn");
 
@@ -146,7 +392,8 @@ form.addEventListener("submit", async (e) => {
   document.getElementById("errorBox").style.display = "none";
   document.getElementById("progressWrap").style.display = "block";
   document.getElementById("progressFill").style.width = "0%";
-  statusEl.textContent = "Starting…";
+  progressPercent.textContent = "0%";
+  progressLabel.textContent = "Starting…";
 
   const resp = await fetch("/generate", {
     method: "POST",
@@ -180,10 +427,8 @@ async function poll(jobId) {
 
     const pct = typeof data.progress === "number" ? Math.max(0, Math.min(100, data.progress)) : 0;
     document.getElementById("progressFill").style.width = pct + "%";
-    document.getElementById("progressFill").textContent = pct >= 8 ? Math.round(pct) + "%" : "";
-
-    const label = data.detail || STEP_LABELS[data.step] || data.step;
-    statusEl.textContent = Math.round(pct) + "% — " + label;
+    progressPercent.textContent = Math.round(pct) + "%";
+    progressLabel.textContent = data.detail || STEP_LABELS[data.step] || data.step;
 
     if (data.step === "done" || data.step === "pending_approval") {
       const r = data.result;
@@ -191,12 +436,15 @@ async function poll(jobId) {
       if (r.preview_url) {
         extra = "<p>Uploaded to YouTube as <b>private</b>. A Telegram message with an " +
                 "Approve &amp; Publish button has been sent.<br>" +
-                "Private preview: <a href='" + r.preview_url + "' target='_blank'>" + r.preview_url + "</a></p>";
+                "Private preview available.</p>" +
+                "<a class='action-link' href='" + r.preview_url + "' target='_blank'>View on YouTube</a>";
       }
       resultEl.innerHTML =
+        "<div class='card'>" +
         "<h3>" + r.title + "</h3><p>" + r.description + "</p>" +
-        "<video controls width='480' src='" + r.video_url + "'></video><br>" +
-        "<a href='" + r.video_url + "' download>Download MP4</a>" + extra;
+        "<video controls src='" + r.video_url + "'></video>" +
+        "<a class='action-link' href='" + r.video_url + "' download>Download MP4</a>" + extra +
+        "</div>";
       btn.disabled = false;
       return;
     }
@@ -211,7 +459,7 @@ async function poll(jobId) {
     }
     setTimeout(() => poll(jobId), 2000);
   } catch (e) {
-    statusEl.textContent = "Lost connection, retrying…";
+    progressLabel.textContent = "Lost connection, retrying…";
     setTimeout(() => poll(jobId), 3000);
   }
 }
@@ -385,6 +633,7 @@ def run_pipeline_job(
 def index():
     return render_template_string(
         PAGE,
+        channel_name=CHANNEL_NAME,
         languages=LANGUAGES,
         default_language=DEFAULT_LANGUAGE,
         duration_presets=DURATION_PRESETS,
