@@ -1,16 +1,10 @@
 ---
 name: Groq SDK / httpx pin mismatch
-description: Old pinned groq package versions raise TypeError on Client init due to httpx API changes.
+description: Old pinned groq package versions break with current httpx; fix direction.
 ---
 
-Projects that pin an old `groq` Python package (e.g. `groq==0.9.0`) fail at runtime with
-`TypeError: Client.__init__() got an unexpected keyword argument 'proxies'` once a current
-`httpx` is installed alongside it.
+Old pinned `groq` package versions can break when `httpx` is upgraded by the environment/lockfile.
 
-**Why:** the old `groq` SDK passes a `proxies` kwarg into `httpx.Client()` that newer `httpx`
-releases no longer accept. Since `httpx` isn't independently pinned in these requirements
-files, pip installs the latest `httpx`, creating the mismatch.
+**Why:** the `groq` SDK's internal client wiring changed to match newer `httpx` internals; downgrading `httpx` re-triggers other dependency conflicts.
 
-**How to apply:** when this error appears, upgrade `groq` to latest (`pip install -U groq`)
-rather than trying to downgrade `httpx` — the newer SDK is compatible with current `httpx`
-and keeps other dependents happy too.
+**How to apply:** if you see `groq` client errors that look like an httpx API mismatch, upgrade `groq` to a current version rather than pinning `httpx` down.
