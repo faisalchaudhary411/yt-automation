@@ -1,5 +1,8 @@
 """
 Turns a topic into a scene-by-scene documentary narration script.
+
+Primary LLM: Groq. Falls back to Gemini automatically if Groq fails
+(rate limit exhausted, API error, or unparseable output after retries).
 """
 
 import json
@@ -7,14 +10,31 @@ import math
 import re
 import time
 from groq import Groq, RateLimitError, APIError
+
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 from config import (
     GROQ_API_KEY, CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_DURATION_MINUTES,
     VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
 )
 
+# GEMINI_API_KEY is optional — fallback is simply skipped if not configured.
+try:
+    from config import GEMINI_API_KEY
+except ImportError:
+    GEMINI_API_KEY = None
+
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
 CHUNK_TARGET_WORDS = 80
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
+
+if GEMINI_AVAILABLE and GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 
 def _target_word_count(duration_minutes: float) -> int:
@@ -118,6 +138,29 @@ def _extract_scenes_from_truncated(raw: str) -> list:
     return scenes
 
 
+def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int = 0):
+    """Shared JSON parsing/repair logic used by both Groq and Gemini paths."""
+    if raw is None or not raw.strip():
+        raise RuntimeError("LLM returned an empty response.")
+
+    raw = raw.strip()
+    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        repaired = _repair_json(raw)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            scenes = _extract_scenes_from_truncated(raw)
+            if scenes:
+                return {"scenes": scenes}
+            if attempt_more_tokens_callback and max_tokens:
+                return attempt_more_tokens_callback(max_tokens + 4000)
+            raise RuntimeError(f"LLM did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
+
+
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
     for attempt in range(3):
         try:
@@ -141,36 +184,70 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
             raise RuntimeError(f"Groq API error: {e}")
 
     raw = response.choices[0].message.content
-    if raw is None or not raw.strip():
+
+    def _retry_with_more_tokens(new_max_tokens):
+        return _call_groq(client, system_prompt, user_content, new_max_tokens)
+
+    return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens)
+
+
+def _call_gemini(system_prompt: str, user_content: str, max_tokens: int) -> dict:
+    if not (GEMINI_AVAILABLE and GEMINI_API_KEY):
         raise RuntimeError(
-            "Groq returned an empty response. "
-            "Check your API key and model access at console.groq.com"
+            "Gemini fallback unavailable: install google-generativeai and set "
+            "GEMINI_API_KEY in config.py / Replit Secrets."
         )
 
-    raw = raw.strip()
-    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    model = genai.GenerativeModel(
+        GEMINI_MODEL_NAME,
+        system_instruction=system_prompt,
+    )
 
-    try:
-        part = json.loads(raw)
-    except json.JSONDecodeError as e:
-        repaired = _repair_json(raw)
+    last_error = None
+    for attempt in range(3):
         try:
-            part = json.loads(repaired)
-        except json.JSONDecodeError:
-            scenes = _extract_scenes_from_truncated(raw)
-            if scenes:
-                return {"scenes": scenes}
-            if attempt < 2:
-                time.sleep(2)
-                return _call_groq(client, system_prompt, user_content, max_tokens + 4000)
-            raise RuntimeError(f"Groq did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
+            response = model.generate_content(
+                user_content,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.7,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                ),
+            )
+            raw = response.text
 
-    return part
+            def _retry_with_more_tokens(new_max_tokens):
+                return _call_gemini(system_prompt, user_content, new_max_tokens)
+
+            return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens)
+
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(4 + attempt * 4)
+            else:
+                raise RuntimeError(f"Gemini fallback also failed: {e}")
+
+    raise RuntimeError(f"Gemini fallback failed after retries: {last_error}")
+
+
+def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
+    """Tries Groq first; transparently falls back to Gemini on any failure."""
+    try:
+        return _call_groq(client, system_prompt, user_content, max_tokens)
+    except Exception as groq_error:
+        print(f"[script_generator] Groq failed ({groq_error}). Falling back to Gemini...")
+        try:
+            return _call_gemini(system_prompt, user_content, max_tokens)
+        except Exception as gemini_error:
+            raise RuntimeError(
+                f"Both Groq and Gemini failed.\nGroq error: {groq_error}\nGemini error: {gemini_error}"
+            )
 
 
 def _generate_metadata(client: Groq, topic: str, language_name: str, style: str) -> dict:
     system_prompt = _build_metadata_prompt(language_name, style)
-    part = _call_groq(client, system_prompt, f"Topic: {topic}", max_tokens=4096)
+    part = _call_llm(client, system_prompt, f"Topic: {topic}", max_tokens=4096)
     return {
         "title": part.get("title") or topic,
         "description": part.get("description") or "",
@@ -196,16 +273,16 @@ def _generate_scenes_chunk(
             f"there — do not repeat earlier content, do not restart the introduction."
         )
 
-    part = _call_groq(client, system_prompt, user_content, max_tokens)
-    
+    part = _call_llm(client, system_prompt, user_content, max_tokens)
+
     if "scenes" not in part or not part["scenes"]:
         raise RuntimeError("Generated script chunk has no scenes.")
-    
+
     actual_words = _count_narration_words(part["scenes"])
 
     if actual_words < word_budget * MIN_ACCEPTABLE_RATIO:
         try:
-            retry_part = _call_groq(
+            retry_part = _call_llm(
                 client, system_prompt,
                 user_content + f"\n\n(Your last attempt only had about {actual_words} words — "
                 f"write more this time, aiming for at least {word_budget} words.)",
