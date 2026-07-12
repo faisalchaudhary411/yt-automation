@@ -282,7 +282,16 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
     if _samba_quota_exhausted:
         raise RuntimeError("SambaNova skipped: quota already confirmed exhausted this run.")
 
-    max_tokens = min(max_tokens, SAMBANOVA_MAX_TOKENS_CEILING)
+    # gpt-oss-120b is a reasoning model: it spends part of its token budget on
+    # hidden chain-of-thought before writing the actual answer. If max_tokens
+    # is too small, ALL of it can get consumed by reasoning, leaving nothing
+    # for the actual JSON content (a 200 OK with an empty message.content —
+    # not an error SambaNova reports, just silently produces no answer).
+    # Fix: keep reasoning effort low (this task needs creative writing, not
+    # multi-step reasoning) and enforce a floor well above what pure JSON
+    # output would need, so reasoning can't eat the whole budget.
+    SAMBANOVA_MIN_TOKENS_FLOOR = 2500
+    max_tokens = min(max(max_tokens, SAMBANOVA_MIN_TOKENS_FLOOR), SAMBANOVA_MAX_TOKENS_CEILING)
 
     headers = {
         "Authorization": f"Bearer {SAMBANOVA_API_KEY}",
@@ -296,6 +305,7 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
         ],
         "temperature": 0.7,
         "max_tokens": max_tokens,
+        "reasoning_effort": "low",
         # NOTE: response_format={"type": "json_object"} is deliberately omitted —
         # SambaNova's OpenAI-compatible endpoint doesn't reliably support it for
         # gpt-oss-120b and returned a 400 with it included. The system prompt
@@ -330,7 +340,17 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
                 raise RuntimeError(f"SambaNova API error (HTTP {resp.status_code}): {resp.text[:500]}")
 
             data = resp.json()
-            raw = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            raw = choice["message"]["content"]
+
+            if not raw or not raw.strip():
+                finish_reason = choice.get("finish_reason", "unknown")
+                usage = data.get("usage", {})
+                raise RuntimeError(
+                    f"SambaNova returned empty content (finish_reason={finish_reason}, "
+                    f"usage={usage}) — likely ran out of tokens mid-reasoning before "
+                    f"writing the answer. Try raising the token budget further."
+                )
 
             def _retry_with_more_tokens(new_max_tokens, new_depth):
                 return _call_samba(system_prompt, user_content, new_max_tokens, depth=new_depth)
