@@ -187,6 +187,24 @@ GROQ_TPM_LIMIT = 8000
 GROQ_SAFETY_MARGIN = 1500  # headroom for prompt tokens + estimation error
 
 
+# Groq's rate-limit error messages include an exact "try again in Xs/Xm" —
+# when that wait is short enough to be worth it, sleep exactly that long and
+# retry instead of giving up (previously we ignored this and just failed).
+# Capped so a long token-per-day reset doesn't block the whole job for ages —
+# in that case it's better to fail fast and let SambaNova (primary) carry it.
+MAX_GROQ_RATE_LIMIT_WAIT_SECONDS = 600  # 10 min ceiling
+
+
+def _extract_retry_after_seconds(message: str):
+    """Parses Groq's 'Please try again in 8m14.208s' / '45.2s' style hints."""
+    match = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", message)
+    if not match:
+        return None
+    minutes = float(match.group(1)) if match.group(1) else 0.0
+    seconds = float(match.group(2))
+    return minutes * 60 + seconds
+
+
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
     max_tokens = min(max_tokens, GROQ_TPM_LIMIT - GROQ_SAFETY_MARGIN)
 
@@ -203,13 +221,31 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
                 response_format={"type": "json_object"},
             )
             break
-        except RateLimitError:
+        except RateLimitError as e:
+            wait_seconds = _extract_retry_after_seconds(str(e))
+            if wait_seconds is not None and wait_seconds <= MAX_GROQ_RATE_LIMIT_WAIT_SECONDS:
+                print(f"[script_generator]   Groq rate limited — waiting {wait_seconds:.0f}s "
+                      f"(as advised) before retrying...")
+                time.sleep(wait_seconds + 2)  # small buffer past the exact reset moment
+                continue
+            if wait_seconds is not None:
+                # Wait would be too long (e.g. a full daily quota reset) — not
+                # worth blocking this job; let the caller fall back to SambaNova/fail.
+                raise RuntimeError(
+                    f"Groq rate limited with a {wait_seconds:.0f}s wait — too long to block on. {e}"
+                )
             if attempt < 3:
                 time.sleep(8 + attempt * 4)
             else:
                 raise
         except APIError as e:
             msg = str(e)
+            wait_seconds = _extract_retry_after_seconds(msg)
+            if wait_seconds is not None and wait_seconds <= MAX_GROQ_RATE_LIMIT_WAIT_SECONDS:
+                print(f"[script_generator]   Groq rate limited — waiting {wait_seconds:.0f}s "
+                      f"(as advised) before retrying...")
+                time.sleep(wait_seconds + 2)
+                continue
             if "rate_limit_exceeded" in msg or "tokens per minute" in msg or "413" in msg:
                 # Request was too large for the TPM budget: shrink it and retry
                 # rather than failing the whole job outright.
@@ -260,7 +296,12 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
         ],
         "temperature": 0.7,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
+        # NOTE: response_format={"type": "json_object"} is deliberately omitted —
+        # SambaNova's OpenAI-compatible endpoint doesn't reliably support it for
+        # gpt-oss-120b and returned a 400 with it included. The system prompt
+        # already instructs strict JSON-only output, and _parse_llm_json's
+        # repair logic (fence-stripping, bracket balancing, regex extraction)
+        # handles the occasional rough edge without needing enforced JSON mode.
     }
 
     last_error = None
@@ -281,7 +322,13 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
 
             if resp.status_code == 429:
                 raise RuntimeError("SambaNova rate limited")
-            resp.raise_for_status()
+
+            if not resp.ok:
+                # Surface the actual response body instead of requests' generic
+                # "400 Client Error: BAD REQUEST" — that's what actually says
+                # *which* field/param SambaNova rejected.
+                raise RuntimeError(f"SambaNova API error (HTTP {resp.status_code}): {resp.text[:500]}")
+
             data = resp.json()
             raw = data["choices"][0]["message"]["content"]
 
