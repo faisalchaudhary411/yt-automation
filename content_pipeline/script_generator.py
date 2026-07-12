@@ -170,11 +170,21 @@ def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int
             raise RuntimeError(f"LLM did not return valid JSON: {e}\nRaw output:\n{raw[:500]}")
 
 
+# This Groq account is on the "on_demand" tier, which caps requests at 8000
+# tokens per minute (prompt + max_completion_tokens counts against this,
+# whether or not the model actually uses that many). Stay comfortably under
+# that on every single call, no matter how large the request wanted to be.
+GROQ_TPM_LIMIT = 8000
+GROQ_SAFETY_MARGIN = 1500  # headroom for prompt tokens + estimation error
+
+
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    for attempt in range(3):
+    max_tokens = min(max_tokens, GROQ_TPM_LIMIT - GROQ_SAFETY_MARGIN)
+
+    for attempt in range(4):
         try:
             response = client.chat.completions.create(
-                model="qwen/qwen3.6-27b",  # Groq recommended replacement (Aug 2026)
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -185,11 +195,19 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
             )
             break
         except RateLimitError:
-            if attempt < 2:
+            if attempt < 3:
                 time.sleep(8 + attempt * 4)
             else:
                 raise
         except APIError as e:
+            msg = str(e)
+            if "rate_limit_exceeded" in msg or "tokens per minute" in msg or "413" in msg:
+                # Request was too large for the TPM budget: shrink it and retry
+                # rather than failing the whole job outright.
+                if attempt < 3 and max_tokens > 1000:
+                    max_tokens = max(1000, int(max_tokens * 0.6))
+                    time.sleep(6 + attempt * 4)
+                    continue
             raise RuntimeError(f"Groq API error: {e}")
 
     raw = response.choices[0].message.content
@@ -326,7 +344,12 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    max_tokens = 12000
+    # llama-3.3-70b-versatile has no hidden "reasoning" token overhead, so the
+    # completion budget can track the actual chunk size (roughly 6 tokens per
+    # word of narration, plus JSON overhead) instead of needing a huge flat
+    # floor. Still capped well under the account's 8000 TPM limit in
+    # _call_groq.
+    max_tokens = min(3000, max(600, word_budget * 6))
 
     if is_first_chunk:
         user_content = f"Topic: {topic}"
