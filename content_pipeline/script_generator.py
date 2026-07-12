@@ -273,16 +273,23 @@ def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: i
     """Tries OpenRouter first (primary); falls back to Groq if it fails."""
     errors = []
 
+    or_start = time.time()
     try:
-        return _call_openrouter(system_prompt, user_content, max_tokens)
+        result = _call_openrouter(system_prompt, user_content, max_tokens)
+        print(f"[script_generator]   OpenRouter succeeded in {time.time() - or_start:.1f}s")
+        return result
     except Exception as e:
         errors.append(f"OpenRouter: {e}")
-        print(f"[script_generator] OpenRouter failed ({e}). Trying Groq...")
+        print(f"[script_generator]   OpenRouter failed after {time.time() - or_start:.1f}s ({e}). Trying Groq...")
 
+    groq_start = time.time()
     try:
-        return _call_groq(client, system_prompt, user_content, max_tokens)
+        result = _call_groq(client, system_prompt, user_content, max_tokens)
+        print(f"[script_generator]   Groq succeeded in {time.time() - groq_start:.1f}s")
+        return result
     except Exception as e:
         errors.append(f"Groq: {e}")
+        print(f"[script_generator]   Groq also failed after {time.time() - groq_start:.1f}s ({e})")
 
     raise RuntimeError("All LLM providers failed.\n" + "\n".join(errors))
 
@@ -358,7 +365,11 @@ def generate_script(
 
     client = Groq(api_key=GROQ_API_KEY)
 
+    print(f"[script_generator] Starting: topic='{topic}', target={total_target_words} words "
+          f"across {num_chunks} chunk(s)")
+
     metadata = _generate_metadata(client, topic, language_name, style)
+    print(f"[script_generator] Metadata generated: \"{metadata['title']}\"")
 
     all_scenes = []
     remaining_words = total_target_words
@@ -372,12 +383,18 @@ def generate_script(
         if all_scenes:
             previous_tail = all_scenes[-1]["narration"][-300:]
 
+        chunk_start = time.time()
         part = _generate_scenes_chunk(
             client, topic, language_name, style, word_budget, is_first, previous_tail,
         )
+        chunk_elapsed = time.time() - chunk_start
 
         all_scenes.extend(part["scenes"])
         remaining_words -= _count_narration_words(part["scenes"])
+
+        words_so_far = _count_narration_words(all_scenes)
+        print(f"[script_generator] Chunk {chunk_index + 1}/{num_chunks} done in {chunk_elapsed:.1f}s "
+              f"— {words_so_far}/{total_target_words} words, {len(all_scenes)} scenes so far")
 
     actual_total_words = _count_narration_words(all_scenes)
     print(f"[script_generator] target={total_target_words} words, actual={actual_total_words} words, "
