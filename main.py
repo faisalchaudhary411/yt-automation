@@ -98,7 +98,20 @@ PAGE = """
   </div>
   <button type="submit" id="genBtn">Generate</button>
 </form>
-<p id="status"></p>
+
+<div id="progressWrap" style="display:none; margin-top:16px;">
+  <div style="background:#2a2a2a; border-radius:6px; overflow:hidden; height:22px; width:100%; max-width:480px;">
+    <div id="progressFill" style="background:#3b82f6; height:100%; width:0%; transition:width 0.4s ease; text-align:right;"></div>
+  </div>
+  <p id="status" style="margin-top:6px;"></p>
+</div>
+
+<div id="errorBox" style="display:none; margin-top:16px; max-width:480px; padding:12px 16px; border:2px solid #dc2626; border-radius:6px; background:#2a1212; color:#fca5a5;">
+  <strong style="color:#f87171;">Generation failed</strong>
+  <p id="errorStep" style="margin:6px 0 2px 0; color:#fca5a5;"></p>
+  <pre id="errorMessage" style="white-space:pre-wrap; word-break:break-word; margin:4px 0 0 0; font-size:13px;"></pre>
+</div>
+
 <div id="result"></div>
 
 <script>
@@ -130,6 +143,9 @@ form.addEventListener("submit", async (e) => {
   const includeOutro = document.getElementById("includeOutro").checked;
   btn.disabled = true;
   resultEl.innerHTML = "";
+  document.getElementById("errorBox").style.display = "none";
+  document.getElementById("progressWrap").style.display = "block";
+  document.getElementById("progressFill").style.width = "0%";
   statusEl.textContent = "Starting…";
 
   const resp = await fetch("/generate", {
@@ -146,7 +162,10 @@ form.addEventListener("submit", async (e) => {
   });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({error: "Unknown error"}));
-    statusEl.textContent = "Error: " + err.error;
+    document.getElementById("progressWrap").style.display = "none";
+    document.getElementById("errorBox").style.display = "block";
+    document.getElementById("errorStep").textContent = "Failed at: request validation";
+    document.getElementById("errorMessage").textContent = err.error;
     btn.disabled = false;
     return;
   }
@@ -158,7 +177,13 @@ async function poll(jobId) {
   try {
     const resp = await fetch("/status/" + jobId);
     const data = await resp.json();
-    statusEl.textContent = STEP_LABELS[data.step] || data.step;
+
+    const pct = typeof data.progress === "number" ? Math.max(0, Math.min(100, data.progress)) : 0;
+    document.getElementById("progressFill").style.width = pct + "%";
+    document.getElementById("progressFill").textContent = pct >= 8 ? Math.round(pct) + "%" : "";
+
+    const label = data.detail || STEP_LABELS[data.step] || data.step;
+    statusEl.textContent = Math.round(pct) + "% — " + label;
 
     if (data.step === "done" || data.step === "pending_approval") {
       const r = data.result;
@@ -176,7 +201,11 @@ async function poll(jobId) {
       return;
     }
     if (data.step === "error") {
-      statusEl.textContent = "Error: " + data.error;
+      document.getElementById("progressWrap").style.display = "none";
+      document.getElementById("errorBox").style.display = "block";
+      const failedStepLabel = STEP_LABELS[data.failed_step] || data.failed_step || "unknown step";
+      document.getElementById("errorStep").textContent = "Failed during: " + failedStepLabel;
+      document.getElementById("errorMessage").textContent = data.error || "Unknown error.";
       btn.disabled = false;
       return;
     }
@@ -195,6 +224,29 @@ def _set_job(job_id: str, **fields):
         JOBS[job_id].update(fields)
 
 
+# Overall progress (0-100) is split across pipeline stages by rough relative
+# cost. Script generation and video assembly get fine-grained sub-progress
+# (per chunk / per clip); audio and image steps currently only jump between
+# their start/end bounds since those modules don't expose a progress hook yet.
+STEP_RANGES = {
+    "script": (0, 35),
+    "audio": (35, 55),
+    "images": (55, 70),
+    "video": (70, 95),
+    "uploading": (95, 100),
+}
+
+
+def _set_progress(job_id: str, step: str, fraction: float, detail: str = None):
+    start, end = STEP_RANGES.get(step, (0, 100))
+    fraction = max(0.0, min(1.0, fraction))
+    progress = round(start + fraction * (end - start), 1)
+    fields = {"step": step, "progress": progress}
+    if detail is not None:
+        fields["detail"] = detail
+    _set_job(job_id, **fields)
+
+
 def run_pipeline_job(
     job_id: str,
     topic: str,
@@ -209,20 +261,57 @@ def run_pipeline_job(
     try:
         work_dir = ensure_work_dir(job_id)
 
-        _set_job(job_id, step="script")
+        _set_progress(job_id, "script", 0.0, detail="Starting script generation…")
         print(f"[1/4] Generating script for: {topic} (lang={language}, ~{duration_minutes}min, style={style})")
-        script = generate_script(topic, language=language, duration_minutes=duration_minutes, style=style)
 
-        _set_job(job_id, step="audio")
+        def _script_progress(chunks_done, total_chunks):
+            frac = chunks_done / total_chunks if total_chunks else 0.0
+            _set_progress(job_id, "script", frac, detail=f"Writing script: chunk {chunks_done}/{total_chunks}")
+
+        script = generate_script(
+            topic, language=language, duration_minutes=duration_minutes, style=style,
+            progress_callback=_script_progress,
+        )
+
+        _set_progress(job_id, "audio", 0.0, detail=f"Generating narration audio ({len(script['scenes'])} scenes)…")
         print(f"[2/4] Generating narration audio ({len(script['scenes'])} scenes, voice={voice_gender})")
-        script["scenes"] = generate_all_scene_audio(script["scenes"], work_dir, language=language, voice_gender=voice_gender)
 
-        _set_job(job_id, step="images")
+        def _audio_progress(done, total):
+            frac = done / total if total else 0.0
+            _set_progress(job_id, "audio", frac, detail=f"Narration audio: {done}/{total} scenes")
+
+        script["scenes"] = generate_all_scene_audio(
+            script["scenes"], work_dir, language=language, voice_gender=voice_gender,
+            progress_callback=_audio_progress,
+        )
+        _set_progress(job_id, "audio", 1.0, detail="Narration audio complete")
+
+        _set_progress(job_id, "images", 0.0, detail="Fetching scene images…")
         print("[3/4] Fetching scene images")
-        script["scenes"] = fetch_all_scene_images(script["scenes"], work_dir)
 
-        _set_job(job_id, step="video")
+        def _images_progress(phase, done, total):
+            # Search and download are each half of this step.
+            frac = (0.5 * (done / total if total else 0.0)) if phase == "search" else (0.5 + 0.5 * (done / total if total else 0.0))
+            label = "Searching images" if phase == "search" else "Downloading images"
+            _set_progress(job_id, "images", frac, detail=f"{label}: {done}/{total} scenes")
+
+        script["scenes"] = fetch_all_scene_images(script["scenes"], work_dir, progress_callback=_images_progress)
+        _set_progress(job_id, "images", 1.0, detail="Scene images complete")
+
+        _set_progress(job_id, "video", 0.0, detail="Assembling final video…")
         print("[4/4] Assembling final video")
+
+        def _video_progress(phase, done, total):
+            if phase == "clips":
+                # Clip rendering is the bulk of the video step (0-90% of this stage);
+                # the final crossfade join gets the remaining 90-100%.
+                frac = 0.9 * (done / total if total else 0.0)
+                detail = f"Rendering scene clip {done}/{total}"
+            else:  # "join"
+                frac = 0.9 + 0.1 * done  # done is 0 or 1
+                detail = "Joining final video…" if done == 0 else "Final video assembled"
+            _set_progress(job_id, "video", frac, detail=detail)
+
         video_path = assemble_video(
             script["scenes"], work_dir,
             title=script["title"],
@@ -230,6 +319,7 @@ def run_pipeline_job(
             include_intro=include_intro,
             include_outro=include_outro,
             style=style,
+            progress_callback=_video_progress,
         )
 
         result = {
@@ -243,7 +333,7 @@ def run_pipeline_job(
 
         # --- Stage 2: upload as private + Telegram approval gate ---
         try:
-            _set_job(job_id, step="uploading")
+            _set_progress(job_id, "uploading", 0.0, detail="Uploading to YouTube as private…")
             print("[5/5] Uploading to YouTube as private")
             access_token = get_access_token()
             video_id = upload_video(
@@ -267,6 +357,7 @@ def run_pipeline_job(
 
             send_approval_request(script["title"], approve_url, preview_url)
             job_step = "pending_approval"
+            _set_progress(job_id, "uploading", 1.0, detail="Uploaded, awaiting approval")
         except Exception as e:
             # Upload failing shouldn't hide the fact that the video itself rendered fine —
             # the local file is still downloadable from the UI either way.
@@ -282,10 +373,12 @@ def run_pipeline_job(
         except Exception as e:
             print(f"Warning: could not log draft to GitHub ({e}). Continuing anyway.")
 
-        _set_job(job_id, step=job_step, result=result)
+        _set_job(job_id, step=job_step, result=result, progress=100.0, detail="Complete")
     except Exception as e:
         traceback.print_exc()
-        _set_job(job_id, step="error", error=str(e))
+        with JOBS_LOCK:
+            failed_step = JOBS.get(job_id, {}).get("step", "unknown")
+        _set_job(job_id, step="error", error=str(e), failed_step=failed_step)
 
 
 @app.route("/")
@@ -340,7 +433,7 @@ def generate_endpoint():
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
-        JOBS[job_id] = {"step": "queued", "topic": topic, "created_at": time.time()}
+        JOBS[job_id] = {"step": "queued", "topic": topic, "created_at": time.time(), "progress": 0.0, "detail": "Queued…"}
 
     thread = threading.Thread(
         target=run_pipeline_job,
