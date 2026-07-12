@@ -29,7 +29,12 @@ except ImportError:
 
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
-CHUNK_TARGET_WORDS = 80
+CHUNK_TARGET_WORDS = 200  # bigger chunks = fewer sequential API round-trips per
+                          # script (each one carries fixed overhead — network
+                          # latency, provider fallback checks, etc. — regardless
+                          # of chunk size, so fewer/larger chunks finish faster
+                          # overall). Was 80; a 450-word "short" script now
+                          # takes ~3 chunks instead of ~6.
 OPENROUTER_MODEL_NAME = "openai/gpt-oss-120b:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MAX_TOKENS_CEILING = 8000  # hard cap so the +4000 retry growth in
@@ -220,12 +225,24 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens, depth=depth)
 
 
+# Once OpenRouter reports quota/credit exhaustion, there's no point retrying
+# it on every subsequent chunk for the rest of this process's lifetime — that
+# was costing ~15-20+ seconds of dead retries per chunk. Skip straight to
+# Groq after the first confirmed exhaustion; a Repl restart re-checks it.
+_openrouter_quota_exhausted = False
+
+
 def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
+    global _openrouter_quota_exhausted
+
     if not OPENROUTER_API_KEY:
         raise RuntimeError(
             "OpenRouter unavailable: set OPENROUTER_API_KEY in "
             "config.py / Replit Secrets."
         )
+
+    if _openrouter_quota_exhausted:
+        raise RuntimeError("OpenRouter skipped: quota already confirmed exhausted this run.")
 
     max_tokens = min(max_tokens, OPENROUTER_MAX_TOKENS_CEILING)
 
@@ -248,6 +265,18 @@ def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, dep
     for attempt in range(3):
         try:
             resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+
+            # Quota/credit exhaustion (402 Payment Required, or a 429 whose body
+            # actually says "quota"/"credit" rather than a normal short-term rate
+            # limit) won't recover by retrying a few seconds later — fail fast
+            # and flag it so later chunks don't repeat the same dead attempt.
+            body_lower = (resp.text or "").lower()
+            if resp.status_code == 402 or (
+                resp.status_code == 429 and ("quota" in body_lower or "credit" in body_lower)
+            ):
+                _openrouter_quota_exhausted = True
+                raise RuntimeError(f"OpenRouter quota/credits exhausted (HTTP {resp.status_code}): {resp.text[:200]}")
+
             if resp.status_code == 429:
                 raise RuntimeError("OpenRouter rate limited")
             resp.raise_for_status()
@@ -261,6 +290,9 @@ def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int, dep
 
         except Exception as e:
             last_error = e
+            if _openrouter_quota_exhausted:
+                # Fail immediately, no point sleeping and retrying a dead quota.
+                raise RuntimeError(f"OpenRouter fallback also failed: {e}")
             if attempt < 2:
                 time.sleep(4 + attempt * 4)
             else:
@@ -273,14 +305,17 @@ def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: i
     """Tries OpenRouter first (primary); falls back to Groq if it fails."""
     errors = []
 
-    or_start = time.time()
-    try:
-        result = _call_openrouter(system_prompt, user_content, max_tokens)
-        print(f"[script_generator]   OpenRouter succeeded in {time.time() - or_start:.1f}s")
-        return result
-    except Exception as e:
-        errors.append(f"OpenRouter: {e}")
-        print(f"[script_generator]   OpenRouter failed after {time.time() - or_start:.1f}s ({e}). Trying Groq...")
+    if not _openrouter_quota_exhausted:
+        or_start = time.time()
+        try:
+            result = _call_openrouter(system_prompt, user_content, max_tokens)
+            print(f"[script_generator]   OpenRouter succeeded in {time.time() - or_start:.1f}s")
+            return result
+        except Exception as e:
+            errors.append(f"OpenRouter: {e}")
+            print(f"[script_generator]   OpenRouter failed after {time.time() - or_start:.1f}s ({e}). Trying Groq...")
+    else:
+        print("[script_generator]   Skipping OpenRouter (quota confirmed exhausted this run). Using Groq directly...")
 
     groq_start = time.time()
     try:
