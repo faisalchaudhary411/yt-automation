@@ -1,14 +1,16 @@
 """
 Turns a topic into a scene-by-scene documentary narration script.
 
-Primary LLM: Groq. Falls back to Gemini automatically if Groq fails
-(rate limit exhausted, API error, or unparseable output after retries).
+Primary LLM: Groq. Falls back to Gemini, then OpenRouter, if the
+previous provider fails (rate limit exhausted, API error, or
+unparseable output after retries).
 """
 
 import json
 import math
 import re
 import time
+import requests
 from groq import Groq, RateLimitError, APIError
 
 try:
@@ -22,16 +24,23 @@ from config import (
     VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
 )
 
-# GEMINI_API_KEY is optional — fallback is simply skipped if not configured.
+# Optional fallback keys — each fallback is simply skipped if not configured.
 try:
     from config import GEMINI_API_KEY
 except ImportError:
     GEMINI_API_KEY = None
 
+try:
+    from config import OPENROUTER_API_KEY
+except ImportError:
+    OPENROUTER_API_KEY = None
+
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
 CHUNK_TARGET_WORDS = 80
 GEMINI_MODEL_NAME = "gemini-2.0-flash"
+OPENROUTER_MODEL_NAME = "meta-llama/llama-3.1-70b-instruct:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 if GEMINI_AVAILABLE and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -139,7 +148,7 @@ def _extract_scenes_from_truncated(raw: str) -> list:
 
 
 def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int = 0):
-    """Shared JSON parsing/repair logic used by both Groq and Gemini paths."""
+    """Shared JSON parsing/repair logic used by every provider path."""
     if raw is None or not raw.strip():
         raise RuntimeError("LLM returned an empty response.")
 
@@ -231,18 +240,75 @@ def _call_gemini(system_prompt: str, user_content: str, max_tokens: int) -> dict
     raise RuntimeError(f"Gemini fallback failed after retries: {last_error}")
 
 
+def _call_openrouter(system_prompt: str, user_content: str, max_tokens: int) -> dict:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OpenRouter fallback unavailable: set OPENROUTER_API_KEY in "
+            "config.py / Replit Secrets."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.7,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+            if resp.status_code == 429:
+                raise RuntimeError("OpenRouter rate limited")
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data["choices"][0]["message"]["content"]
+
+            def _retry_with_more_tokens(new_max_tokens):
+                return _call_openrouter(system_prompt, user_content, new_max_tokens)
+
+            return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens)
+
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(4 + attempt * 4)
+            else:
+                raise RuntimeError(f"OpenRouter fallback also failed: {e}")
+
+    raise RuntimeError(f"OpenRouter fallback failed after retries: {last_error}")
+
+
 def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: int) -> dict:
-    """Tries Groq first; transparently falls back to Gemini on any failure."""
+    """Tries Groq, then Gemini, then OpenRouter, in order."""
+    errors = []
+
     try:
         return _call_groq(client, system_prompt, user_content, max_tokens)
-    except Exception as groq_error:
-        print(f"[script_generator] Groq failed ({groq_error}). Falling back to Gemini...")
-        try:
-            return _call_gemini(system_prompt, user_content, max_tokens)
-        except Exception as gemini_error:
-            raise RuntimeError(
-                f"Both Groq and Gemini failed.\nGroq error: {groq_error}\nGemini error: {gemini_error}"
-            )
+    except Exception as e:
+        errors.append(f"Groq: {e}")
+        print(f"[script_generator] Groq failed ({e}). Trying Gemini...")
+
+    try:
+        return _call_gemini(system_prompt, user_content, max_tokens)
+    except Exception as e:
+        errors.append(f"Gemini: {e}")
+        print(f"[script_generator] Gemini failed ({e}). Trying OpenRouter...")
+
+    try:
+        return _call_openrouter(system_prompt, user_content, max_tokens)
+    except Exception as e:
+        errors.append(f"OpenRouter: {e}")
+
+    raise RuntimeError("All LLM providers failed.\n" + "\n".join(errors))
 
 
 def _generate_metadata(client: Groq, topic: str, language_name: str, style: str) -> dict:
