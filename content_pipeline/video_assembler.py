@@ -1,14 +1,23 @@
 """
 Assembles per-scene images + narration audio into one final MP4.
 Each scene gets a slow Ken-Burns zoom on its still image, with the narration
-audio and a burned-in caption of the narration text. Scenes are joined with
-short crossfade dissolves (instead of hard cuts) for a more polished,
-less obviously auto-generated feel.
+audio and a caption of the narration text rendered via libass (not drawtext —
+drawtext has no Arabic/Urdu text-shaping engine behind it, so joined Nastaliq
+letterforms render as disconnected/isolated glyphs, and any glyph missing
+from the fallback font shows as a "tofu" box). Scenes are joined with short
+crossfade dissolves (instead of hard cuts) for a more polished, less
+obviously auto-generated feel.
 
 Requires ffmpeg to be installed on the Replit environment (add "ffmpeg" to
 replit.nix or use the nix package manager in the Replit shell:
   `nix-env -iA nixpkgs.ffmpeg`
-or simply enable it via Replit's "Nix" packages panel).
+or simply enable it via Replit's "Nix" packages panel) — and specifically
+requires an ffmpeg build with libass enabled (`ffmpeg -version` should list
+`--enable-libass` under configuration; nearly all standard ffmpeg builds,
+including Replit's nix package, include this).
+
+Also requires a Nastaliq/Arabic-script font bundled at fonts/NotoNastaliqUrdu.ttf
+(next to this file) — see FONTS_DIR/CAPTION_FONT_NAME below.
 """
 
 import os
@@ -17,6 +26,17 @@ import re
 import math
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Directory holding fonts bundled with the repo (not installed system-wide —
+# passed to ffmpeg's `subtitles` filter via fontsdir=, so this works even in
+# environments with no root/font-install access, like Replit).
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+# Must exactly match the font's internal family name (not the filename) —
+# libass resolves fonts by family name, looked up via fontsdir. Verify with
+# `fc-scan fonts/NotoNastaliqUrdu.ttf | grep family` if you swap fonts.
+CAPTION_FONT_NAME = "Noto Nastaliq Urdu"
+CAPTION_FONT_FILENAME = "NotoNastaliqUrdu.ttf"
 
 # Scene clips are CPU-bound (ffmpeg encode); a couple of workers helps even on
 # a 2-core box since ffmpeg itself doesn't saturate a core the whole time.
@@ -104,10 +124,52 @@ def _run(cmd: list, step_name: str) -> None:
 
 
 def _escape_for_drawtext(text: str) -> str:
-    # ffmpeg drawtext needs these characters escaped
+    # ffmpeg drawtext needs these characters escaped. Still used for the
+    # watermark only (plain Latin text — no shaping issues there).
     text = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\u2019")
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _escape_ass_text(text: str) -> str:
+    # ASS/SSA dialogue text needs backslashes and braces escaped (braces
+    # start override tags like {\an5}). Actual line breaks are inserted
+    # separately as literal "\N" tokens by the caller, not via this escape.
+    text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _escape_for_filter_path(path: str) -> str:
+    # ffmpeg filter option syntax uses ':' to separate key=value pairs and
+    # wraps values in single quotes when needed — escape any embedded
+    # single quotes/colons so a path containing either doesn't break parsing.
+    return path.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+
+def _format_ass_time(seconds: float) -> str:
+    """Formats seconds as ASS's H:MM:SS.cc timestamp (centiseconds)."""
+    total_cs = max(0, int(round(seconds * 100)))
+    hours, rem = divmod(total_cs, 360000)
+    minutes, rem = divmod(rem, 6000)
+    secs, cs = divmod(rem, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+
+def _require_caption_font() -> str:
+    """
+    Returns the absolute path to the bundled caption font, raising a clear,
+    actionable error immediately (not a cryptic ffmpeg filter failure deep in
+    a subprocess call) if it hasn't been added to the repo yet.
+    """
+    font_path = os.path.join(FONTS_DIR, CAPTION_FONT_FILENAME)
+    if not os.path.isfile(font_path):
+        raise FileNotFoundError(
+            f"Caption font not found at {font_path}. Download it (e.g. from "
+            "https://github.com/google/fonts/raw/main/ofl/notonastaliqurdu/NotoNastaliqUrdu%5Bwght%5D.ttf) "
+            f"and save it as fonts/{CAPTION_FONT_FILENAME} next to video_assembler.py — "
+            "without it, Urdu/Arabic captions will render as boxes."
+        )
+    return font_path
 
 
 def _wrap_text_lines(text: str, width: int, fontsize: int, max_chars_per_line: int = None) -> list:
@@ -147,20 +209,29 @@ def _paginate_lines(lines: list, lines_per_page: int = 2, max_pages: int = 10) -
     return [lines[i:i + lines_per_page] for i in range(0, len(lines), lines_per_page)]
 
 
-def _caption_filters(text: str, width: int, fontsize: int, bottom_margin: int, duration: float) -> str:
+def _write_caption_ass(
+    text: str, width: int, height: int, fontsize: int, bottom_margin: int,
+    duration: float, out_path: str,
+) -> str:
     """
-    Builds a chain of drawtext filters covering the ENTIRE narration (no
-    truncation), split into pages of up to 2 lines each that are shown one
-    at a time across the clip's `duration` — each page's on-screen time is
-    weighted by its share of the total word count, so pages advance roughly
-    in step with how long that portion of narration takes to speak.
+    Writes an ASS subtitle file covering the ENTIRE narration (no truncation),
+    split into pages of up to 2 lines each shown one at a time across
+    `duration` — each page's on-screen time weighted by its share of the
+    total word count, same pacing logic as before.
 
-    Styled as bordered white text (no solid background box).
+    Rendered via ffmpeg's `subtitles` filter (libass -> HarfBuzz), NOT
+    drawtext: this is what actually fixes Urdu/Arabic text — drawtext places
+    glyphs one at a time with no shaping engine, so joined Nastaliq
+    letterforms come out disconnected/isolated, and any glyph missing from
+    the fallback font renders as a "tofu" box (□). libass does real script
+    shaping and font fallback lookup via fontsdir.
 
-    OPTIMIZED: Removed per-frame alpha fade expressions (the #1 CPU bottleneck
-    on shared VMs). Captions now appear/disappear at page boundaries instead
-    of fading. This saves ~40% encode time per scene with minimal visual
-    impact in documentary style.
+    Style uses BorderStyle=3 (an opaque semi-transparent box behind the
+    text) instead of a plain outline — this both fixes contrast against
+    busy photo backgrounds and covers the "add a background bar for
+    readability" request in one native filter option, no manual compositing.
+
+    Returns out_path, or "" if there's no narration text to caption.
     """
     all_lines = _wrap_text_lines(text, width, fontsize)
     pages = _paginate_lines(all_lines, lines_per_page=2)
@@ -169,35 +240,46 @@ def _caption_filters(text: str, width: int, fontsize: int, bottom_margin: int, d
 
     word_counts = [max(1, sum(len(line.split()) for line in page)) for page in pages]
     total_words = sum(word_counts)
-    line_height = fontsize + 22
 
-    filters = []
+    events = []
     t_cursor = 0.0
     for i, page in enumerate(pages):
         is_last = i == len(pages) - 1
         page_duration = duration * (word_counts[i] / total_words)
         start = t_cursor
-        # Last page always extends to the exact end of duration, absorbing any
-        # rounding drift instead of leaving a gap with no caption showing.
         end = duration if is_last else t_cursor + page_duration
         t_cursor = end
 
-        # OPTIMIZATION: Removed per-frame alpha fade expressions (the #1 CPU
-        # bottleneck — often 50-60% of total encode time). The 0.25s fade
-        # in/out was visually subtle; captions now appear/disappear instantly
-        # at page boundaries. Timed pagination via enable=between() is kept
-        # — it is cheap (just a boolean check, no per-pixel math).
-        for j, line in enumerate(reversed(page)):
-            y_from_bottom = bottom_margin + j * line_height
-            filters.append(
-                f"drawtext=text='{_escape_for_drawtext(line)}':fontcolor=white:fontsize={fontsize}:"
-                f"borderw=3:bordercolor=black@0.85:"
-                f"x=(w-text_w)/2:y=h-{y_from_bottom}:enable='between(t,{start:.3f},{end:.3f})'"
-            )
-    return ",".join(filters)
+        page_text = "\\N".join(_escape_ass_text(line) for line in page)
+        events.append(
+            f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},"
+            f"Caption,,0,0,0,,{page_text}"
+        )
+
+    # BackColour alpha 0x73 (~55% opaque black box). Colours are &HAABBGGRR.
+    ass_content = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 2\n"  # 2 = no auto word-wrap; respect our manual \N breaks only
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Caption,{CAPTION_FONT_NAME},{fontsize},&H00FFFFFF,&H000000FF,&H00000000,"
+        f"&H73000000,0,0,0,0,100,100,0,0,3,0,8,2,60,60,{bottom_margin},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        + "\n".join(events) + "\n"
+    )
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+    return out_path
 
 
-def _watermark_filter(channel_name: str, fontsize: int = 22) -> str:
+def _watermark_filter(channel_name: str, fontsize: int = 26) -> str:
     """
     Small, low-opacity channel name in the bottom-right corner, present for
     the whole clip (no timing/enable — unlike captions, this doesn't change).
@@ -266,17 +348,29 @@ def _build_scene_clip(
     total_frames = int(duration * fps)
 
     fontsize = 40
-    caption_filters = _caption_filters(scene["narration"], width, fontsize, bottom_margin=90, duration=duration)
+    ass_path = os.path.join(clip_dir, f"scene_{index:03d}_captions.ass")
+    caption_ass_path = _write_caption_ass(
+        scene["narration"], width, height, fontsize, bottom_margin=90,
+        duration=duration, out_path=ass_path,
+    )
+    caption_filter = ""
+    if caption_ass_path:
+        _require_caption_font()  # raises a clear error early if the font isn't bundled yet
+        caption_filter = (
+            f"subtitles=filename='{_escape_for_filter_path(caption_ass_path)}':"
+            f"fontsdir='{_escape_for_filter_path(FONTS_DIR)}'"
+        )
     watermark_filter = _watermark_filter(channel_name)
 
     # Ken Burns zoom (alternating plain/pan per scene) + color grade/vignette
-    # for a consistent filmic look + timed, fading captions + a persistent
-    # channel watermark, then a frozen-frame pad appended at the tail. That
-    # pad exists purely so the crossfade dissolve into the next scene has
-    # something silent/static to eat into — without it, the dissolve blended
-    # directly into the last half-second of this scene's own narration/caption,
-    # so the next scene's picture (and caption) visibly appeared while this
-    # scene's voiceover was still speaking.
+    # for a consistent filmic look + timed captions (via libass — see
+    # _write_caption_ass) + a persistent channel watermark, then a
+    # frozen-frame pad appended at the tail. That pad exists purely so the
+    # crossfade dissolve into the next scene has something silent/static to
+    # eat into — without it, the dissolve blended directly into the last
+    # half-second of this scene's own narration/caption, so the next scene's
+    # picture (and caption) visibly appeared while this scene's voiceover was
+    # still speaking.
     # Scale directly to output resolution before zoompan — no extra scale-up
     # buffer. Benchmarked: the 1.15x max zoom is subtle enough that the earlier
     # 1.3x buffer added no visible smoothness, just extra pixels to encode.
@@ -284,7 +378,7 @@ def _build_scene_clip(
         f"scale={width}:{height}",
         f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
         COLOR_GRADE_FILTER,
-        caption_filters,
+        caption_filter,
     ]
     if watermark_filter:
         vf_parts.append(watermark_filter)
@@ -314,6 +408,76 @@ def _build_scene_clip(
     return out_path
 
 
+def _write_title_ass(
+    lines: list, out_path: str, width: int, height: int, duration: float,
+    title_fontsize: int = 56, subtitle_fontsize: int = 34,
+) -> str:
+    """
+    Writes an ASS file for the intro/outro title card: title lines centered
+    as a stacked block, with an optional subtitle line block below. Rendered
+    via libass (subtitles filter), same as scene captions and for the same
+    reason — the video's actual title is frequently Urdu too, and drawtext
+    can't shape it correctly.
+
+    Uses \\pos()+\\an5 (middle-center anchor) override tags per line to
+    reproduce the original centered-stack layout math exactly: with an5,
+    \\pos(x,y) places the *center* of that line at (x,y) regardless of the
+    line's rendered width, so a plain width/2, height/2+offset reproduces
+    the old (w-text_w)/2, (h-text_h)/2+offset drawtext positioning without
+    needing to know each line's rendered width up front.
+    """
+    line_height = title_fontsize + 16
+    title_lines = _wrap_text_lines(lines[0], width, title_fontsize)[:3]
+    n_title_lines = len(title_lines)
+
+    events = []
+    end_ts = _format_ass_time(duration)
+    for i, line in enumerate(title_lines):
+        offset = (i - (n_title_lines - 1) / 2) * line_height - 30
+        y = height / 2 + offset
+        events.append(
+            f"Dialogue: 0,0:00:00.00,{end_ts},Title,,0,0,0,,"
+            f"{{\\an5\\pos({width / 2:.0f},{y:.0f})}}{_escape_ass_text(line)}"
+        )
+
+    if len(lines) > 1 and lines[1]:
+        subtitle_lines = _wrap_text_lines(lines[1], width, subtitle_fontsize)[:2]
+        subtitle_top = 40 + (n_title_lines - 1) * line_height
+        for j, sub_line in enumerate(subtitle_lines):
+            offset = subtitle_top + j * (subtitle_fontsize + 12)
+            y = height / 2 + offset
+            events.append(
+                f"Dialogue: 0,0:00:00.00,{end_ts},Title,,0,0,0,,"
+                f"{{\\an5\\pos({width / 2:.0f},{y:.0f})\\fs{subtitle_fontsize}\\bord2}}"
+                f"{_escape_ass_text(sub_line)}"
+            )
+
+    # OutlineColour alpha 0x4D (~70% opaque black), matching the original
+    # borderw=3/bordercolor=black@0.7 drawtext look. BorderStyle=1 keeps a
+    # plain outline (not a box) since this sits on a solid color card, not a
+    # busy photo — box background matters more for scene captions.
+    ass_content = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 2\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Title,{CAPTION_FONT_NAME},{title_fontsize},&H00FFFFFF,&H000000FF,&H4D000000,"
+        "&H00000000,0,0,0,0,100,100,0,0,1,3,0,5,20,20,20,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        + "\n".join(events) + "\n"
+    )
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+    return out_path
+
+
 def _build_title_card(
     lines: list,
     out_path: str,
@@ -330,39 +494,17 @@ def _build_title_card(
     """
     title_fontsize = 56
     subtitle_fontsize = 34
-    line_height = title_fontsize + 16
 
-    # Wrap the title (previously drawn as one unbroken line, which clipped
-    # off both edges of the frame whenever it was too wide to fit) into as
-    # many lines as it needs, capped at 3 so a very long title still fits
-    # comfortably within a 3.5s card instead of overflowing vertically.
-    title_lines = _wrap_text_lines(lines[0], width, title_fontsize)[:3]
-    n_title_lines = len(title_lines)
-
-    filters = []
-    # Stack title lines centered as a block: with n lines, the first line's
-    # vertical center sits (n-1)/2 line-heights above the card's true center,
-    # and each subsequent line sits one line-height below the previous one.
-    for i, line in enumerate(title_lines):
-        offset = (i - (n_title_lines - 1) / 2) * line_height - 30
-        filters.append(
-            f"drawtext=text='{_escape_for_drawtext(line)}':fontcolor=white:fontsize={title_fontsize}:borderw=3:"
-            f"bordercolor=black@0.7:x=(w-text_w)/2:y=(h-text_h)/2+{offset:.1f}"
-        )
-
-    if len(lines) > 1 and lines[1]:
-        subtitle_lines = _wrap_text_lines(lines[1], width, subtitle_fontsize)[:2]
-        subtitle_top = 40 + (n_title_lines - 1) * line_height
-        for j, sub_line in enumerate(subtitle_lines):
-            offset = subtitle_top + j * (subtitle_fontsize + 12)
-            filters.append(
-                f"drawtext=text='{_escape_for_drawtext(sub_line)}':fontcolor=white:fontsize={subtitle_fontsize}:borderw=2:"
-                f"bordercolor=black@0.7:x=(w-text_w)/2:y=(h-text_h)/2+{offset:.1f}"
-            )
+    ass_path = out_path + ".ass"
+    _require_caption_font()
+    _write_title_ass(lines, ass_path, width, height, duration, title_fontsize, subtitle_fontsize)
 
     fade_out_start = max(0.0, duration - 0.6)
-    filters.append(f"fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6")
-    vf = ",".join(filters)
+    vf = (
+        f"subtitles=filename='{_escape_for_filter_path(ass_path)}':"
+        f"fontsdir='{_escape_for_filter_path(FONTS_DIR)}',"
+        f"fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6"
+    )
 
     cmd = [
         "ffmpeg", "-y",
