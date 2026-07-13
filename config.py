@@ -113,6 +113,14 @@ GITHUB_API_BASE = "https://api.github.com"
 
 WORK_DIR = "output"  # local scratch folder on Replit (audio/images/video before upload)
 
+# Optional background music track, looped and ducked under narration in every
+# generated video. Fully optional — if this file doesn't exist, video_assembler
+# just skips music mixing silently. Source a royalty-free track yourself (e.g.
+# YouTube Audio Library, Pixabay Music, Free Music Archive) and upload it to
+# this path in your repo. Keep it instrumental/ambient — anything with vocals
+# will fight with the narration.
+BACKGROUND_MUSIC_PATH = os.environ.get("BACKGROUND_MUSIC_PATH", "assets/background_music.mp3")
+
 
 def _gh_headers():
     return {

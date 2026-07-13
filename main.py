@@ -27,7 +27,7 @@ from flask import Flask, request, jsonify, render_template_string, send_from_dir
 from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
-    EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE,
+    EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -568,6 +568,7 @@ def run_pipeline_job(
             include_outro=include_outro,
             style=style,
             progress_callback=_video_progress,
+            music_path=BACKGROUND_MUSIC_PATH,
         )
 
         result = {
@@ -706,7 +707,19 @@ def status_endpoint(job_id):
 @app.route("/output/<job_id>/<path:filename>")
 def output_file(job_id, filename):
     directory = os.path.join(os.getcwd(), "output", job_id)
-    return send_from_directory(directory, filename)
+    # conditional=True (Werkzeug's default, but made explicit here) is what
+    # actually enables HTTP Range request handling — the browser/download
+    # manager sends "Range: bytes=1234-" to resume a dropped download, and
+    # Werkzeug responds with a 206 Partial Content instead of restarting from
+    # byte 0. as_attachment + download_name ensures mobile browsers treat this
+    # as a real downloadable file (with a resumable entry in the downloads
+    # list) rather than an inline video stream.
+    return send_from_directory(
+        directory, filename,
+        as_attachment=True,
+        download_name=filename,
+        conditional=True,
+    )
 
 
 @app.route("/authorize")
@@ -754,4 +767,11 @@ if __name__ == "__main__":
         print(json.dumps(JOBS[job_id], indent=2, ensure_ascii=False))
     else:
         # Web mode (default on Replit — click Run)
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+        # threaded=True is essential here, not optional: Flask's dev server
+        # otherwise handles exactly ONE request at a time. Without it, a large
+        # video download in progress (slow on a weak mobile connection) blocks
+        # every other request — including a new connection trying to RESUME
+        # that same download after a drop — until the first one finishes or
+        # times out. That was the actual cause of downloads looking "stuck"
+        # or failing to resume.
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)
