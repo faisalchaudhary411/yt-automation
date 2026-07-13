@@ -43,6 +43,15 @@ X264_PRESET = "veryfast"
 # killing renders that were still making real progress, not actually stuck.
 FFMPEG_TIMEOUT_SECONDS = 1200
 
+# Frame rate used for BOTH scene clips and title cards. Must be a single
+# shared constant, not duplicated per-function: scene clips and title cards
+# get crossfaded/concatenated together, and ffmpeg's xfade filter (and
+# stream-copy concat) both require every joined clip to share an identical
+# timebase. A mismatch here (e.g. scenes at 15fps, title cards at 24fps)
+# fails at join time with an xfade "timebase do not match" / "Invalid
+# argument" error, not at render time — easy to miss until final assembly.
+SCENE_FPS = 15  # was 24: ~37% fewer frames, visually identical for slow Ken Burns zooms — ~15-20% faster to encode with no perceptible quality difference for this style of motion.
+
 # Length of the dissolve between consecutive clips (intro/scenes/outro).
 CROSSFADE_SECONDS = 0.6
 
@@ -253,8 +262,7 @@ def _build_scene_clip(
         raise RuntimeError(f"Scene {index} is missing an image or audio file.")
 
     duration = _get_media_duration(scene["audio_path"])
-    fps = 15  # was 24: ~37% fewer frames, visually identical for slow Ken Burns zooms — standard cinematic frame rate, ~15-20% faster to encode
-              # with no perceptible quality difference for Ken Burns-style motion.
+    fps = SCENE_FPS  # shared with _build_title_card — see SCENE_FPS comment for why this must match
     total_frames = int(duration * fps)
 
     fontsize = 40
@@ -312,9 +320,7 @@ def _build_title_card(
     duration: float = 3.5,
     width: int = 1920,
     height: int = 1080,
-    fps: int = 24,  # must match _build_scene_clip's fps — the final assembly
-                    # stream-copies clips together in places, which requires
-                    # identical fps across every joined file.
+    fps: int = SCENE_FPS,  # shared with _build_scene_clip — see SCENE_FPS comment for why this must match
     bg_color: str = "0x141E30",
 ) -> str:
     """
