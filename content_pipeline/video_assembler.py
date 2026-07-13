@@ -14,6 +14,7 @@ or simply enable it via Replit's "Nix" packages panel).
 import os
 import subprocess
 import re
+import math
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,7 +23,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Kept modest (not scaled up with scene count) so longer videos (more scenes)
 # don't pile on more *simultaneous* encodes and risk OOM on a small Replit VM
 # — they just take a proportionally longer total time instead.
-MAX_CONCURRENT_CLIPS = 3
+MAX_CONCURRENT_CLIPS = 2  # was 3 — reduced because the added color grade/
+                          # vignette/watermark/timed-caption filters made each
+                          # clip meaningfully more CPU-heavy, and Replit's
+                          # shared/free-tier compute doesn't have much
+                          # headroom for 3 full x264 encodes fighting at once.
 
 # x264 encode speed preset for clip/title-card rendering. "veryfast" trades a
 # little file-size efficiency for a large wall-clock speedup versus the
@@ -31,8 +36,12 @@ X264_PRESET = "veryfast"
 
 # Hard ceiling on any single ffmpeg/ffprobe call so a stuck process can never
 # hang a job forever (longer videos have more clips, so more chances for one
-# process to wedge on a bad input).
-FFMPEG_TIMEOUT_SECONDS = 600
+# process to wedge on a bad input). Raised from 600s -> 1200s: a genuinely
+# long/text-heavy scene under Replit's shared CPU can legitimately take
+# several minutes now that clips carry a heavier filter chain (color grade,
+# vignette, watermark, timed multi-page captions) — the old 600s ceiling was
+# killing renders that were still making real progress, not actually stuck.
+FFMPEG_TIMEOUT_SECONDS = 1200
 
 # Length of the dissolve between consecutive clips (intro/scenes/outro).
 CROSSFADE_SECONDS = 0.6
@@ -94,8 +103,25 @@ def _wrap_text_lines(text: str, width: int, fontsize: int, max_chars_per_line: i
     return lines
 
 
-def _paginate_lines(lines: list, lines_per_page: int = 2) -> list:
-    """Groups wrapped lines into pages of at most `lines_per_page` lines each."""
+def _paginate_lines(lines: list, lines_per_page: int = 2, max_pages: int = 10) -> list:
+    """
+    Groups wrapped lines into pages of at most `lines_per_page` lines each.
+    If that would produce more than `max_pages` (e.g. one scene ends up
+    carrying an unusually large amount of narration — such as the LLM
+    under-splitting a whole script chunk into a single scene), lines_per_page
+    is increased just enough to fit within max_pages instead. This keeps the
+    rendered drawtext filter chain bounded — each page is its own filter with
+    a per-frame alpha/enable expression, so an unbounded page count was
+    directly inflating encode time on unusually long scenes (each additional
+    page adds real per-frame evaluation cost, not just a code-complexity
+    concern). All text still gets shown; long scenes just get slightly denser
+    pages (e.g. 3-4 lines instead of 2) rather than more of them.
+    """
+    if lines_per_page < 1:
+        lines_per_page = 1
+    n_pages = math.ceil(len(lines) / lines_per_page) if lines else 0
+    if n_pages > max_pages:
+        lines_per_page = math.ceil(len(lines) / max_pages)
     return [lines[i:i + lines_per_page] for i in range(0, len(lines), lines_per_page)]
 
 
