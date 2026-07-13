@@ -46,12 +46,25 @@ FFMPEG_TIMEOUT_SECONDS = 1200
 # Length of the dissolve between consecutive clips (intro/scenes/outro).
 CROSSFADE_SECONDS = 0.6
 
-# Faster preset used only for the per-scene/title-card intermediate renders —
-# these get fully re-encoded again during the final crossfade join anyway, so
-# spending extra encode time on them twice isn't worth it. The final join
-# keeps the higher-quality X264_PRESET since that pass determines what the
-# viewer actually sees, and is the one pass that can't be sped up this way.
-INTERMEDIATE_PRESET = "ultrafast"
+# Preset for per-scene/title-card renders. NOTE: despite the name, this is
+# NOT a throwaway draft pass for most scenes — _join_mixed_transitions only
+# re-encodes the intro/outro edge clips during the final join; every middle
+# scene is joined via stream-copy concat (no re-encode at all). So whatever
+# quality a scene clip is rendered at here is its final published quality.
+# "faster" is a good middle ground: meaningfully better compression
+# efficiency than "ultrafast" for a modest per-clip time cost.
+INTERMEDIATE_PRESET = "faster"
+
+# Explicit CRF (quality target, independent of preset) so visual quality
+# stays consistent even if presets above are changed later. Lower = higher
+# quality/larger file. 20 is a noticeable step up from libx264's default of
+# 23, appropriate now that INTERMEDIATE_PRESET clips are final-quality output.
+SCENE_CRF = "20"
+
+# Cap each ffmpeg process's thread usage so MAX_CONCURRENT_CLIPS workers
+# don't each try to claim every core and contend with each other. Leaves each
+# worker a reasonable slice of a shared/limited Replit VM's CPU.
+THREADS_PER_CLIP = max(1, (os.cpu_count() or 2) // MAX_CONCURRENT_CLIPS)
 
 
 def _run(cmd: list, step_name: str) -> None:
@@ -280,10 +293,12 @@ def _build_scene_clip(
         # different levels by the TTS engine. apad adds silence matching the
         # video's frozen-frame tail pad above, so the crossfade blends silence
         # into silence instead of clipping the tail of this scene's speech.
-        "-af", f"dynaudnorm=f=150:g=15,apad=pad_dur={CROSSFADE_SECONDS}  # single-pass, no 2-pass analysis delay",
-        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET,
+        # single-pass dynaudnorm, no 2-pass analysis delay
+        "-af", f"dynaudnorm=f=150:g=15,apad=pad_dur={CROSSFADE_SECONDS}",
+        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
+        "-threads", str(THREADS_PER_CLIP),
         "-t", str(duration + CROSSFADE_SECONDS), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
         out_path,
     ]
@@ -348,8 +363,9 @@ def _build_title_card(
         "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-vf", vf,
-        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
+        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
+        "-t", str(duration), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest",
         out_path,
     ]
     _run(cmd, "Title card render")
@@ -371,8 +387,8 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
     if n == 1:
         cmd = [
             "ffmpeg", "-y", "-i", clip_paths[0],
-            "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
             "-movflags", "+faststart",
             final_path,
         ]
@@ -415,8 +431,8 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
         "-filter_complex", filter_complex,
         "-map", f"[{prev_v_label}]",
         "-map", f"[{prev_a_label}]",
-        "-c:v", "libx264", "-preset", X264_PRESET, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         "-movflags", "+faststart",
         final_path,
     ]
@@ -540,7 +556,7 @@ def _mix_background_music(video_path: str, music_path: str, output_path: str, mu
         "-filter_complex",
         f"[1:a]volume={music_volume}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=3[aout]",
         "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy", "-c:a", "aac",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         output_path,
     ]
     _run(cmd, "Background music mix")
