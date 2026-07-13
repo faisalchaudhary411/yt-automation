@@ -79,15 +79,11 @@ def _escape_for_drawtext(text: str) -> str:
     return text
 
 
-def _wrap_caption_lines(text: str, width: int, fontsize: int, max_chars_per_line: int = None) -> list:
+def _wrap_text_lines(text: str, width: int, fontsize: int, max_chars_per_line: int = None) -> list:
     """
-    Wraps narration text into a list of lines so drawtext never renders one
-    giant line that overflows off-screen (previously the whole scene's
-    narration was drawn as a single unbroken line, so only a fragment of it
-    was ever visible on screen, cut off mid-word). ffmpeg's drawtext filter
-    does not reliably honor an embedded "\\n" as a newline in this build, so
-    each line is rendered as its own chained drawtext filter instead (see
-    `_caption_filters`).
+    Wraps text into a list of lines sized to fit within `width` at `fontsize`,
+    so drawtext never renders one giant line that overflows off-screen.
+    Returns ALL wrapped lines (no cap) — callers decide how to paginate them.
     """
     if max_chars_per_line is None:
         # Rough estimate: a bold-ish sans glyph averages ~0.55x fontsize wide.
@@ -95,30 +91,81 @@ def _wrap_caption_lines(text: str, width: int, fontsize: int, max_chars_per_line
     lines = textwrap.wrap(text, width=max_chars_per_line, break_long_words=False)
     if not lines:
         lines = [text]
-    # Cap at 3 lines so captions never eat too much of the frame; if the
-    # narration is longer than that it still reads fine without every word.
-    return lines[:3]
+    return lines
 
 
-def _caption_filters(text: str, width: int, fontsize: int, bottom_margin: int) -> str:
+def _paginate_lines(lines: list, lines_per_page: int = 2) -> list:
+    """Groups wrapped lines into pages of at most `lines_per_page` lines each."""
+    return [lines[i:i + lines_per_page] for i in range(0, len(lines), lines_per_page)]
+
+
+def _caption_filters(text: str, width: int, fontsize: int, bottom_margin: int, duration: float) -> str:
     """
-    Builds a chain of drawtext filters (one per wrapped line), stacked upward
-    from `bottom_margin` pixels above the bottom edge, each with its own
-    semi-transparent background box for readability over busy photos.
+    Builds a chain of drawtext filters covering the ENTIRE narration (no
+    truncation), split into pages of up to 2 lines each that are shown one
+    at a time across the clip's `duration` — each page's on-screen time is
+    weighted by its share of the total word count, so pages advance roughly
+    in step with how long that portion of narration takes to speak.
+
+    Styled as bordered white text (no solid background box) with a quick
+    fade in/out between pages, closer to a broadcast/streaming subtitle
+    look than a flat boxed caption.
     """
-    lines = _wrap_caption_lines(text, width, fontsize)
+    all_lines = _wrap_text_lines(text, width, fontsize)
+    pages = _paginate_lines(all_lines, lines_per_page=2)
+    if not pages:
+        return ""
+
+    word_counts = [max(1, sum(len(line.split()) for line in page)) for page in pages]
+    total_words = sum(word_counts)
     line_height = fontsize + 22
+    fade_seconds = 0.25
+
     filters = []
-    # Lines are drawn from the bottom line up, so the last wrapped line sits
-    # closest to bottom_margin and earlier lines stack above it.
-    for i, line in enumerate(reversed(lines)):
-        y_from_bottom = bottom_margin + i * line_height
-        filters.append(
-            f"drawtext=text='{_escape_for_drawtext(line)}':fontcolor=white:fontsize={fontsize}:"
-            f"box=1:boxcolor=black@0.55:boxborderw=12:"
-            f"x=(w-text_w)/2:y=h-{y_from_bottom}"
+    t_cursor = 0.0
+    for i, page in enumerate(pages):
+        is_last = i == len(pages) - 1
+        page_duration = duration * (word_counts[i] / total_words)
+        start = t_cursor
+        # Last page always extends to the exact end of duration, absorbing any
+        # rounding drift instead of leaving a gap with no caption showing.
+        end = duration if is_last else t_cursor + page_duration
+        t_cursor = end
+
+        # Fade window can't exceed half this page's own duration, so very
+        # short pages still fade cleanly instead of the in/out overlapping.
+        fade = min(fade_seconds, max(0.05, (end - start) / 2))
+        alpha_expr = (
+            f"if(lt(t,{start:.3f}+{fade:.3f}),(t-{start:.3f})/{fade:.3f},"
+            f"if(lt(t,{end:.3f}-{fade:.3f}),1,({end:.3f}-t)/{fade:.3f}))"
         )
-    return ",".join(reversed(filters))
+
+        # Lines within a page are drawn bottom-up, closest wrapped line nearest
+        # bottom_margin, matching the original single-page stacking behavior.
+        for j, line in enumerate(reversed(page)):
+            y_from_bottom = bottom_margin + j * line_height
+            filters.append(
+                f"drawtext=text='{_escape_for_drawtext(line)}':fontcolor=white:fontsize={fontsize}:"
+                f"borderw=3:bordercolor=black@0.85:"
+                f"x=(w-text_w)/2:y=h-{y_from_bottom}:enable='between(t,{start:.3f},{end:.3f})':"
+                f"alpha='{alpha_expr}'"
+            )
+    return ",".join(filters)
+
+
+def _watermark_filter(channel_name: str, fontsize: int = 22) -> str:
+    """
+    Small, low-opacity channel name in the bottom-right corner, present for
+    the whole clip (no timing/enable — unlike captions, this doesn't change).
+    Kept subtle (0.55 alpha, no border/box) so it reads as a watermark rather
+    than competing with the captions for attention.
+    """
+    if not channel_name:
+        return ""
+    return (
+        f"drawtext=text='{_escape_for_drawtext(channel_name)}':"
+        f"fontcolor=white@0.55:fontsize={fontsize}:x=w-text_w-24:y=h-text_h-20"
+    )
 
 
 def _get_media_duration(path: str) -> float:
@@ -138,7 +185,31 @@ def _get_media_duration(path: str) -> float:
     return float(duration_str)
 
 
-def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008) -> str:
+def _zoompan_expr(index: int, zoom_rate: float) -> str:
+    """
+    Alternates between a plain centered Ken Burns zoom (even scene indices)
+    and a zoom with a slow lateral drift (odd indices), so consecutive
+    scenes don't all move in exactly the same way — a small but noticeable
+    step up from every clip using identical motion.
+    """
+    z_expr = f"min(zoom+{zoom_rate},1.15)"
+    y_expr = "ih/2-(ih/zoom/2)"
+    if index % 2 == 1:
+        x_expr = "iw/2-(iw/zoom/2)+ceil(20*sin(on/40))"
+    else:
+        x_expr = "iw/2-(iw/zoom/2)"
+    return f"z='{z_expr}':x='{x_expr}':y='{y_expr}'"
+
+
+# Subtle color grade + vignette applied uniformly to every scene, for a
+# consistent "graded" filmic look instead of raw, flat stock-photo colors.
+COLOR_GRADE_FILTER = "eq=contrast=1.08:saturation=0.92:brightness=0.02,vignette=PI/5"
+
+
+def _build_scene_clip(
+    scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008,
+    channel_name: str = None,
+) -> str:
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
     out_path = os.path.join(clip_dir, f"clip_{index:03d}.mp4")
@@ -151,23 +222,30 @@ def _build_scene_clip(scene: dict, index: int, work_dir: str, width=1920, height
     total_frames = int(duration * fps)
 
     fontsize = 40
-    caption_filters = _caption_filters(scene["narration"], width, fontsize, bottom_margin=90)
+    caption_filters = _caption_filters(scene["narration"], width, fontsize, bottom_margin=90, duration=duration)
+    watermark_filter = _watermark_filter(channel_name)
 
-    # Ken Burns zoom (slow zoom-in) + boxed, word-wrapped captions at the bottom,
-    # then a frozen-frame pad appended at the tail. That pad exists purely so the
-    # crossfade dissolve into the next scene has something silent/static to eat
-    # into — without it, the dissolve blended directly into the last half-second
-    # of this scene's own narration/caption, so the next scene's picture (and
-    # caption) visibly appeared while this scene's voiceover was still speaking.
+    # Ken Burns zoom (alternating plain/pan per scene) + color grade/vignette
+    # for a consistent filmic look + timed, fading captions + a persistent
+    # channel watermark, then a frozen-frame pad appended at the tail. That
+    # pad exists purely so the crossfade dissolve into the next scene has
+    # something silent/static to eat into — without it, the dissolve blended
+    # directly into the last half-second of this scene's own narration/caption,
+    # so the next scene's picture (and caption) visibly appeared while this
+    # scene's voiceover was still speaking.
     # Scale is a modest 1.3x (not 2x) before zoompan — the zoom is subtle enough
     # that the extra resolution wasn't visibly needed, and halving the pixel
     # count here meaningfully cuts encode time.
-    vf = (
-        f"scale={int(width * 1.3)}:{int(height * 1.3)},"
-        f"zoompan=z='min(zoom+{zoom_rate},1.15)':d={total_frames}:s={width}x{height}:fps={fps},"
-        f"{caption_filters},"
-        f"tpad=stop_mode=clone:stop_duration={CROSSFADE_SECONDS}"
-    )
+    vf_parts = [
+        f"scale={int(width * 1.3)}:{int(height * 1.3)}",
+        f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
+        COLOR_GRADE_FILTER,
+        caption_filters,
+    ]
+    if watermark_filter:
+        vf_parts.append(watermark_filter)
+    vf_parts.append(f"tpad=stop_mode=clone:stop_duration={CROSSFADE_SECONDS}")
+    vf = ",".join(part for part in vf_parts if part)
 
     cmd = [
         "ffmpeg", "-y",
@@ -204,17 +282,38 @@ def _build_title_card(
     fade in/out, matching the codec/resolution/audio format of scene clips so
     it joins cleanly. `lines` is a list of 1-2 strings (title + subtitle).
     """
-    title = _escape_for_drawtext(lines[0])
-    filters = [
-        f"drawtext=text='{title}':fontcolor=white:fontsize=56:borderw=3:"
-        f"bordercolor=black@0.7:x=(w-text_w)/2:y=(h-text_h)/2-30"
-    ]
-    if len(lines) > 1 and lines[1]:
-        subtitle = _escape_for_drawtext(lines[1])
+    title_fontsize = 56
+    subtitle_fontsize = 34
+    line_height = title_fontsize + 16
+
+    # Wrap the title (previously drawn as one unbroken line, which clipped
+    # off both edges of the frame whenever it was too wide to fit) into as
+    # many lines as it needs, capped at 3 so a very long title still fits
+    # comfortably within a 3.5s card instead of overflowing vertically.
+    title_lines = _wrap_text_lines(lines[0], width, title_fontsize)[:3]
+    n_title_lines = len(title_lines)
+
+    filters = []
+    # Stack title lines centered as a block: with n lines, the first line's
+    # vertical center sits (n-1)/2 line-heights above the card's true center,
+    # and each subsequent line sits one line-height below the previous one.
+    for i, line in enumerate(title_lines):
+        offset = (i - (n_title_lines - 1) / 2) * line_height - 30
         filters.append(
-            f"drawtext=text='{subtitle}':fontcolor=white:fontsize=34:borderw=2:"
-            f"bordercolor=black@0.7:x=(w-text_w)/2:y=(h-text_h)/2+40"
+            f"drawtext=text='{_escape_for_drawtext(line)}':fontcolor=white:fontsize={title_fontsize}:borderw=3:"
+            f"bordercolor=black@0.7:x=(w-text_w)/2:y=(h-text_h)/2+{offset:.1f}"
         )
+
+    if len(lines) > 1 and lines[1]:
+        subtitle_lines = _wrap_text_lines(lines[1], width, subtitle_fontsize)[:2]
+        subtitle_top = 40 + (n_title_lines - 1) * line_height
+        for j, sub_line in enumerate(subtitle_lines):
+            offset = subtitle_top + j * (subtitle_fontsize + 12)
+            filters.append(
+                f"drawtext=text='{_escape_for_drawtext(sub_line)}':fontcolor=white:fontsize={subtitle_fontsize}:borderw=2:"
+                f"bordercolor=black@0.7:x=(w-text_w)/2:y=(h-text_h)/2+{offset:.1f}"
+            )
+
     fade_out_start = max(0.0, duration - 0.6)
     filters.append(f"fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6")
     vf = ",".join(filters)
@@ -300,6 +399,32 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
     return final_path
 
 
+def _mix_background_music(video_path: str, music_path: str, output_path: str, music_volume: float = 0.12) -> str:
+    """
+    Loops `music_path` under the video's existing narration audio, ducked to
+    `music_volume` (a fraction of full volume — 0.12 sits well under narration
+    without disappearing entirely), trimmed to match the video's own length.
+    Video stream is copied (not re-encoded) since only the audio changes.
+    Silently no-ops (returns video_path unchanged) if music_path is falsy or
+    doesn't exist, so this feature is fully optional.
+    """
+    if not music_path or not os.path.isfile(music_path):
+        return video_path
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-stream_loop", "-1", "-i", music_path,
+        "-filter_complex",
+        f"[1:a]volume={music_volume}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=3[aout]",
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac",
+        output_path,
+    ]
+    _run(cmd, "Background music mix")
+    return output_path
+
+
 def assemble_video(
     scenes: list,
     work_dir: str,
@@ -310,13 +435,17 @@ def assemble_video(
     include_outro: bool = True,
     style: str = "documentary",
     progress_callback=None,
+    music_path: str = None,
 ) -> str:
     """
     Builds one clip per scene (plus optional intro/outro title cards for a more
     polished, human-produced feel) and joins them with short crossfade
     dissolves into the final MP4. `style` is a key from config.VIDEO_STYLES
-    controlling the title-card color and Ken Burns zoom speed. Returns the
-    path to the final video.
+    controlling the title-card color and Ken Burns zoom speed. Each scene
+    carries a small `channel_name` watermark and a subtle color grade; if
+    `music_path` points to an existing audio file, it's looped and ducked
+    under the narration for the whole video. Returns the path to the final
+    video.
 
     progress_callback, if given, is called as progress_callback(phase, done, total)
     where phase is "clips" while scene clips render (done/total = clips finished
@@ -358,7 +487,7 @@ def assemble_video(
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLIPS) as executor:
         futures = {
-            executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate): i
+            executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate, channel_name=channel_name): i
             for i, scene in enumerate(scenes)
         }
         # as_completed (not iterating futures in submission order) so progress
@@ -387,6 +516,13 @@ def assemble_video(
 
     final_path = os.path.join(work_dir, output_name)
     _join_with_crossfades(clip_paths, final_path)
+
+    if music_path and os.path.isfile(music_path):
+        music_mixed_path = os.path.join(work_dir, "final_with_music.mp4")
+        _mix_background_music(final_path, music_path, music_mixed_path)
+        os.replace(music_mixed_path, final_path)
+    elif music_path:
+        print(f"[video_assembler] music_path '{music_path}' not found — skipping background music.")
 
     if progress_callback:
         progress_callback("join", 1, 1)
