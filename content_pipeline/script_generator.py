@@ -249,8 +249,8 @@ def _extract_scenes_safely(raw: str) -> list:
     # If no scenes found with strict pattern, try looser extraction
     if not scenes:
         # Find all narration values
-        narration_pattern = re.compile(r'"narration"\s*:\s*"((?:[^"\]|\.)*)"')
-        keyword_pattern = re.compile(r'"image_keywords"\s*:\s*"((?:[^"\]|\.)*)"')
+        narration_pattern = re.compile(r'"narration"\s*:\s*"((?:[^"\\]|\\.)*)"')
+        keyword_pattern = re.compile(r'"image_keywords"\s*:\s*"((?:[^"\\]|\\.)*)"')
         duration_pattern = re.compile(r'"duration_seconds"\s*:\s*(\d+)')
 
         narrations = narration_pattern.findall(raw)
@@ -420,8 +420,11 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
                           "completion — attempting to salvage the partial output...")
                     try:
                         return _parse_llm_json(failed_gen, None, max_tokens, depth=depth)
-                    except RuntimeError:
-                        pass  # nothing salvageable — fall through to retrying the call
+                    except Exception as salvage_error:
+                        # Best-effort salvage — any failure here (bad regex, unexpected
+                        # shape, etc.) should just mean "couldn't salvage", not escape
+                        # as a confusing top-level error. Log it so it's still visible.
+                        print(f"[script_generator]   Salvage attempt failed: {salvage_error}")
                 if attempt < 3:
                     print(f"[script_generator]   Groq JSON validation failed "
                           f"(attempt {attempt + 1}/4) — retrying...")
