@@ -42,9 +42,20 @@ FALLBACK_FONT_NAMES = [
     "Noto Sans Arabic",
     "FreeSerif",
 ]
+LATIN_FONT_NAME = "DejaVu Sans"
+LATIN_FONT_FILENAME = "DejaVuSans.ttf"
+
+# Latin fallback fonts (for English text - intro/outro/titles)
+LATIN_FALLBACK_FONTS = [
+    "DejaVu Sans",
+    "Liberation Sans", 
+    "Noto Sans",
+    "FreeSans",
+    "Arial",
+]
 
 
-def _resolve_font() -> tuple:
+def _resolve_font(for_latin_text: bool = False) -> tuple:
     """
     Returns (font_family_name, fonts_dir_path) for use with ffmpeg's subtitles filter.
 
@@ -52,10 +63,25 @@ def _resolve_font() -> tuple:
       1. Bundled font in local fonts/ directory (for containers/Replit)
       2. System-installed font found via fc-list (for systems with font packages)
 
+    for_latin_text: If True, resolves a Latin-capable font (DejaVu Sans, etc.) for
+    English text. If False, resolves an Urdu/Arabic-shaping-capable font (Noto
+    Nastaliq Urdu, etc.) so Urdu captions render properly instead of tofu boxes.
+
     If no suitable font is found, raises a clear error with installation instructions.
     """
+    if for_latin_text:
+        bundled_filename = LATIN_FONT_FILENAME
+        bundled_family_name = LATIN_FONT_NAME
+        fallback_names = LATIN_FALLBACK_FONTS
+        label = "Latin"
+    else:
+        bundled_filename = CAPTION_FONT_FILENAME
+        bundled_family_name = CAPTION_FONT_NAME
+        fallback_names = FALLBACK_FONT_NAMES
+        label = "Urdu/Arabic"
+
     # 1. Check bundled font first
-    bundled_path = os.path.join(FONTS_DIR, CAPTION_FONT_FILENAME)
+    bundled_path = os.path.join(FONTS_DIR, bundled_filename)
     if os.path.isfile(bundled_path):
         # Verify the family name matches what libass expects
         try:
@@ -68,10 +94,10 @@ def _resolve_font() -> tuple:
                 return (family, FONTS_DIR)
         except Exception:
             pass  # fall through to system fonts
-        return (CAPTION_FONT_NAME, FONTS_DIR)
+        return (bundled_family_name, FONTS_DIR)
 
     # 2. Fall back to system-installed fonts
-    for font_name in FALLBACK_FONT_NAMES:
+    for font_name in fallback_names:
         try:
             result = subprocess.run(
                 ["fc-list", font_name, ":file"],
@@ -85,26 +111,51 @@ def _resolve_font() -> tuple:
 
     # 3. Nothing found — raise helpful error
     raise FileNotFoundError(
-        f"No Urdu/Arabic-capable font found. Tried: {FALLBACK_FONT_NAMES}\n\n"
+        f"No {label}-capable font found. Tried: {fallback_names}\n\n"
         "To fix this, either:\n"
-        "  a) Download NotoNastaliqUrdu.ttf and place it at:\n"
-        f"     {os.path.join(FONTS_DIR, CAPTION_FONT_FILENAME)}\n"
+        "  a) Download the required font and place it at:\n"
+        f"     {os.path.join(FONTS_DIR, bundled_filename)}\n"
         "  b) Install system fonts: apt-get install fonts-noto-core fonts-freefont-ttf"
     )
 
 
-# Resolve font once at module load (fails fast if missing)
-(_RESOLVED_FONT_FAMILY, _RESOLVED_FONTS_DIR) = _resolve_font()
+# Resolve fonts at module load (fails fast if missing)
+(_RESOLVED_FONT_FAMILY, _RESOLVED_FONTS_DIR) = _resolve_font(for_latin_text=False)
+(_RESOLVED_LATIN_FONT, _RESOLVED_LATIN_FONTS_DIR) = _resolve_font(for_latin_text=True)
 
 
-def _get_fonts_dir_for_filter() -> str:
+def _get_fonts_dir_for_filter(for_latin: bool = False) -> str:
     """Returns the fontsdir path for ffmpeg subtitles filter, or empty string if using system fonts."""
+    if for_latin:
+        return _RESOLVED_LATIN_FONTS_DIR
     return _RESOLVED_FONTS_DIR
 
 
-def _get_font_family() -> str:
+def _get_font_family(for_latin: bool = False) -> str:
     """Returns the resolved font family name for ASS styles."""
+    if for_latin:
+        return _RESOLVED_LATIN_FONT
     return _RESOLVED_FONT_FAMILY
+
+
+def _is_latin_text(text: str) -> bool:
+    """Detects whether a string is primarily Latin/English (vs. Urdu/Arabic)."""
+    if not text:
+        return True
+    latin_chars = sum(1 for c in text if ord(c) < 128)
+    return (latin_chars / max(len(text), 1)) > 0.5
+
+
+def _combined_fonts_dir() -> str:
+    """
+    Returns a single fontsdir usable for an ASS file that mixes Urdu and Latin
+    fonts in the same document (e.g. title cards with per-line \\fn overrides).
+    Both bundled fonts live under the same FONTS_DIR, so one directory covers
+    either/both; falls back to "" (system font cache only) if it doesn't exist.
+    """
+    if os.path.isdir(FONTS_DIR):
+        return FONTS_DIR
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -184,11 +235,13 @@ def _paginate_lines(lines: list, lines_per_page: int = 2, max_pages: int = 10) -
 
 def _write_caption_ass(
     text: str, width: int, height: int, fontsize: int, bottom_margin: int,
-    duration: float, out_path: str,
+    duration: float, out_path: str, for_latin: bool = False,
 ) -> str:
     """
-    Writes an ASS subtitle file with proper Urdu/Arabic text shaping via libass.
+    Writes an ASS subtitle file with proper text shaping via libass.
     Uses the resolved font family (bundled or system).
+
+    for_latin: If True, uses Latin-capable font for English text (prevents tofu boxes).
     """
     all_lines = _wrap_text_lines(text, width, fontsize)
     pages = _paginate_lines(all_lines, lines_per_page=2)
@@ -213,7 +266,7 @@ def _write_caption_ass(
             f"Caption,,0,0,0,,{page_text}"
         )
 
-    font_family = _get_font_family()
+    font_family = _get_font_family(for_latin=for_latin)
 
     ass_content = (
         "[Script Info]\n"
@@ -273,12 +326,12 @@ def _zoompan_expr(index: int, zoom_rate: float) -> str:
     return f"z='{z_expr}':x='{x_expr}':y='{y_expr}'"
 
 
-def _build_subtitles_filter(ass_path: str) -> str:
+def _build_subtitles_filter(ass_path: str, for_latin: bool = False) -> str:
     """
     Builds the subtitles filter string. Only includes fontsdir when using bundled fonts.
     When using system fonts, fontsdir is omitted so libass uses the system font cache.
     """
-    fonts_dir = _get_fonts_dir_for_filter()
+    fonts_dir = _get_fonts_dir_for_filter(for_latin=for_latin)
     base = f"subtitles=filename='{_escape_for_filter_path(ass_path)}'"
     if fonts_dir:
         base += f":fontsdir='{_escape_for_filter_path(fonts_dir)}'"
@@ -302,14 +355,19 @@ def _build_scene_clip(
 
     fontsize = 40
     ass_path = os.path.join(clip_dir, f"scene_{index:03d}_captions.ass")
+
+    # Auto-detect if narration is primarily Latin/English text
+    narration_text = scene.get("narration", "")
+    is_latin = _is_latin_text(narration_text)
+
     caption_ass_path = _write_caption_ass(
-        scene["narration"], width, height, fontsize, bottom_margin=90,
-        duration=duration, out_path=ass_path,
+        narration_text, width, height, fontsize, bottom_margin=90,
+        duration=duration, out_path=ass_path, for_latin=is_latin,
     )
 
     caption_filter = ""
     if caption_ass_path:
-        caption_filter = _build_subtitles_filter(caption_ass_path)
+        caption_filter = _build_subtitles_filter(caption_ass_path, for_latin=is_latin)
 
     watermark_filter = _watermark_filter(channel_name)
 
@@ -343,10 +401,18 @@ def _build_scene_clip(
 
 def _write_title_ass(
     lines: list, out_path: str, width: int, height: int, duration: float,
-    title_fontsize: int = 56, subtitle_fontsize: int = 34,
+    title_fontsize: int = 92, subtitle_fontsize: int = 46,
 ) -> str:
-    line_height = title_fontsize + 16
-    title_lines = _wrap_text_lines(lines[0], width, title_fontsize)[:3]
+    """
+    Writes the title-card ASS file. Each line's font is chosen per-line based on
+    whether that line's text is primarily Latin or Urdu/Arabic (via inline \\fn
+    override), since a title card's main title (often Urdu) and its hardcoded
+    subtitle (often English) can be different scripts within the same card.
+    """
+    line_height = title_fontsize + 20
+    title_text = lines[0] if lines else ""
+    title_font = _get_font_family(for_latin=_is_latin_text(title_text))
+    title_lines = _wrap_text_lines(title_text, width, title_fontsize)[:3]
     n_title_lines = len(title_lines)
 
     events = []
@@ -356,22 +422,27 @@ def _write_title_ass(
         y = height / 2 + offset
         events.append(
             f"Dialogue: 0,0:00:00.00,{end_ts},Title,,0,0,0,,"
-            f"{{\\an5\\pos({width / 2:.0f},{y:.0f})}}{_escape_ass_text(line)}"
+            f"{{\\an5\\pos({width / 2:.0f},{y:.0f})\\fn{title_font}\\fs{title_fontsize}}}"
+            f"{_escape_ass_text(line)}"
         )
 
     if len(lines) > 1 and lines[1]:
-        subtitle_lines = _wrap_text_lines(lines[1], width, subtitle_fontsize)[:2]
-        subtitle_top = 40 + (n_title_lines - 1) * line_height
+        subtitle_text = lines[1]
+        subtitle_font = _get_font_family(for_latin=_is_latin_text(subtitle_text))
+        subtitle_lines = _wrap_text_lines(subtitle_text, width, subtitle_fontsize)[:2]
+        subtitle_top = 50 + (n_title_lines - 1) * line_height
         for j, sub_line in enumerate(subtitle_lines):
-            offset = subtitle_top + j * (subtitle_fontsize + 12)
+            offset = subtitle_top + j * (subtitle_fontsize + 14)
             y = height / 2 + offset
             events.append(
                 f"Dialogue: 0,0:00:00.00,{end_ts},Title,,0,0,0,,"
-                f"{{\\an5\\pos({width / 2:.0f},{y:.0f})\\fs{subtitle_fontsize}\\bord2}}"
+                f"{{\\an5\\pos({width / 2:.0f},{y:.0f})\\fn{subtitle_font}\\fs{subtitle_fontsize}\\bord3}}"
                 f"{_escape_ass_text(sub_line)}"
             )
 
-    font_family = _get_font_family()
+    # Default/base style font doesn't matter much since every event carries its
+    # own \fn override above, but set it to the title's font as a sane fallback.
+    font_family = title_font
 
     ass_content = (
         "[Script Info]\n"
@@ -384,8 +455,8 @@ def _write_title_ass(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Title,{font_family},{title_fontsize},&H00FFFFFF,&H000000FF,&H4D000000,"
-        "&H00000000,0,0,0,0,100,100,0,0,1,3,0,5,20,20,20,1\n\n"
+        f"Style: Title,{font_family},{title_fontsize},&H00FFFFFF,&H000000FF,&H00000000,"
+        "&H00000000,0,0,0,0,100,100,0,0,1,4,1,5,20,20,20,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         + "\n".join(events) + "\n"
@@ -404,15 +475,19 @@ def _build_title_card(
     fps: int = SCENE_FPS,
     bg_color: str = "0x141E30",
 ) -> str:
-    title_fontsize = 56
-    subtitle_fontsize = 34
+    title_fontsize = 92
+    subtitle_fontsize = 46
 
     ass_path = out_path + ".ass"
     _write_title_ass(lines, ass_path, width, height, duration, title_fontsize, subtitle_fontsize)
 
     fade_out_start = max(0.0, duration - 0.6)
+    fonts_dir = _combined_fonts_dir()
+    subtitles_filter = f"subtitles=filename='{_escape_for_filter_path(ass_path)}'"
+    if fonts_dir:
+        subtitles_filter += f":fontsdir='{_escape_for_filter_path(fonts_dir)}'"
     vf = (
-        f"{_build_subtitles_filter(ass_path)},"
+        f"{subtitles_filter},"
         f"fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6"
     )
 
@@ -638,9 +713,9 @@ def _sanitize_filename(name: str, max_length: int = 80) -> str:
 def assemble_video(
     scenes: list,
     work_dir: str,
-    output_name: str = None,   # explicit override; if None, falls back to topic-based name
-    topic: str = None,         # NEW: used for auto-naming when output_name is not given
-    title: str = None,
+    output_name: str = None,   # explicit override; if None, falls back to title, then topic
+    topic: str = None,         # fallback for auto-naming when no title/output_name is given
+    title: str = None,         # generated video title; used for both the intro card and the output filename
     channel_name: str = None,
     include_intro: bool = True,
     include_outro: bool = True,
@@ -703,9 +778,11 @@ def assemble_video(
     if progress_callback:
         progress_callback("join", 0, 1)
 
-    # Resolve output filename: explicit > topic-based > fallback
+    # Resolve output filename: explicit override > video title > topic > fallback
     if output_name:
         resolved_name = output_name
+    elif title:
+        resolved_name = _sanitize_filename(title)
     elif topic:
         resolved_name = _sanitize_filename(topic)
     else:

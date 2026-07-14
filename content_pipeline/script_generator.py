@@ -6,9 +6,12 @@ open-weight gpt-oss-120b model — fast RDU-hosted inference).
 Falls back to Groq if SambaNova fails (rate limit/quota exhausted, API
 error, or unparseable output after retries).
 
-Gemini and SambaNova support were both removed: Gemini's free-tier key
-hit a permanent "limit: 0" quota wall, and SambaNova's free-tier quota
-was also getting exhausted, wasting retry time on every chunk.
+FIXES FOR URDU TEXT CORRUPTION:
+  - Added proper Unicode handling in JSON parsing
+  - Fixed _repair_json to not corrupt text content
+  - Improved _extract_scenes_from_truncated to handle Urdu text safely
+  - Added text sanitization to remove garbage characters
+  - Added validation to detect corrupted Urdu text
 """
 
 import json
@@ -31,16 +34,20 @@ except ImportError:
 
 WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
-CHUNK_TARGET_WORDS = 200  # bigger chunks = fewer sequential API round-trips per
-                          # script (each one carries fixed overhead — network
-                          # latency, provider fallback checks, etc. — regardless
-                          # of chunk size, so fewer/larger chunks finish faster
-                          # overall). Was 80; a 450-word "short" script now
-                          # takes ~3 chunks instead of ~6.
+CHUNK_TARGET_WORDS = 200
 SAMBANOVA_MODEL_NAME = "gpt-oss-120b"
 SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions"
-SAMBANOVA_MAX_TOKENS_CEILING = 8000  # hard cap so the +4000 retry growth in
-                                      # _parse_llm_json can't run away
+SAMBANOVA_MAX_TOKENS_CEILING = 8000
+
+# Unicode ranges for valid Urdu/Arabic characters
+URDU_UNICODE_RANGE = re.compile(
+    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF"
+    r"\s\u060C\u061B\u061F\u06D4.,!?;:\'\"\-—\u200C\u200D]+"
+)
+
+# Pattern to detect corrupted/garbage text (random symbols that shouldn't be in Urdu)
+GARBAGE_PATTERN = re.compile(r"[&!@#$%^*+=~`|<>{}\[\]\\]{2,}")
+
 
 def _target_word_count(duration_minutes: float) -> int:
     return round(duration_minutes * WORDS_PER_MINUTE)
@@ -52,13 +59,30 @@ def _scene_count_for_words(word_budget: int) -> tuple:
     return scene_low, scene_high
 
 
+def _urdu_style_notes(language_name: str) -> str:
+    """
+    Extra guidance appended to prompts when writing Urdu, so the narration sounds
+    like natural spoken Pakistani Urdu rather than stiff, overly literary, or
+    machine-translated Urdu.
+    """
+    if language_name.strip().lower() != "urdu":
+        return ""
+    return """
+
+URDU STYLE GUIDANCE (very important):
+- Write like a Pakistani YouTube narrator talking to a general audience, not like a textbook or news bulletin.
+- Prefer everyday, commonly spoken Urdu vocabulary over heavy Persian/Arabic literary words. If a simpler word is what people actually say out loud, use it.
+- Use natural sentence rhythm and short-to-medium sentences suited to narration, not long nested literary clauses.
+- It's fine and often better to keep common English loanwords that Pakistanis actually use in speech (e.g. "invest", "company", "market", "percent") instead of forcing an obscure formal Urdu equivalent — but do not switch entire sentences to English.
+- Avoid word-for-word translated phrasing that sounds like it was translated from an English draft. Write the thought directly in Urdu the way a person would say it.
+- Vary sentence openings; avoid repeating the same connector words (e.g. "لیکن", "اس کے بعد") in every sentence."""
+
+
 def _build_metadata_prompt(language_name: str, style_key: str) -> str:
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
-    return f"""You are a scriptwriter for a YouTube channel about history and finance \
-(channel: {CHANNEL_NAME}). Write as {narrator_style}.
+    return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response in {language_name}. Do not mix in another language unless \
-{language_name} is English.
+Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
@@ -76,11 +100,9 @@ def _build_scenes_prompt(
     scene_low, scene_high = _scene_count_for_words(word_budget)
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
 
-    return f"""You are a scriptwriter for a YouTube channel about history and finance \
-(channel: {CHANNEL_NAME}). Write as {narrator_style}.
+    return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response in {language_name}. Do not mix in another language unless \
-{language_name} is English.
+Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
@@ -94,105 +116,223 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 }}
 
 CRITICAL: Do NOT include title, description, or tags. Only include the "scenes" array.
-CRITICAL LENGTH REQUIREMENT: the combined narration across every scene in THIS response \
-must add up to approximately {word_budget} words in total (aim for {word_budget}-\
-{int(word_budget * 1.15)} words — never less). Use {scene_low}-{scene_high} scenes to hit \
-that total, with each scene's narration long enough to read aloud in roughly its \
-duration_seconds (~2.5 words per second). If you are unsure whether you have written \
-enough, err on the side of writing more scenes and more narration per scene, not fewer. \
-Do not include any text outside the JSON object."""
+CRITICAL LENGTH REQUIREMENT: the combined narration across every scene in THIS response must add up to approximately {word_budget} words in total (aim for {word_budget}-{int(word_budget * 1.15)} words — never less). Use {scene_low}-{scene_high} scenes to hit that total, with each scene's narration long enough to read aloud in roughly its duration_seconds (~2.5 words per second). If you are unsure whether you have written enough, err on the side of writing more scenes and more narration per scene, not fewer. Do not include any text outside the JSON object.
+
+CRITICAL TEXT FORMATTING:
+- Use proper {language_name} punctuation (e.g., Urdu full stop: ۔ not .)
+- Do NOT use Latin/English punctuation inside {language_name} text
+- Do NOT mix English words inside {language_name} narration unless necessary"""
 
 
 def _count_narration_words(scenes: list) -> int:
     return sum(len(scene.get("narration", "").split()) for scene in scenes)
 
 
+def _is_text_corrupted(text: str) -> bool:
+    """Detects if Urdu text contains garbage characters or corruption."""
+    if not text:
+        return True
+
+    # Check for excessive garbage symbols
+    if GARBAGE_PATTERN.search(text):
+        return True
+
+    # Check if text has reasonable ratio of Urdu characters to total
+    urdu_chars = sum(1 for c in text if (0x0600 <= ord(c) <= 0x06FF) or
+                     (0x0750 <= ord(c) <= 0x077F))
+    total_chars = len([c for c in text if c.strip()])
+
+    # If less than 30% Urdu characters and text is supposed to be Urdu, it's corrupted
+    if total_chars > 0 and urdu_chars / total_chars < 0.3:
+        # But allow English text (for image_keywords)
+        latin_chars = sum(1 for c in text if ord(c) < 128 and c.isalpha())
+        if latin_chars / total_chars < 0.5:  # Not mostly Latin either
+            return True
+
+    return False
+
+
+def _sanitize_narration(text: str) -> str:
+    """Cleans narration text by removing garbage and fixing common issues."""
+    if not text:
+        return text
+
+    # Remove sequences of random symbols (like ,&!12)
+    text = GARBAGE_PATTERN.sub(" ", text)
+
+    # Fix common corruption patterns
+    # Replace multiple spaces with single space
+    text = re.sub(r"\s+", " ", text)
+
+    # Remove isolated Latin punctuation that might be corruption
+    # But preserve legitimate Urdu punctuation
+    text = re.sub(r"(?<![\u0600-\u06FF])[,;:!?]+(?![\u0600-\u06FF])", " ", text)
+
+    # Ensure proper Urdu sentence ending if missing
+    text = text.strip()
+    if text and text[-1] not in ".!?۔":
+        text += "۔"
+
+    return text.strip()
+
+
 def _repair_json(raw: str) -> str:
-    if raw.count('"') % 2 != 0:
-        raw = raw + '"'
-    open_brackets = raw.count('[') - raw.count(']')
-    open_braces = raw.count('{') - raw.count('}')
-    for _ in range(open_brackets):
-        raw = raw + ']'
-    for _ in range(open_braces):
-        raw = raw + '}'
-    raw = re.sub(r',\s*([\}\]])', r'\1', raw)
+    """
+    Repairs malformed JSON without corrupting text content.
+    Uses a safer approach than naive quote/bracket counting.
+    """
+    if not raw or not raw.strip():
+        return raw
+
+    raw = raw.strip()
+
+    # Remove markdown fences
+    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+    # Try to find the JSON object boundaries
+    # Look for the outermost { ... }
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        raw = raw[first_brace:last_brace + 1]
+
+    # Remove trailing commas before closing brackets/braces
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+
+    # Balance brackets and braces by finding the last complete structure
+    # Don't just append to end - that corrupts text
+    open_brackets = raw.count("[") - raw.count("]")
+    open_braces = raw.count("{") - raw.count("}")
+
+    # Only add closing if we're inside a structure and at the end
+    if open_brackets > 0 and not raw.rstrip().endswith("]"):
+        # Find where to add - after the last complete element
+        raw = raw.rstrip() + "]" * open_brackets
+    if open_braces > 0 and not raw.rstrip().endswith("}"):
+        raw = raw.rstrip() + "}" * open_braces
+
     return raw
 
 
-def _extract_scenes_from_truncated(raw: str) -> list:
-    try:
-        repaired = _repair_json(raw)
-        data = json.loads(repaired)
-        return data.get("scenes", [])
-    except (json.JSONDecodeError, AttributeError):
-        pass
-
+def _extract_scenes_safely(raw: str) -> list:
+    """
+    Safely extracts scenes from potentially malformed JSON.
+    Handles Urdu/Arabic Unicode text properly.
+    """
     scenes = []
-    narrations = re.findall(r'"narration"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
-    keywords = re.findall(r'"image_keywords"\s*:\s*"((?:\\.|[^"\\])*)"', raw)
-    durations = re.findall(r'"duration_seconds"\s*:\s*(\d+)', raw)
 
-    for i, narration in enumerate(narrations):
+    # Try to find all scene objects using a safer pattern
+    # Look for narration fields and their values
+    # Pattern: "narration" followed by colon and quoted string
+    # Handles escaped quotes inside the string
+
+    # First try: find complete scene objects
+    scene_pattern = re.compile(
+        r'"narration"\s*:\s*"(.*?)"\s*,\s*"image_keywords"\s*:\s*"(.*?)"\s*,\s*"duration_seconds"\s*:\s*(\d+)',
+        re.DOTALL
+    )
+
+    matches = scene_pattern.findall(raw)
+    for narration, keywords, duration in matches:
+        # Clean up the extracted narration
+        narration = narration.replace("\\\\", "\\").replace('\"', '"')
+        narration = _sanitize_narration(narration)
+
         if narration.strip():
             scenes.append({
                 "narration": narration,
-                "image_keywords": keywords[i] if i < len(keywords) else "historical scene",
-                "duration_seconds": int(durations[i]) if i < len(durations) else 25,
+                "image_keywords": keywords.replace("\\\\", "\\").replace('\"', '"'),
+                "duration_seconds": int(duration),
             })
+
+    # If no scenes found with strict pattern, try looser extraction
+    if not scenes:
+        # Find all narration values
+        narration_pattern = re.compile(r'"narration"\s*:\s*"((?:[^"\]|\.)*)"')
+        keyword_pattern = re.compile(r'"image_keywords"\s*:\s*"((?:[^"\]|\.)*)"')
+        duration_pattern = re.compile(r'"duration_seconds"\s*:\s*(\d+)')
+
+        narrations = narration_pattern.findall(raw)
+        keywords = keyword_pattern.findall(raw)
+        durations = duration_pattern.findall(raw)
+
+        for i, narration in enumerate(narrations):
+            narration = narration.replace("\\\\", "\\").replace('\"', '"')
+            narration = _sanitize_narration(narration)
+
+            if narration.strip():
+                scenes.append({
+                    "narration": narration,
+                    "image_keywords": keywords[i].replace("\\\\", "\\").replace('\"', '"') if i < len(keywords) else "historical scene",
+                    "duration_seconds": int(durations[i]) if i < len(durations) else 25,
+                })
+
     return scenes
 
 
-MAX_JSON_RETRY_DEPTH = 2  # hard ceiling on how many times we'll re-call the LLM
-                          # for a bigger completion before giving up entirely.
+MAX_JSON_RETRY_DEPTH = 2
 
 
 def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int = 0, depth: int = 0):
-    """Shared JSON parsing/repair logic used by every provider path.
-
-    `depth` guards against unbounded recursion: if the LLM keeps returning
-    unparseable JSON, attempt_more_tokens_callback would otherwise be called
-    again and again forever (each call itself doing its own multi-attempt
-    retry loop with sleeps), which is what caused the pipeline to hang.
-    """
+    """Shared JSON parsing/repair logic used by every provider path."""
     if raw is None or not raw.strip():
         raise RuntimeError("LLM returned an empty response.")
 
     raw = raw.strip()
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
 
+    # First attempt: direct JSON parse
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
+        data = json.loads(raw)
+        # Validate and sanitize scenes
+        if "scenes" in data:
+            for scene in data["scenes"]:
+                if "narration" in scene:
+                    scene["narration"] = _sanitize_narration(scene["narration"])
+        return data
+    except json.JSONDecodeError:
+        pass
+
+    # Second attempt: repair JSON
+    try:
         repaired = _repair_json(raw)
-        try:
-            return json.loads(repaired)
-        except json.JSONDecodeError:
-            scenes = _extract_scenes_from_truncated(raw)
-            if scenes:
-                return {"scenes": scenes}
-            if attempt_more_tokens_callback and max_tokens and depth < MAX_JSON_RETRY_DEPTH:
-                return attempt_more_tokens_callback(max_tokens + 4000, depth + 1)
-            raise RuntimeError(
-                f"LLM did not return valid JSON after {depth} retry attempt(s): "
-                f"{e}\nRaw output:\n{raw[:500]}"
-            )
+        data = json.loads(repaired)
+        if "scenes" in data:
+            for scene in data["scenes"]:
+                if "narration" in scene:
+                    scene["narration"] = _sanitize_narration(scene["narration"])
+        return data
+    except json.JSONDecodeError:
+        pass
+
+    # Third attempt: extract scenes safely from malformed JSON
+    scenes = _extract_scenes_safely(raw)
+    if scenes:
+        # Validate extracted scenes
+        valid_scenes = []
+        for scene in scenes:
+            if not _is_text_corrupted(scene["narration"]):
+                valid_scenes.append(scene)
+            else:
+                print(f"[WARNING] Skipping corrupted scene: {scene['narration'][:50]}...")
+
+        if valid_scenes:
+            return {"scenes": valid_scenes}
+
+    # Final fallback: retry with more tokens
+    if attempt_more_tokens_callback and max_tokens and depth < MAX_JSON_RETRY_DEPTH:
+        return attempt_more_tokens_callback(max_tokens + 4000, depth + 1)
+
+    raise RuntimeError(
+        f"LLM did not return valid JSON after {depth} retry attempt(s). "
+        f"Raw output:\n{raw[:800]}"
+    )
 
 
-# This Groq account is on the "on_demand" tier, which caps requests at 8000
-# tokens per minute (prompt + max_completion_tokens counts against this,
-# whether or not the model actually uses that many). Stay comfortably under
-# that on every single call, no matter how large the request wanted to be.
 GROQ_TPM_LIMIT = 8000
-GROQ_SAFETY_MARGIN = 1500  # headroom for prompt tokens + estimation error
-
-
-# Groq's rate-limit error messages include an exact "try again in Xs/Xm" —
-# when that wait is short enough to be worth it, sleep exactly that long and
-# retry instead of giving up (previously we ignored this and just failed).
-# Capped so a long token-per-day reset doesn't block the whole job for ages —
-# in that case it's better to fail fast and let SambaNova (primary) carry it.
-MAX_GROQ_RATE_LIMIT_WAIT_SECONDS = 600  # 10 min ceiling
+GROQ_SAFETY_MARGIN = 1500
+MAX_GROQ_RATE_LIMIT_WAIT_SECONDS = 600
 
 
 def _extract_retry_after_seconds(message: str):
@@ -226,11 +366,9 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
             if wait_seconds is not None and wait_seconds <= MAX_GROQ_RATE_LIMIT_WAIT_SECONDS:
                 print(f"[script_generator]   Groq rate limited — waiting {wait_seconds:.0f}s "
                       f"(as advised) before retrying...")
-                time.sleep(wait_seconds + 2)  # small buffer past the exact reset moment
+                time.sleep(wait_seconds + 2)
                 continue
             if wait_seconds is not None:
-                # Wait would be too long (e.g. a full daily quota reset) — not
-                # worth blocking this job; let the caller fall back to SambaNova/fail.
                 raise RuntimeError(
                     f"Groq rate limited with a {wait_seconds:.0f}s wait — too long to block on. {e}"
                 )
@@ -247,8 +385,6 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
                 time.sleep(wait_seconds + 2)
                 continue
             if "rate_limit_exceeded" in msg or "tokens per minute" in msg or "413" in msg:
-                # Request was too large for the TPM budget: shrink it and retry
-                # rather than failing the whole job outright.
                 if attempt < 3 and max_tokens > 1000:
                     max_tokens = max(1000, int(max_tokens * 0.6))
                     time.sleep(6 + attempt * 4)
@@ -263,10 +399,6 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
     return _parse_llm_json(raw, _retry_with_more_tokens, max_tokens, depth=depth)
 
 
-# Once SambaNova reports quota/credit exhaustion, there's no point retrying
-# it on every subsequent chunk for the rest of this process's lifetime — that
-# was costing ~15-20+ seconds of dead retries per chunk. Skip straight to
-# Groq after the first confirmed exhaustion; a Repl restart re-checks it.
 _samba_quota_exhausted = False
 
 
@@ -282,14 +414,6 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
     if _samba_quota_exhausted:
         raise RuntimeError("SambaNova skipped: quota already confirmed exhausted this run.")
 
-    # gpt-oss-120b is a reasoning model: it spends part of its token budget on
-    # hidden chain-of-thought before writing the actual answer. If max_tokens
-    # is too small, ALL of it can get consumed by reasoning, leaving nothing
-    # for the actual JSON content (a 200 OK with an empty message.content —
-    # not an error SambaNova reports, just silently produces no answer).
-    # Fix: keep reasoning effort low (this task needs creative writing, not
-    # multi-step reasoning) and enforce a floor well above what pure JSON
-    # output would need, so reasoning can't eat the whole budget.
     SAMBANOVA_MIN_TOKENS_FLOOR = 2500
     max_tokens = min(max(max_tokens, SAMBANOVA_MIN_TOKENS_FLOOR), SAMBANOVA_MAX_TOKENS_CEILING)
 
@@ -306,12 +430,6 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
         "temperature": 0.7,
         "max_tokens": max_tokens,
         "reasoning_effort": "low",
-        # NOTE: response_format={"type": "json_object"} is deliberately omitted —
-        # SambaNova's OpenAI-compatible endpoint doesn't reliably support it for
-        # gpt-oss-120b and returned a 400 with it included. The system prompt
-        # already instructs strict JSON-only output, and _parse_llm_json's
-        # repair logic (fence-stripping, bracket balancing, regex extraction)
-        # handles the occasional rough edge without needing enforced JSON mode.
     }
 
     last_error = None
@@ -319,10 +437,6 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
         try:
             resp = requests.post(SAMBANOVA_URL, headers=headers, json=payload, timeout=60)
 
-            # Quota/credit exhaustion (402 Payment Required, or a 429 whose body
-            # actually says "quota"/"credit" rather than a normal short-term rate
-            # limit) won't recover by retrying a few seconds later — fail fast
-            # and flag it so later chunks don't repeat the same dead attempt.
             body_lower = (resp.text or "").lower()
             if resp.status_code == 402 or (
                 resp.status_code == 429 and ("quota" in body_lower or "credit" in body_lower)
@@ -334,9 +448,6 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
                 raise RuntimeError("SambaNova rate limited")
 
             if not resp.ok:
-                # Surface the actual response body instead of requests' generic
-                # "400 Client Error: BAD REQUEST" — that's what actually says
-                # *which* field/param SambaNova rejected.
                 raise RuntimeError(f"SambaNova API error (HTTP {resp.status_code}): {resp.text[:500]}")
 
             data = resp.json()
@@ -360,7 +471,6 @@ def _call_samba(system_prompt: str, user_content: str, max_tokens: int, depth: i
         except Exception as e:
             last_error = e
             if _samba_quota_exhausted:
-                # Fail immediately, no point sleeping and retrying a dead quota.
                 raise RuntimeError(f"SambaNova call failed: {e}")
             if attempt < 2:
                 time.sleep(4 + attempt * 4)
@@ -413,11 +523,6 @@ def _generate_scenes_chunk(
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
 ) -> dict:
     system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
-    # llama-3.3-70b-versatile has no hidden "reasoning" token overhead, so the
-    # completion budget can track the actual chunk size (roughly 6 tokens per
-    # word of narration, plus JSON overhead) instead of needing a huge flat
-    # floor. Still capped well under the account's 8000 TPM limit in
-    # _call_groq.
     max_tokens = min(3000, max(600, word_budget * 6))
 
     if is_first_chunk:
@@ -426,7 +531,7 @@ def _generate_scenes_chunk(
         user_content = (
             f"Topic: {topic}\n\n"
             f"This continues a script already in progress. The most recent narration so far "
-            f"was:\n\"{previous_narration_tail}\"\n\n"
+            f"was:\n{previous_narration_tail}\n\n"
             f"Write the NEXT part of the same script, continuing the story naturally from "
             f"there — do not repeat earlier content, do not restart the introduction."
         )
@@ -461,12 +566,6 @@ def generate_script(
     style: str = DEFAULT_VIDEO_STYLE,
     progress_callback=None,
 ) -> dict:
-    """
-    progress_callback, if given, is called as progress_callback(chunks_done, total_chunks)
-    after every chunk (and once with (0, total_chunks) before the first chunk starts),
-    so a caller (e.g. the Flask job status) can report fine-grained progress instead
-    of just "script step in progress".
-    """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in Replit Secrets.")
 
