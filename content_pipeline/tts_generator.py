@@ -45,7 +45,7 @@ MAX_CONCURRENT_TTS = 6
 # Urdu text pre-processing for better TTS output
 # ---------------------------------------------------------------------------
 
-def _preprocess_urdu_text(text: str) -> str:
+def _preprocess_urdu_text(text: str, use_ssml: bool = True) -> str:
     """
     Cleans and prepares Urdu text for TTS to sound more natural.
 
@@ -55,6 +55,11 @@ def _preprocess_urdu_text(text: str) -> str:
       3. Fixes common number/pronunciation issues
       4. Removes excessive whitespace
       5. Ensures proper sentence-ending punctuation for natural cadence
+
+    use_ssml: If True, pause markers are inserted as SSML <break> tags (only
+    safe when the text will actually be wrapped in SSML downstream). If False,
+    no XML is inserted — plain commas already give edge-tts a natural pause,
+    so nothing extra is added to avoid the tag being read aloud as literal text.
     """
     if not text:
         return text
@@ -74,9 +79,13 @@ def _preprocess_urdu_text(text: str) -> str:
     # Replace multiple spaces/newlines with single space
     text = re.sub(r"\s+", " ", text)
 
-    # Add slight pause markers after commas for more natural rhythm
-    # (edge-tts handles commas okay, but this helps with long sentences)
-    text = text.replace(", ", ", ")
+    # Add a slight pause marker after commas for more natural rhythm.
+    # Only safe to insert real SSML <break> tags when the caller will wrap
+    # this text in SSML (use_ssml=True) — otherwise the tag would be spoken
+    # aloud as literal text by edge-tts.
+    if use_ssml:
+        text = re.sub(r",\s*", ', <break time="150ms"/> ', text)
+        text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
@@ -110,12 +119,17 @@ def _add_ssml_prosody(text: str, rate: str = "default", pitch: str = "default") 
     return f'<prosody rate="{rate_attr}" pitch="{pitch_attr}">{text}</prosody>'
 
 
-def _split_long_sentences(text: str, max_words: int = 18) -> str:
+def _split_long_sentences(text: str, max_words: int = 18, use_ssml: bool = True) -> str:
     """
     Breaks very long sentences into shorter ones for more natural TTS pacing.
     Pakistani conversational Urdu rarely uses sentences longer than 15-20 words.
     This inserts breaks at conjunctions (اور، لیکن، کیونکہ، تو) when sentences
     exceed max_words.
+
+    use_ssml: If True, chunks are joined with an SSML <break> tag (only safe
+    when the caller will wrap this text in SSML downstream). If False, chunks
+    are joined with an Urdu comma pause instead, since a plain space here would
+    produce no audible pause at all — that was the original bug.
     """
     words = text.split()
     if len(words) <= max_words:
@@ -140,7 +154,11 @@ def _split_long_sentences(text: str, max_words: int = 18) -> str:
     if current_chunk:
         result.append(" ".join(current_chunk))
 
-    return " ".join(result)
+    if len(result) <= 1:
+        return text
+
+    joiner = ' <break time="300ms"/> ' if use_ssml else "، "
+    return joiner.join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +216,10 @@ async def _tts_edge_async(text: str, out_path: str, voice: str, use_ssml: bool =
       <prosody rate="..." pitch="...">...</prosody>
     """
     # Pre-process the text
-    processed_text = _preprocess_urdu_text(text)
+    processed_text = _preprocess_urdu_text(text, use_ssml=use_ssml)
 
     # Apply sentence splitting for very long text
-    processed_text = _split_long_sentences(processed_text)
+    processed_text = _split_long_sentences(processed_text, use_ssml=use_ssml)
 
     # Wrap in SSML if enabled and not already SSML
     if use_ssml and not processed_text.strip().startswith("<"):
