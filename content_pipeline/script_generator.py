@@ -345,6 +345,30 @@ def _extract_retry_after_seconds(message: str):
     return minutes * 60 + seconds
 
 
+def _extract_failed_generation(e: "APIError") -> str:
+    """
+    When Groq's own server-side JSON-mode validator rejects a completion
+    (code: json_validate_failed), the model's actual malformed output is
+    still available in the error body under 'failed_generation' — but the
+    SDK raises before we ever see a normal response object. This pulls that
+    text out so we can attempt to salvage it with our own repair pipeline
+    instead of throwing the whole generation away.
+    """
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        fg = (body.get("error") or {}).get("failed_generation")
+        if fg:
+            return fg
+    # Fallback: parse it out of the stringified exception if .body wasn't a dict
+    match = re.search(r"'failed_generation':\s*'((?:[^'\\]|\\.)*)'", str(e))
+    if match:
+        try:
+            return match.group(1).encode().decode("unicode_escape")
+        except UnicodeDecodeError:
+            return match.group(1)
+    return ""
+
+
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
     max_tokens = min(max_tokens, GROQ_TPM_LIMIT - GROQ_SAFETY_MARGIN)
 
@@ -388,6 +412,20 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
                 if attempt < 3 and max_tokens > 1000:
                     max_tokens = max(1000, int(max_tokens * 0.6))
                     time.sleep(6 + attempt * 4)
+                    continue
+            if "json_validate_failed" in msg:
+                failed_gen = _extract_failed_generation(e)
+                if failed_gen:
+                    print("[script_generator]   Groq's JSON-mode validator rejected the "
+                          "completion — attempting to salvage the partial output...")
+                    try:
+                        return _parse_llm_json(failed_gen, None, max_tokens, depth=depth)
+                    except RuntimeError:
+                        pass  # nothing salvageable — fall through to retrying the call
+                if attempt < 3:
+                    print(f"[script_generator]   Groq JSON validation failed "
+                          f"(attempt {attempt + 1}/4) — retrying...")
+                    time.sleep(4 + attempt * 3)
                     continue
             raise RuntimeError(f"Groq API error: {e}")
 
