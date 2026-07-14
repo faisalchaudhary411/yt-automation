@@ -576,7 +576,7 @@ def run_pipeline_job(
             "title": script["title"],
             "description": script["description"],
             "tags": script["tags"],
-            "video_url": f"/output/{job_id}/final_video.mp4",
+            "video_url": f"/output/{job_id}/{os.path.basename(video_path)}",
             "status": "ready_for_review",
         }
 
