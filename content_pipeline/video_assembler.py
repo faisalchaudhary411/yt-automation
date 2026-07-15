@@ -55,6 +55,69 @@ LATIN_FALLBACK_FONTS = [
 ]
 
 
+_FONT_MAGIC_BYTES = (
+    b"\x00\x01\x00\x00",  # TrueType
+    b"OTTO",              # OpenType/CFF
+    b"true",              # TrueType (older mac)
+    b"ttcf",              # TrueType collection
+)
+
+
+def _validate_font_file(path: str) -> str:
+    """
+    Sanity-checks a font file that merely *exists* on disk before trusting it.
+
+    Files uploaded/committed through GitHub's mobile web editor (or any
+    copy-paste-based workflow) can silently end up as 0-byte stubs, truncated
+    partial writes, or — if the repo ever used Git LFS for this file — a small
+    ~130-byte *text* pointer file instead of the real binary. In all of these
+    cases os.path.isfile() still returns True, fc-scan fails quietly, and the
+    code used to fall back to a hardcoded family name that libass can't
+    actually find glyphs for — producing tofu boxes with no error anywhere.
+
+    Returns an empty string if the file looks like a real, valid font.
+    Returns a human-readable reason string if it does not.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return f"could not stat file ({e})"
+
+    if size == 0:
+        return "file is 0 bytes (empty — upload/commit likely failed)"
+
+    if size < 2048:
+        # Real TTF/OTF files (esp. ones with Urdu/Arabic glyph coverage) are
+        # realistically hundreds of KB at minimum. Anything this small is
+        # almost certainly not a real font.
+        try:
+            with open(path, "rb") as f:
+                head = f.read(200)
+            if head.startswith(b"version https://git-lfs"):
+                return (
+                    f"file is only {size} bytes and is a Git LFS pointer, not the "
+                    "actual font binary — Railway's build never ran `git lfs pull`, "
+                    "so it checked out the pointer text instead of the real .ttf. "
+                    "Either stop using LFS for this file (commit the raw binary "
+                    "directly) or make sure git-lfs is installed and pulled during "
+                    "the Railway build."
+                )
+            return f"file is only {size} bytes — too small to be a real font ({head[:50]!r})"
+        except OSError as e:
+            return f"could not read file to inspect it ({e})"
+
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError as e:
+        return f"could not read file header ({e})"
+
+    if magic not in _FONT_MAGIC_BYTES:
+        return f"file header {magic!r} doesn't match any known font format (corrupted upload?)"
+
+    return ""  # looks valid
+
+
 def _resolve_font(for_latin_text: bool = False) -> tuple:
     """
     Returns (font_family_name, fonts_dir_path) for use with ffmpeg's subtitles filter.
@@ -68,6 +131,8 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
     Nastaliq Urdu, etc.) so Urdu captions render properly instead of tofu boxes.
 
     If no suitable font is found, raises a clear error with installation instructions.
+    Every step is logged loudly to stdout so Railway's deploy logs show exactly
+    what happened, instead of silently degrading to tofu boxes.
     """
     if for_latin_text:
         bundled_filename = LATIN_FONT_FILENAME
@@ -82,19 +147,36 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
 
     # 1. Check bundled font first
     bundled_path = os.path.join(FONTS_DIR, bundled_filename)
+    print(f"[font_resolve:{label}] looking for bundled font at {bundled_path}")
+
     if os.path.isfile(bundled_path):
-        # Verify the family name matches what libass expects
-        try:
-            result = subprocess.run(
-                ["fc-scan", "--format=%{family}\n", bundled_path],
-                capture_output=True, text=True, timeout=10
+        problem = _validate_font_file(bundled_path)
+        if problem:
+            print(
+                f"[font_resolve:{label}] FOUND bundled file but it's INVALID: {problem}\n"
+                f"[font_resolve:{label}] >>> This is very likely the cause of tofu boxes. "
+                f"Re-upload a real copy of {bundled_filename} to {FONTS_DIR}/ and redeploy."
             )
-            family = result.stdout.strip().split("\n")[0].strip()
-            if family:
-                return (family, FONTS_DIR)
-        except Exception:
-            pass  # fall through to system fonts
-        return (bundled_family_name, FONTS_DIR)
+            # Deliberately do NOT trust this file — fall through to system fonts
+            # rather than silently returning a family name with no real glyphs.
+        else:
+            size = os.path.getsize(bundled_path)
+            print(f"[font_resolve:{label}] bundled file looks valid ({size} bytes)")
+            try:
+                result = subprocess.run(
+                    ["fc-scan", "--format=%{family}\n", bundled_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                family = result.stdout.strip().split("\n")[0].strip()
+                if family:
+                    print(f"[font_resolve:{label}] fc-scan reports family='{family}' — using it")
+                    return (family, FONTS_DIR)
+                print(f"[font_resolve:{label}] fc-scan returned no family name; using hardcoded '{bundled_family_name}'")
+            except Exception as e:
+                print(f"[font_resolve:{label}] fc-scan failed ({e}); using hardcoded '{bundled_family_name}'")
+            return (bundled_family_name, FONTS_DIR)
+    else:
+        print(f"[font_resolve:{label}] no bundled file found at that path")
 
     # 2. Fall back to system-installed fonts
     for font_name in fallback_names:
@@ -104,6 +186,7 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
                 capture_output=True, text=True, timeout=10
             )
             if result.stdout.strip():
+                print(f"[font_resolve:{label}] using system font '{font_name}' (fc-list found: {result.stdout.strip().splitlines()[0]})")
                 # Font is installed system-wide; no need for fontsdir
                 return (font_name, "")
         except Exception:
@@ -113,8 +196,9 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
     raise FileNotFoundError(
         f"No {label}-capable font found. Tried: {fallback_names}\n\n"
         "To fix this, either:\n"
-        "  a) Download the required font and place it at:\n"
+        "  a) Place a REAL, valid font file at:\n"
         f"     {os.path.join(FONTS_DIR, bundled_filename)}\n"
+        "     (check the file size on GitHub — it should be hundreds of KB, not a few bytes)\n"
         "  b) Install system fonts: apt-get install fonts-noto-core fonts-freefont-ttf"
     )
 
