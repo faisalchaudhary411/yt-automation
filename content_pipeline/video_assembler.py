@@ -35,14 +35,13 @@ except ImportError:
     _HAS_BIDI = False
 
 # ---------------------------------------------------------------------------
-# Font resolution -- try bundled first, then fall back to system fonts
+# HARD-CODED FONT PATHS — points to content_pipeline/fonts/
 # ---------------------------------------------------------------------------
 
-FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content_pipeline", "fonts")
 
-# Primary font for Urdu/Arabic text (Nastaliq style, preferred for Pakistani Urdu)
-CAPTION_FONT_NAME = "Noto Nastaliq Urdu"
-CAPTION_FONT_FILENAME = "NotoNastaliqUrdu.ttf"
+URDU_FONT_PATH = os.path.join(FONTS_DIR, "NotoNastaliqUrdu.ttf")
+LATIN_FONT_PATH = os.path.join(FONTS_DIR, "DejaVuSans.ttf")
 
 # Fallback fonts in order of preference (system-wide, no bundling needed)
 FALLBACK_FONT_NAMES = [
@@ -50,11 +49,8 @@ FALLBACK_FONT_NAMES = [
     "Noto Naskh Arabic",
     "Noto Sans Arabic",
     "FreeSerif",
+    "DejaVu Sans",
 ]
-LATIN_FONT_NAME = "DejaVu Sans"
-LATIN_FONT_FILENAME = "DejaVuSans.ttf"
-
-# Latin fallback fonts (for English text - intro/outro/titles)
 LATIN_FALLBACK_FONTS = [
     "DejaVu Sans",
     "Liberation Sans",
@@ -105,15 +101,43 @@ def _validate_font_file(path: str) -> str:
     return ""
 
 
+def _find_font_in_dirs(filenames, dirs):
+    """Walk common font directories looking for a matching font file."""
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.lower().endswith((".ttf", ".otf", ".ttc")):
+                        for target in filenames:
+                            if target.lower().replace(" ", "") in f.lower().replace(" ", ""):
+                                path = os.path.join(root, f)
+                                if not _validate_font_file(path):
+                                    return path
+        except Exception:
+            continue
+    return ""
+
+
+def _verify_font_has_arabic(font, sample="Urdu"):
+    """Quick check that the font contains Arabic-script glyphs."""
+    try:
+        mask = font.getmask(sample)
+        return len(mask) > 0
+    except Exception:
+        return False
+
+
 def _resolve_font(for_latin_text: bool = False) -> tuple:
     if for_latin_text:
-        bundled_filename = LATIN_FONT_FILENAME
-        bundled_family_name = LATIN_FONT_NAME
+        bundled_filename = "DejaVuSans.ttf"
+        bundled_family_name = "DejaVu Sans"
         fallback_names = LATIN_FALLBACK_FONTS
         label = "Latin"
     else:
-        bundled_filename = CAPTION_FONT_FILENAME
-        bundled_family_name = CAPTION_FONT_NAME
+        bundled_filename = "NotoNastaliqUrdu.ttf"
+        bundled_family_name = "Noto Nastaliq Urdu"
         fallback_names = FALLBACK_FONT_NAMES
         label = "Urdu/Arabic"
 
@@ -211,6 +235,9 @@ def _prepare_text_for_rendering(text: str, is_latin: bool) -> str:
         return get_display(reshaped)
 
     # Otherwise just return raw text (Pillow will render LTR; not ideal but won't crash)
+    print("[WARN] arabic-reshaper and/or python-bidi not installed. "
+          "Urdu/Arabic text will render unjoined and left-to-right. "
+          "Install: pip install arabic-reshaper python-bidi")
     return text
 
 
@@ -219,12 +246,12 @@ def _prepare_text_for_rendering(text: str, is_latin: bool) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_font_path(for_latin: bool = False) -> str:
-    """Returns an actual filesystem path to a TTF for Pillow."""
-    filename = LATIN_FONT_FILENAME if for_latin else CAPTION_FONT_FILENAME
-    bundled = os.path.join(FONTS_DIR, filename)
-    if os.path.isfile(bundled) and not _validate_font_file(bundled):
-        return bundled
+    """Returns the hardcoded font path. Falls back to system search if missing."""
+    path = LATIN_FONT_PATH if for_latin else URDU_FONT_PATH
+    if os.path.isfile(path):
+        return path
 
+    # Fallback: search system fonts
     names = LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES
     for name in names:
         try:
@@ -233,12 +260,46 @@ def _resolve_font_path(for_latin: bool = False) -> str:
                 capture_output=True, text=True, timeout=10
             )
             if r.stdout.strip():
-                path = r.stdout.strip().splitlines()[0].split(":")[0]
-                if os.path.isfile(path):
-                    return path
+                return r.stdout.strip().splitlines()[0].split(":")[0]
         except Exception:
             continue
     return ""
+
+
+def _load_font_for_rendering(font_path: str, fontsize: int, for_latin: bool):
+    """Load a font and verify it can render the target script."""
+    if font_path:
+        try:
+            font = ImageFont.truetype(font_path, fontsize)
+        except Exception as e:
+            print(f"[font_load] truetype load failed ({e}), trying fallback search")
+            font = None
+    else:
+        font = None
+
+    if font is None:
+        # Last resort: try to find ANY font that might work
+        fallback_path = _resolve_font_path(for_latin=for_latin)
+        if fallback_path:
+            try:
+                font = ImageFont.truetype(fallback_path, fontsize)
+            except Exception:
+                font = None
+
+    if font is None:
+        raise RuntimeError(
+            "No usable font found for rendering. "
+            f"{'Latin' if for_latin else 'Urdu/Arabic'} text will show as tofu boxes. "
+            "Please place a valid .ttf font file in the 'content_pipeline/fonts/' folder or install system fonts."
+        )
+
+    # For Arabic/Urdu, verify the font actually has Arabic glyphs
+    if not for_latin and not _verify_font_has_arabic(font):
+        print(f"[WARN] Loaded font may not support Arabic/Urdu glyphs. "
+              f"Text may render as tofu boxes. Font: {font_path}")
+        # Don't raise here -- let it try, but warn the user
+
+    return font
 
 
 def _render_text_page(lines, width, height, fontsize, bottom_margin, out_path, for_latin=False):
@@ -250,11 +311,7 @@ def _render_text_page(lines, width, height, fontsize, bottom_margin, out_path, f
     draw = ImageDraw.Draw(img)
 
     font_path = _resolve_font_path(for_latin=for_latin)
-    try:
-        font = ImageFont.truetype(font_path, fontsize) if font_path else ImageFont.load_default()
-    except Exception as e:
-        print(f"[render_text] Font load failed ({e}), using default")
-        font = ImageFont.load_default()
+    font = _load_font_for_rendering(font_path, fontsize, for_latin)
 
     line_spacing = int(fontsize * 0.35)
     line_height = fontsize + line_spacing
@@ -336,19 +393,13 @@ def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, su
     title_text = lines[0] if lines else ""
     is_title_latin = _is_latin_text(title_text)
     title_path = _resolve_font_path(for_latin=is_title_latin)
-    try:
-        title_font = ImageFont.truetype(title_path, title_fontsize) if title_path else ImageFont.load_default()
-    except Exception:
-        title_font = ImageFont.load_default()
+    title_font = _load_font_for_rendering(title_path, title_fontsize, is_title_latin)
     title_lines = _wrap_text_lines(title_text, width, title_fontsize)[:3]
 
     subtitle_text = lines[1] if len(lines) > 1 else ""
     is_sub_latin = _is_latin_text(subtitle_text) if subtitle_text else True
     sub_path = _resolve_font_path(for_latin=is_sub_latin)
-    try:
-        sub_font = ImageFont.truetype(sub_path, subtitle_fontsize) if sub_path else ImageFont.load_default()
-    except Exception:
-        sub_font = ImageFont.load_default()
+    sub_font = _load_font_for_rendering(sub_path, subtitle_fontsize, is_sub_latin)
     subtitle_lines = _wrap_text_lines(subtitle_text, width, subtitle_fontsize)[:2] if subtitle_text else []
 
     # Prepare text for rendering
