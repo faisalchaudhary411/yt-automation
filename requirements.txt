@@ -4,3 +4,5 @@ groq==1.5.0
 Pillow==10.4.0
 python-dotenv==1.0.1
 edge-tts
+arabic-reshaper==3.0.0
+python-bidi==0.4.2
