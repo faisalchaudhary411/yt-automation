@@ -222,12 +222,53 @@ def _get_font_family(for_latin: bool = False) -> str:
     return _RESOLVED_FONT_FAMILY
 
 
+# Unicode blocks covering Arabic/Urdu script (including presentation forms used by
+# some fonts/renderers for joined letterforms)
+_ARABIC_SCRIPT_RANGES = (
+    (0x0600, 0x06FF),  # Arabic (includes Urdu-specific letters)
+    (0x0750, 0x077F),  # Arabic Supplement
+    (0x08A0, 0x08FF),  # Arabic Extended-A
+    (0xFB50, 0xFDFF),  # Arabic Presentation Forms-A
+    (0xFE70, 0xFEFF),  # Arabic Presentation Forms-B
+)
+
+
+def _is_arabic_script_char(c: str) -> bool:
+    cp = ord(c)
+    return any(lo <= cp <= hi for lo, hi in _ARABIC_SCRIPT_RANGES)
+
+
 def _is_latin_text(text: str) -> bool:
-    """Detects whether a string is primarily Latin/English (vs. Urdu/Arabic)."""
+    """
+    Detects whether a string should use the Latin font or the Urdu/Nastaliq font.
+
+    IMPORTANT: this used to count every character with ord(c) < 128 as "Latin",
+    which includes spaces, digits, and ASCII punctuation -- all of which appear
+    constantly in otherwise-Urdu narration (word spacing, years like "1929",
+    dollar figures, English proper nouns). That let ordinary Urdu sentences tip
+    past a 50% "Latin" threshold and get rendered in DejaVu Sans (no Arabic
+    glyphs at all) instead of Noto Nastaliq Urdu -- producing tofu boxes for
+    real Urdu text, inconsistently, depending on what happened to be in each
+    scene's narration.
+
+    Fix: only look at actual alphabetic letters (ignore spaces/digits/
+    punctuation entirely, since those aren't script-specific), and default to
+    the Urdu font whenever there's any meaningful amount of real Arabic-script
+    text -- a few embedded English words/numbers in mostly-Urdu narration
+    should still render as Urdu, not flip the whole scene to a font with no
+    Arabic coverage.
+    """
     if not text:
         return True
-    latin_chars = sum(1 for c in text if ord(c) < 128)
-    return (latin_chars / max(len(text), 1)) > 0.5
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True  # no letters at all (pure numbers/symbols) -- Latin font is a safe default
+    arabic_count = sum(1 for c in letters if _is_arabic_script_char(c))
+    # Only treat as "Latin" if Arabic-script letters are negligible (<15% of all
+    # letters). This deliberately favors the Urdu font for mixed content, since
+    # Noto Nastaliq Urdu still renders basic Latin digits/punctuation fine, while
+    # the reverse (Urdu text in DejaVu Sans) produces tofu boxes.
+    return (arabic_count / len(letters)) < 0.15
 
 
 def _combined_fonts_dir() -> str:

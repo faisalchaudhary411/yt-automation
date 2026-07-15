@@ -45,21 +45,22 @@ MAX_CONCURRENT_TTS = 6
 # Urdu text pre-processing for better TTS output
 # ---------------------------------------------------------------------------
 
-def _preprocess_urdu_text(text: str, use_ssml: bool = True) -> str:
+def _preprocess_urdu_text(text: str) -> str:
     """
     Cleans and prepares Urdu text for TTS to sound more natural.
 
     Fixes applied:
       1. Normalizes Arabic/Urdu punctuation to standard forms TTS handles better
-      2. Adds subtle pauses after commas and sentence endings
-      3. Fixes common number/pronunciation issues
-      4. Removes excessive whitespace
-      5. Ensures proper sentence-ending punctuation for natural cadence
+      2. Fixes common number/pronunciation issues
+      3. Removes excessive whitespace
+      4. Ensures proper sentence-ending punctuation for natural cadence
 
-    use_ssml: If True, pause markers are inserted as SSML <break> tags (only
-    safe when the text will actually be wrapped in SSML downstream). If False,
-    no XML is inserted — plain commas already give edge-tts a natural pause,
-    so nothing extra is added to avoid the tag being read aloud as literal text.
+    NOTE: this used to have a use_ssml mode that injected literal <break> tags
+    for pauses. edge-tts's Communicate class does NOT parse SSML tags embedded
+    in its text input -- it just synthesizes whatever string you give it, tags
+    included, so every "<break time=...>" was being read aloud word-for-word.
+    Plain commas already give edge-tts a perfectly natural pause, so that's all
+    this does now -- no XML is ever inserted into text that gets sent to TTS.
     """
     if not text:
         return text
@@ -79,57 +80,35 @@ def _preprocess_urdu_text(text: str, use_ssml: bool = True) -> str:
     # Replace multiple spaces/newlines with single space
     text = re.sub(r"\s+", " ", text)
 
-    # Add a slight pause marker after commas for more natural rhythm.
-    # Only safe to insert real SSML <break> tags when the caller will wrap
-    # this text in SSML (use_ssml=True) — otherwise the tag would be spoken
-    # aloud as literal text by edge-tts.
-    if use_ssml:
-        text = re.sub(r",\s*", ', <break time="150ms"/> ', text)
-        text = re.sub(r"\s+", " ", text)
-
     return text.strip()
 
 
-def _add_ssml_prosody(text: str, rate: str = "default", pitch: str = "default") -> str:
+def _rate_to_edge_format(rate: str) -> str:
+    """Converts a friendly rate name to the percent string edge-tts's Communicate expects."""
+    return {"slow": "-10%", "default": "+0%", "fast": "+10%"}.get(rate, "+0%")
+
+
+def _pitch_to_edge_format(pitch: str) -> str:
     """
-    Wraps text in SSML prosody tags for more natural speech.
-
-    rate: "slow" | "default" | "fast" — speech speed
-    pitch: "low" | "default" | "high" — pitch variation
-
-    Note: edge-tts supports limited SSML — only <voice> and <prosody> tags
-    with rate/pitch/volume attributes. This uses what's reliably supported.
+    Converts a friendly pitch name to the Hz string edge-tts's Communicate expects.
+    NOTE: edge-tts's native pitch parameter uses Hz offsets (e.g. "+0Hz", "-5Hz"),
+    not percentages -- percentages only apply to rate/volume.
     """
-    rate_attr = {
-        "slow": "-10%",
-        "default": "0%",
-        "fast": "+10%",
-    }.get(rate, "0%")
-
-    pitch_attr = {
-        "low": "-5%",
-        "default": "0%",
-        "high": "+5%",
-    }.get(pitch, "0%")
-
-    # Only wrap if we're actually changing something
-    if rate_attr == "0%" and pitch_attr == "0%":
-        return text
-
-    return f'<prosody rate="{rate_attr}" pitch="{pitch_attr}">{text}</prosody>'
+    return {"low": "-5Hz", "default": "+0Hz", "high": "+5Hz"}.get(pitch, "+0Hz")
 
 
-def _split_long_sentences(text: str, max_words: int = 18, use_ssml: bool = True) -> str:
+def _split_long_sentences(text: str, max_words: int = 18) -> str:
     """
     Breaks very long sentences into shorter ones for more natural TTS pacing.
     Pakistani conversational Urdu rarely uses sentences longer than 15-20 words.
     This inserts breaks at conjunctions (اور، لیکن، کیونکہ، تو) when sentences
     exceed max_words.
 
-    use_ssml: If True, chunks are joined with an SSML <break> tag (only safe
-    when the caller will wrap this text in SSML downstream). If False, chunks
-    are joined with an Urdu comma pause instead, since a plain space here would
-    produce no audible pause at all — that was the original bug.
+    Chunks are joined with an Urdu comma pause -- edge-tts's Communicate never
+    parses inline SSML like <break>, so a literal "<break time=...>" tag
+    inserted here would just be read aloud as text (this was the actual bug
+    causing narration to speak out its own pause tags). A comma is a real,
+    audible pause that edge-tts already handles naturally.
     """
     words = text.split()
     if len(words) <= max_words:
@@ -157,8 +136,7 @@ def _split_long_sentences(text: str, max_words: int = 18, use_ssml: bool = True)
     if len(result) <= 1:
         return text
 
-    joiner = ' <break time="300ms"/> ' if use_ssml else "، "
-    return joiner.join(result)
+    return "، ".join(result)
 
 
 # ---------------------------------------------------------------------------
@@ -206,29 +184,29 @@ def _resolve_voice(language: str, voice_gender: str) -> str:
 # Async TTS generation
 # ---------------------------------------------------------------------------
 
-async def _tts_edge_async(text: str, out_path: str, voice: str, use_ssml: bool = True):
+async def _tts_edge_async(text: str, out_path: str, voice: str, rate: str = "slow", pitch: str = "default"):
     """
     Generates TTS audio using edge-tts.
 
-    If use_ssml is True and the text doesn't already contain SSML tags,
-    wraps it in minimal SSML for better prosody. Edge-tts supports:
-      <voice name="...">...</voice>
-      <prosody rate="..." pitch="...">...</prosody>
+    rate: "slow" | "default" | "fast" — passed as a real Communicate parameter
+    pitch: "low" | "default" | "high" — passed as a real Communicate parameter
+
+    IMPORTANT: edge-tts's Communicate class does not parse SSML embedded in its
+    `text` argument -- it treats that string as literal spoken text. Previous
+    versions of this function wrapped text in <voice>/<prosody>/<break> tags,
+    which edge-tts then read aloud verbatim (the actual cause of narration
+    speaking its own markup). Prosody is now set the only way edge-tts actually
+    supports it: as real constructor keyword arguments.
     """
-    # Pre-process the text
-    processed_text = _preprocess_urdu_text(text, use_ssml=use_ssml)
+    processed_text = _preprocess_urdu_text(text)
+    processed_text = _split_long_sentences(processed_text)
 
-    # Apply sentence splitting for very long text
-    processed_text = _split_long_sentences(processed_text, use_ssml=use_ssml)
-
-    # Wrap in SSML if enabled and not already SSML
-    if use_ssml and not processed_text.strip().startswith("<"):
-        # Add subtle prosody for documentary-style narration
-        # Slightly slower than default for clarity, neutral pitch
-        processed_text = _add_ssml_prosody(processed_text, rate="slow", pitch="default")
-        processed_text = f'<voice name="{voice}">{processed_text}</voice>'
-
-    communicate = edge_tts.Communicate(processed_text, voice)
+    communicate = edge_tts.Communicate(
+        processed_text,
+        voice,
+        rate=_rate_to_edge_format(rate),
+        pitch=_pitch_to_edge_format(pitch),
+    )
     await communicate.save(out_path)
 
 
@@ -237,11 +215,12 @@ def generate_scene_audio(
     out_path: str, 
     language: str = "ur", 
     voice_gender: str = "male",
-    use_ssml: bool = True,
+    rate: str = "slow",
+    pitch: str = "default",
 ):
     """Writes an mp3 to out_path using edge-tts with Pakistani Urdu voice."""
     voice = _resolve_voice(language, voice_gender)
-    asyncio.run(_tts_edge_async(text, out_path, voice, use_ssml))
+    asyncio.run(_tts_edge_async(text, out_path, voice, rate, pitch))
 
 
 async def _generate_all_async(
@@ -250,7 +229,8 @@ async def _generate_all_async(
     language: str, 
     voice_gender: str, 
     progress_callback=None,
-    use_ssml: bool = True,
+    rate: str = "slow",
+    pitch: str = "default",
 ):
     voice = _resolve_voice(language, voice_gender)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
@@ -265,7 +245,7 @@ async def _generate_all_async(
         narration = scene.get("narration", "")
 
         async with semaphore:
-            await _tts_edge_async(narration, out_path, voice, use_ssml)
+            await _tts_edge_async(narration, out_path, voice, rate, pitch)
 
         scene["audio_path"] = out_path
         done_count += 1
@@ -281,13 +261,15 @@ def generate_all_scene_audio(
     language: str = "ur",
     voice_gender: str = "male", 
     progress_callback=None,
-    use_ssml: bool = True,
+    rate: str = "slow",
+    pitch: str = "default",
 ) -> list:
     """
     scenes: list of scene dicts from script_generator (each with "narration")
     language: language code — for Urdu, use "ur" (automatically resolves to ur-PK)
     voice_gender: "male" or "female" — picks Pakistani Urdu neural voice
-    use_ssml: whether to wrap text in SSML prosody for more natural speech
+    rate: "slow" | "default" | "fast" — speech speed (real edge-tts parameter)
+    pitch: "low" | "default" | "high" — pitch variation (real edge-tts parameter)
     progress_callback: called as progress_callback(done, total) per scene
 
     Returns the same list with an added "audio_path" key per scene.
@@ -296,7 +278,7 @@ def generate_all_scene_audio(
     os.makedirs(audio_dir, exist_ok=True)
 
     asyncio.run(_generate_all_async(
-        scenes, audio_dir, language, voice_gender, progress_callback, use_ssml
+        scenes, audio_dir, language, voice_gender, progress_callback, rate, pitch
     ))
 
     return scenes
