@@ -559,7 +559,7 @@ def _build_scene_clip(
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-threads", str(THREADS_PER_CLIP),
         "-t", str(duration + CROSSFADE_SECONDS), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2,
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
         out_path,
     ]
@@ -589,7 +589,7 @@ def _build_title_card(
         "-filter_complex", f"[0:v][2:v]overlay=0:0,fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6",
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2, "-shortest",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest",
         out_path,
     ]
     _run(cmd, "Title card render")
@@ -605,7 +605,7 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
         cmd = [
             "ffmpeg", "-y", "-i", clip_paths[0],
             "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2,
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
             "-movflags", "+faststart",
             final_path,
         ]
@@ -649,7 +649,7 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
         "-map", f"[{prev_v_label}]",
         "-map", f"[{prev_a_label}]",
         "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2,
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         "-movflags", "+faststart",
         final_path,
     ]
