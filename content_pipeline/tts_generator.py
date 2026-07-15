@@ -13,6 +13,19 @@ Key improvements for Pakistani Urdu content:
 
 Scenes are generated concurrently (I/O-bound network calls) to keep total
 generation time low on longer videos.
+
+FIX: script_generator.py's prompts deliberately embed script/editing markers
+in the narration text -- "(PAUSE)", "(EMPHASIS)", and "[B-ROLL: description]"
+-- for pacing and editing purposes. Those are directorial notes, not words to
+be spoken. Because edge-tts's Communicate class does not parse any markup in
+its text input (it just speaks the literal string), those markers were being
+read aloud verbatim: the narrator would literally say "PAUSE", "EMPHASIS", and
+read out B-ROLL descriptions in English mid-Urdu-sentence. That abrupt
+language/register switching is very likely what sounded like "the AI reading
+words differently" -- it wasn't a voice-quality issue, it was literal stage
+directions being spoken. This is now stripped/converted before any text
+reaches TTS. Number/currency symbols (%, $) are also now spoken out in Urdu
+words instead of being left for the voice to guess at in English.
 """
 
 import os
@@ -42,6 +55,70 @@ MAX_CONCURRENT_TTS = 6
 
 
 # ---------------------------------------------------------------------------
+# Script-marker stripping (PAUSE / EMPHASIS / B-ROLL directives)
+# ---------------------------------------------------------------------------
+
+# Matches "[B-ROLL: anything]" (case-insensitive, tolerant of odd spacing) --
+# these are footage directions for the video assembler, never meant to be
+# spoken.
+_BROLL_MARKER_RE = re.compile(r"\[\s*B-?ROLL\s*:.*?\]", re.IGNORECASE | re.DOTALL)
+
+# Matches "(PAUSE)" -- converted to a real Urdu comma so edge-tts produces an
+# actual audible pause, instead of speaking the literal word "pause".
+_PAUSE_MARKER_RE = re.compile(r"\(\s*PAUSE\s*\)", re.IGNORECASE)
+
+# Matches "(EMPHASIS)" -- edge-tts's Communicate class has no way to apply
+# per-word stress/emphasis without SSML (which it doesn't parse anyway), so
+# there's nothing meaningful to convert this to. It's simply removed rather
+# than being read aloud as the word "emphasis".
+_EMPHASIS_MARKER_RE = re.compile(r"\(\s*EMPHASIS\s*\)", re.IGNORECASE)
+
+
+def _strip_narration_markers(text: str) -> str:
+    """Removes/converts script-writing directives that were never meant to be
+    spoken by TTS. Must run BEFORE sentence splitting/word-count logic so
+    those don't get thrown off by leftover bracket text."""
+    if not text:
+        return text
+
+    text = _BROLL_MARKER_RE.sub(" ", text)
+    text = _PAUSE_MARKER_RE.sub("،", text)
+    text = _EMPHASIS_MARKER_RE.sub(" ", text)
+
+    # Clean up artifacts left behind: doubled punctuation, stray leading
+    # commas, extra whitespace from the removals above.
+    text = re.sub(r"[،,]{2,}", "،", text)
+    text = re.sub(r"\s*،\s*", "، ", text)
+    text = re.sub(r"^[،,\s]+", "", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Number / currency preprocessing
+# ---------------------------------------------------------------------------
+
+# "50%" -> "50 فیصد" ("feesad" / percent). Left bare, edge-tts tends to read
+# the symbol in English mid-Urdu-sentence, which is a jarring language switch.
+_PERCENT_RE = re.compile(r"(\d[\d,.]*)\s*%")
+
+# "$500" -> "500 ڈالر" (dollar). Same reasoning as above -- spelled out in
+# Urdu so the whole sentence stays in one language/register.
+_DOLLAR_PREFIX_RE = re.compile(r"\$\s*(\d[\d,.]*)")
+
+
+def _normalize_numbers_and_currency(text: str) -> str:
+    """Spells out %/$ in Urdu words so the voice doesn't switch languages
+    mid-sentence to read a bare symbol."""
+    if not text:
+        return text
+    text = _PERCENT_RE.sub(r"\1 فیصد", text)
+    text = _DOLLAR_PREFIX_RE.sub(r"\1 ڈالر", text)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Urdu text pre-processing for better TTS output
 # ---------------------------------------------------------------------------
 
@@ -50,10 +127,13 @@ def _preprocess_urdu_text(text: str) -> str:
     Cleans and prepares Urdu text for TTS to sound more natural.
 
     Fixes applied:
-      1. Normalizes Arabic/Urdu punctuation to standard forms TTS handles better
-      2. Fixes common number/pronunciation issues
-      3. Removes excessive whitespace
-      4. Ensures proper sentence-ending punctuation for natural cadence
+      1. Strips script/editing markers -- (PAUSE), (EMPHASIS), [B-ROLL: ...] --
+         that are meant for the human editor/assembler, not to be spoken
+      2. Normalizes Arabic/Urdu punctuation to standard forms TTS handles better
+      3. Spells out %/$ in Urdu words instead of leaving bare symbols that get
+         read in English mid-sentence
+      4. Removes excessive whitespace
+      5. Ensures proper sentence-ending punctuation for natural cadence
 
     NOTE: this used to have a use_ssml mode that injected literal <break> tags
     for pauses. edge-tts's Communicate class does NOT parse SSML tags embedded
@@ -65,11 +145,18 @@ def _preprocess_urdu_text(text: str) -> str:
     if not text:
         return text
 
+    # Strip script-writing directives FIRST, before any other processing,
+    # since they're not spoken content at all.
+    text = _strip_narration_markers(text)
+
     # Normalize various Unicode space/punctuation variants
     text = text.replace("\u060c", ",")   # Arabic comma -> standard comma
     text = text.replace("\u061b", ";")   # Arabic semicolon -> standard
     text = text.replace("\u061f", "?")   # Arabic question mark -> standard
     text = text.replace("\u0640", "")    # Tatweel (kashida) -> remove (TTS chokes on it)
+
+    # Spell out %/$ in Urdu words instead of bare symbols
+    text = _normalize_numbers_and_currency(text)
 
     # Ensure sentence-ending punctuation for natural TTS cadence
     # TTS engines often run sentences together without clear ending marks
@@ -196,7 +283,10 @@ async def _tts_edge_async(text: str, out_path: str, voice: str, rate: str = "slo
     versions of this function wrapped text in <voice>/<prosody>/<break> tags,
     which edge-tts then read aloud verbatim (the actual cause of narration
     speaking its own markup). Prosody is now set the only way edge-tts actually
-    supports it: as real constructor keyword arguments.
+    supports it: as real constructor keyword arguments. Script-writing markers
+    like (PAUSE)/(EMPHASIS)/[B-ROLL: ...] are stripped in _preprocess_urdu_text
+    before any text reaches this function, for the same underlying reason --
+    they are not spoken content.
     """
     processed_text = _preprocess_urdu_text(text)
     processed_text = _split_long_sentences(processed_text)
