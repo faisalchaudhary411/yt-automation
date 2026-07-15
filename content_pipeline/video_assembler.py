@@ -1,21 +1,9 @@
 """
 Assembles per-scene images + narration audio into one final MP4.
 Each scene gets a slow Ken-Burns zoom on its still image, with the narration
-audio and a caption of the narration text rendered via libass (not drawtext —
-drawtext has no Arabic/Urdu text-shaping engine behind it, so joined Nastaliq
-letterforms render as disconnected/isolated glyphs, and any glyph missing
-from the fallback font shows as a "tofu" box). Scenes are joined with short
-crossfade dissolves (instead of hard cuts) for a more polished, less
-obviously auto-generated feel.
-
-Requires ffmpeg to be installed with libass enabled (`ffmpeg -version` should list
-`--enable-libass` under configuration; nearly all standard ffmpeg builds include this).
-
-FONT HANDLING:
-  The code first checks for a bundled font at fonts/NotoNastaliqUrdu.ttf (relative
-  to this script). If not found, it falls back to system-installed fonts detected
-  via fc-list. This ensures Urdu/Arabic captions render correctly whether running
-  in a container with bundled fonts or on a system with global font packages.
+audio and a caption rendered via Pillow (not libass) to avoid Replit's
+HarfBuzz-ng 10.2.0 regression that turns Nastaliq into tofu boxes.
+Scenes are joined with short crossfade dissolves.
 """
 
 import os
@@ -25,8 +13,16 @@ import math
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Pillow is required for the PNG text-overlay fix
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+    Image = ImageDraw = ImageFont = None
+
 # ---------------------------------------------------------------------------
-# Font resolution — try bundled first, then fall back to system fonts
+# Font resolution -- try bundled first, then fall back to system fonts
 # ---------------------------------------------------------------------------
 
 FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
@@ -48,61 +44,39 @@ LATIN_FONT_FILENAME = "DejaVuSans.ttf"
 # Latin fallback fonts (for English text - intro/outro/titles)
 LATIN_FALLBACK_FONTS = [
     "DejaVu Sans",
-    "Liberation Sans", 
+    "Liberation Sans",
     "Noto Sans",
     "FreeSans",
     "Arial",
 ]
 
-
 _FONT_MAGIC_BYTES = (
     b"\x00\x01\x00\x00",  # TrueType
-    b"OTTO",              # OpenType/CFF
-    b"true",              # TrueType (older mac)
-    b"ttcf",              # TrueType collection
+    b"OTTO",                   # OpenType/CFF
+    b"true",                   # TrueType (older mac)
+    b"ttcf",                   # TrueType collection
 )
 
 
 def _validate_font_file(path: str) -> str:
-    """
-    Sanity-checks a font file that merely *exists* on disk before trusting it.
-
-    Files uploaded/committed through GitHub's mobile web editor (or any
-    copy-paste-based workflow) can silently end up as 0-byte stubs, truncated
-    partial writes, or — if the repo ever used Git LFS for this file — a small
-    ~130-byte *text* pointer file instead of the real binary. In all of these
-    cases os.path.isfile() still returns True, fc-scan fails quietly, and the
-    code used to fall back to a hardcoded family name that libass can't
-    actually find glyphs for — producing tofu boxes with no error anywhere.
-
-    Returns an empty string if the file looks like a real, valid font.
-    Returns a human-readable reason string if it does not.
-    """
     try:
         size = os.path.getsize(path)
     except OSError as e:
         return f"could not stat file ({e})"
 
     if size == 0:
-        return "file is 0 bytes (empty — upload/commit likely failed)"
+        return "file is 0 bytes (empty -- upload/commit likely failed)"
 
     if size < 2048:
-        # Real TTF/OTF files (esp. ones with Urdu/Arabic glyph coverage) are
-        # realistically hundreds of KB at minimum. Anything this small is
-        # almost certainly not a real font.
         try:
             with open(path, "rb") as f:
                 head = f.read(200)
             if head.startswith(b"version https://git-lfs"):
                 return (
                     f"file is only {size} bytes and is a Git LFS pointer, not the "
-                    "actual font binary — Railway's build never ran `git lfs pull`, "
-                    "so it checked out the pointer text instead of the real .ttf. "
-                    "Either stop using LFS for this file (commit the raw binary "
-                    "directly) or make sure git-lfs is installed and pulled during "
-                    "the Railway build."
+                    "actual font binary."
                 )
-            return f"file is only {size} bytes — too small to be a real font ({head[:50]!r})"
+            return f"file is only {size} bytes -- too small to be a real font ({head[:50]!r})"
         except OSError as e:
             return f"could not read file to inspect it ({e})"
 
@@ -115,25 +89,10 @@ def _validate_font_file(path: str) -> str:
     if magic not in _FONT_MAGIC_BYTES:
         return f"file header {magic!r} doesn't match any known font format (corrupted upload?)"
 
-    return ""  # looks valid
+    return ""
 
 
 def _resolve_font(for_latin_text: bool = False) -> tuple:
-    """
-    Returns (font_family_name, fonts_dir_path) for use with ffmpeg's subtitles filter.
-
-    Priority:
-      1. Bundled font in local fonts/ directory (for containers/Replit)
-      2. System-installed font found via fc-list (for systems with font packages)
-
-    for_latin_text: If True, resolves a Latin-capable font (DejaVu Sans, etc.) for
-    English text. If False, resolves an Urdu/Arabic-shaping-capable font (Noto
-    Nastaliq Urdu, etc.) so Urdu captions render properly instead of tofu boxes.
-
-    If no suitable font is found, raises a clear error with installation instructions.
-    Every step is logged loudly to stdout so Railway's deploy logs show exactly
-    what happened, instead of silently degrading to tofu boxes.
-    """
     if for_latin_text:
         bundled_filename = LATIN_FONT_FILENAME
         bundled_family_name = LATIN_FONT_NAME
@@ -145,20 +104,13 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
         fallback_names = FALLBACK_FONT_NAMES
         label = "Urdu/Arabic"
 
-    # 1. Check bundled font first
     bundled_path = os.path.join(FONTS_DIR, bundled_filename)
     print(f"[font_resolve:{label}] looking for bundled font at {bundled_path}")
 
     if os.path.isfile(bundled_path):
         problem = _validate_font_file(bundled_path)
         if problem:
-            print(
-                f"[font_resolve:{label}] FOUND bundled file but it's INVALID: {problem}\n"
-                f"[font_resolve:{label}] >>> This is very likely the cause of tofu boxes. "
-                f"Re-upload a real copy of {bundled_filename} to {FONTS_DIR}/ and redeploy."
-            )
-            # Deliberately do NOT trust this file — fall through to system fonts
-            # rather than silently returning a family name with no real glyphs.
+            print(f"[font_resolve:{label}] FOUND bundled file but INVALID: {problem}")
         else:
             size = os.path.getsize(bundled_path)
             print(f"[font_resolve:{label}] bundled file looks valid ({size} bytes)")
@@ -169,7 +121,7 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
                 )
                 family = result.stdout.strip().split("\n")[0].strip()
                 if family:
-                    print(f"[font_resolve:{label}] fc-scan reports family='{family}' — using it")
+                    print(f"[font_resolve:{label}] fc-scan reports family='{family}' -- using it")
                     return (family, FONTS_DIR)
                 print(f"[font_resolve:{label}] fc-scan returned no family name; using hardcoded '{bundled_family_name}'")
             except Exception as e:
@@ -178,7 +130,6 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
     else:
         print(f"[font_resolve:{label}] no bundled file found at that path")
 
-    # 2. Fall back to system-installed fonts
     for font_name in fallback_names:
         try:
             result = subprocess.run(
@@ -187,18 +138,16 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
             )
             if result.stdout.strip():
                 print(f"[font_resolve:{label}] using system font '{font_name}' (fc-list found: {result.stdout.strip().splitlines()[0]})")
-                # Font is installed system-wide; no need for fontsdir
                 return (font_name, "")
         except Exception:
             continue
 
-    # 3. Nothing found — raise helpful error
     raise FileNotFoundError(
         f"No {label}-capable font found. Tried: {fallback_names}\n\n"
         "To fix this, either:\n"
         "  a) Place a REAL, valid font file at:\n"
         f"     {os.path.join(FONTS_DIR, bundled_filename)}\n"
-        "     (check the file size on GitHub — it should be hundreds of KB, not a few bytes)\n"
+        "     (check the file size on GitHub -- it should be hundreds of KB, not a few bytes)\n"
         "  b) Install system fonts: apt-get install fonts-noto-core fonts-freefont-ttf"
     )
 
@@ -206,20 +155,6 @@ def _resolve_font(for_latin_text: bool = False) -> tuple:
 # Resolve fonts at module load (fails fast if missing)
 (_RESOLVED_FONT_FAMILY, _RESOLVED_FONTS_DIR) = _resolve_font(for_latin_text=False)
 (_RESOLVED_LATIN_FONT, _RESOLVED_LATIN_FONTS_DIR) = _resolve_font(for_latin_text=True)
-
-
-def _get_fonts_dir_for_filter(for_latin: bool = False) -> str:
-    """Returns the fontsdir path for ffmpeg subtitles filter, or empty string if using system fonts."""
-    if for_latin:
-        return _RESOLVED_LATIN_FONTS_DIR
-    return _RESOLVED_FONTS_DIR
-
-
-def _get_font_family(for_latin: bool = False) -> str:
-    """Returns the resolved font family name for ASS styles."""
-    if for_latin:
-        return _RESOLVED_LATIN_FONT
-    return _RESOLVED_FONT_FAMILY
 
 
 # Unicode blocks covering Arabic/Urdu script (including presentation forms used by
@@ -239,48 +174,182 @@ def _is_arabic_script_char(c: str) -> bool:
 
 
 def _is_latin_text(text: str) -> bool:
-    """
-    Detects whether a string should use the Latin font or the Urdu/Nastaliq font.
-
-    IMPORTANT: this used to count every character with ord(c) < 128 as "Latin",
-    which includes spaces, digits, and ASCII punctuation -- all of which appear
-    constantly in otherwise-Urdu narration (word spacing, years like "1929",
-    dollar figures, English proper nouns). That let ordinary Urdu sentences tip
-    past a 50% "Latin" threshold and get rendered in DejaVu Sans (no Arabic
-    glyphs at all) instead of Noto Nastaliq Urdu -- producing tofu boxes for
-    real Urdu text, inconsistently, depending on what happened to be in each
-    scene's narration.
-
-    Fix: only look at actual alphabetic letters (ignore spaces/digits/
-    punctuation entirely, since those aren't script-specific), and default to
-    the Urdu font whenever there's any meaningful amount of real Arabic-script
-    text -- a few embedded English words/numbers in mostly-Urdu narration
-    should still render as Urdu, not flip the whole scene to a font with no
-    Arabic coverage.
-    """
     if not text:
         return True
     letters = [c for c in text if c.isalpha()]
     if not letters:
-        return True  # no letters at all (pure numbers/symbols) -- Latin font is a safe default
+        return True
     arabic_count = sum(1 for c in letters if _is_arabic_script_char(c))
-    # Only treat as "Latin" if Arabic-script letters are negligible (<15% of all
-    # letters). This deliberately favors the Urdu font for mixed content, since
-    # Noto Nastaliq Urdu still renders basic Latin digits/punctuation fine, while
-    # the reverse (Urdu text in DejaVu Sans) produces tofu boxes.
     return (arabic_count / len(letters)) < 0.15
 
 
-def _combined_fonts_dir() -> str:
-    """
-    Returns a single fontsdir usable for an ASS file that mixes Urdu and Latin
-    fonts in the same document (e.g. title cards with per-line \\fn overrides).
-    Both bundled fonts live under the same FONTS_DIR, so one directory covers
-    either/both; falls back to "" (system font cache only) if it doesn't exist.
-    """
-    if os.path.isdir(FONTS_DIR):
-        return FONTS_DIR
+# ---------------------------------------------------------------------------
+# Pillow-based text rendering (replaces libass/ASS entirely)
+# ---------------------------------------------------------------------------
+
+def _resolve_font_path(for_latin: bool = False) -> str:
+    """Returns an actual filesystem path to a TTF for Pillow."""
+    filename = LATIN_FONT_FILENAME if for_latin else CAPTION_FONT_FILENAME
+    bundled = os.path.join(FONTS_DIR, filename)
+    if os.path.isfile(bundled) and not _validate_font_file(bundled):
+        return bundled
+
+    names = LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES
+    for name in names:
+        try:
+            r = subprocess.run(
+                ["fc-list", name, ":file"],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.stdout.strip():
+                path = r.stdout.strip().splitlines()[0].split(":")[0]
+                if os.path.isfile(path):
+                    return path
+        except Exception:
+            continue
     return ""
+
+
+def _render_text_page(lines, width, height, fontsize, bottom_margin, out_path, for_latin=False):
+    """Renders a page of caption lines to a full-size transparent PNG."""
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required. Install it: pip install pillow")
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    font_path = _resolve_font_path(for_latin=for_latin)
+    try:
+        font = ImageFont.truetype(font_path, fontsize) if font_path else ImageFont.load_default()
+    except Exception as e:
+        print(f"[render_text] Font load failed ({e}), using default")
+        font = ImageFont.load_default()
+
+    direction = "ltr" if for_latin else "rtl"
+    line_spacing = int(fontsize * 0.35)
+    line_height = fontsize + line_spacing
+
+    measured = []
+    for line in lines:
+        bb = draw.textbbox((0, 0), line, font=font, direction=direction)
+        measured.append({
+            "text": line,
+            "w": bb[2] - bb[0],
+            "h": bb[3] - bb[1],
+            "left": bb[0],
+            "top": bb[1],
+        })
+
+    max_w = max((m["w"] for m in measured), default=0)
+    total_h = len(lines) * line_height - line_spacing
+
+    x_start = (width - max_w) // 2
+    y_start = height - bottom_margin - total_h
+
+    pad_x, pad_y = 48, 24
+    box = [
+        max(0, x_start - pad_x),
+        max(0, y_start - pad_y),
+        min(width, x_start + max_w + pad_x),
+        min(height, y_start + total_h + pad_y),
+    ]
+    draw.rectangle(box, fill=(0, 0, 0, 115))
+
+    for i, m in enumerate(measured):
+        x = (width - m["w"]) // 2 - m["left"]
+        y = y_start + i * line_height - m["top"]
+
+        for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+            draw.text((x + dx, y + dy), m["text"], font=font, fill=(0, 0, 0, 160), direction=direction)
+        draw.text((x, y), m["text"], font=font, fill=(255, 255, 255, 255), direction=direction)
+
+    img.save(out_path)
+    return out_path
+
+
+def _write_caption_pngs(text, width, height, fontsize, bottom_margin, duration, out_dir, prefix="cap", for_latin=False):
+    """Paginates text and renders each page to a transparent PNG with timing info."""
+    all_lines = _wrap_text_lines(text, width, fontsize)
+    pages = _paginate_lines(all_lines, lines_per_page=2)
+    if not pages:
+        return []
+
+    word_counts = [max(1, sum(len(line.split()) for line in page)) for page in pages]
+    total_words = sum(word_counts)
+
+    png_infos = []
+    t_cursor = 0.0
+    for i, page in enumerate(pages):
+        is_last = i == len(pages) - 1
+        page_duration = duration * (word_counts[i] / total_words)
+        start = t_cursor
+        end = duration if is_last else t_cursor + page_duration
+        t_cursor = end
+
+        out_path = os.path.join(out_dir, f"{prefix}_page_{i:03d}.png")
+        _render_text_page(page, width, height, fontsize, bottom_margin, out_path, for_latin=for_latin)
+        png_infos.append({"path": out_path, "start": start, "end": end})
+    return png_infos
+
+
+def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, subtitle_fontsize=46):
+    """Renders a title card to a full-size transparent PNG."""
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required. Install it: pip install pillow")
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    title_text = lines[0] if lines else ""
+    is_title_latin = _is_latin_text(title_text)
+    title_path = _resolve_font_path(for_latin=is_title_latin)
+    try:
+        title_font = ImageFont.truetype(title_path, title_fontsize) if title_path else ImageFont.load_default()
+    except Exception:
+        title_font = ImageFont.load_default()
+    title_dir = "ltr" if is_title_latin else "rtl"
+    title_lines = _wrap_text_lines(title_text, width, title_fontsize)[:3]
+
+    subtitle_text = lines[1] if len(lines) > 1 else ""
+    is_sub_latin = _is_latin_text(subtitle_text) if subtitle_text else True
+    sub_path = _resolve_font_path(for_latin=is_sub_latin)
+    try:
+        sub_font = ImageFont.truetype(sub_path, subtitle_fontsize) if sub_path else ImageFont.load_default()
+    except Exception:
+        sub_font = ImageFont.load_default()
+    sub_dir = "ltr" if is_sub_latin else "rtl"
+    subtitle_lines = _wrap_text_lines(subtitle_text, width, subtitle_fontsize)[:2] if subtitle_text else []
+
+    title_line_h = title_fontsize + 20
+    sub_line_h = subtitle_fontsize + 14
+    gap = 30 if subtitle_lines else 0
+    total_h = len(title_lines) * title_line_h + gap + len(subtitle_lines) * sub_line_h
+    y_cursor = (height - total_h) // 2
+
+    for line in title_lines:
+        bb = draw.textbbox((0, 0), line, font=title_font, direction=title_dir)
+        text_w = bb[2] - bb[0]
+        x = (width - text_w) // 2 - bb[0]
+        y = y_cursor - bb[1]
+        for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 180), direction=title_dir)
+        draw.text((x, y), line, font=title_font, fill=(255, 255, 255, 255), direction=title_dir)
+        y_cursor += title_line_h
+
+    if subtitle_lines:
+        y_cursor += gap - 10
+        for line in subtitle_lines:
+            bb = draw.textbbox((0, 0), line, font=sub_font, direction=sub_dir)
+            text_w = bb[2] - bb[0]
+            x = (width - text_w) // 2 - bb[0]
+            y = y_cursor - bb[1]
+            for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+                draw.text((x + dx, y + dy), line, font=sub_font, fill=(0, 0, 0, 160), direction=sub_dir)
+            draw.text((x, y), line, font=sub_font, fill=(255, 255, 255, 255), direction=sub_dir)
+            y_cursor += sub_line_h
+
+    img.save(out_path)
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -322,11 +391,6 @@ def _escape_for_drawtext(text: str) -> str:
     return text
 
 
-def _escape_ass_text(text: str) -> str:
-    text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _escape_for_filter_path(path: str) -> str:
     return path.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
 
@@ -341,7 +405,6 @@ def _format_ass_time(seconds: float) -> str:
 
 def _wrap_text_lines(text: str, width: int, fontsize: int, max_chars_per_line: int = None) -> list:
     if max_chars_per_line is None:
-        # Nastaliq is wider per character than Latin; use more conservative estimate
         max_chars_per_line = max(15, int(width * 0.85 / (fontsize * 0.65)))
     lines = textwrap.wrap(text, width=max_chars_per_line, break_long_words=False)
     if not lines:
@@ -356,63 +419,6 @@ def _paginate_lines(lines: list, lines_per_page: int = 2, max_pages: int = 10) -
     if n_pages > max_pages:
         lines_per_page = math.ceil(len(lines) / max_pages)
     return [lines[i:i + lines_per_page] for i in range(0, len(lines), lines_per_page)]
-
-
-def _write_caption_ass(
-    text: str, width: int, height: int, fontsize: int, bottom_margin: int,
-    duration: float, out_path: str, for_latin: bool = False,
-) -> str:
-    """
-    Writes an ASS subtitle file with proper text shaping via libass.
-    Uses the resolved font family (bundled or system).
-
-    for_latin: If True, uses Latin-capable font for English text (prevents tofu boxes).
-    """
-    all_lines = _wrap_text_lines(text, width, fontsize)
-    pages = _paginate_lines(all_lines, lines_per_page=2)
-    if not pages:
-        return ""
-
-    word_counts = [max(1, sum(len(line.split()) for line in page)) for page in pages]
-    total_words = sum(word_counts)
-
-    events = []
-    t_cursor = 0.0
-    for i, page in enumerate(pages):
-        is_last = i == len(pages) - 1
-        page_duration = duration * (word_counts[i] / total_words)
-        start = t_cursor
-        end = duration if is_last else t_cursor + page_duration
-        t_cursor = end
-
-        page_text = "\\N".join(_escape_ass_text(line) for line in page)
-        events.append(
-            f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},"
-            f"Caption,,0,0,0,,{page_text}"
-        )
-
-    font_family = _get_font_family(for_latin=for_latin)
-
-    ass_content = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        f"PlayResX: {width}\n"
-        f"PlayResY: {height}\n"
-        "WrapStyle: 2\n"
-        "ScaledBorderAndShadow: yes\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
-        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
-        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Caption,{font_family},{fontsize},&H00FFFFFF,&H000000FF,&H00000000,"
-        f"&H73000000,0,0,0,0,100,100,0,0,3,0,8,2,60,60,{bottom_margin},1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        + "\n".join(events) + "\n"
-    )
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(ass_content)
-    return out_path
 
 
 def _watermark_filter(channel_name: str, fontsize: int = 26) -> str:
@@ -451,18 +457,6 @@ def _zoompan_expr(index: int, zoom_rate: float) -> str:
     return f"z='{z_expr}':x='{x_expr}':y='{y_expr}'"
 
 
-def _build_subtitles_filter(ass_path: str, for_latin: bool = False) -> str:
-    """
-    Builds the subtitles filter string. Only includes fontsdir when using bundled fonts.
-    When using system fonts, fontsdir is omitted so libass uses the system font cache.
-    """
-    fonts_dir = _get_fonts_dir_for_filter(for_latin=for_latin)
-    base = f"subtitles=filename='{_escape_for_filter_path(ass_path)}'"
-    if fonts_dir:
-        base += f":fontsdir='{_escape_for_filter_path(fonts_dir)}'"
-    return base
-
-
 def _build_scene_clip(
     scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008,
     channel_name: str = None,
@@ -479,39 +473,53 @@ def _build_scene_clip(
     total_frames = int(duration * fps)
 
     fontsize = 40
-    ass_path = os.path.join(clip_dir, f"scene_{index:03d}_captions.ass")
-
-    # Auto-detect if narration is primarily Latin/English text
     narration_text = scene.get("narration", "")
     is_latin = _is_latin_text(narration_text)
 
-    caption_ass_path = _write_caption_ass(
+    caption_pngs = _write_caption_pngs(
         narration_text, width, height, fontsize, bottom_margin=90,
-        duration=duration, out_path=ass_path, for_latin=is_latin,
+        duration=duration, out_dir=clip_dir, prefix=f"scene_{index:03d}", for_latin=is_latin,
     )
-
-    caption_filter = ""
-    if caption_ass_path:
-        caption_filter = _build_subtitles_filter(caption_ass_path, for_latin=is_latin)
 
     watermark_filter = _watermark_filter(channel_name)
 
-    vf_parts = [
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", scene["image_path"], "-i", scene["audio_path"]]
+    for info in caption_pngs:
+        cmd += ["-loop", "1", "-i", info["path"]]
+
+    base_filters = [
         f"scale={width}:{height}",
         f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
         COLOR_GRADE_FILTER,
-        caption_filter,
     ]
-    if watermark_filter:
-        vf_parts.append(watermark_filter)
-    vf_parts.append(f"tpad=stop_mode=clone:stop_duration={CROSSFADE_SECONDS}")
-    vf = ",".join(part for part in vf_parts if part)
+    filters = [f"[0:v]{','.join(base_filters)}[base]"]
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", scene["image_path"],
-        "-i", scene["audio_path"],
-        "-vf", vf,
+    current_label = "[base]"
+    for i, info in enumerate(caption_pngs):
+        input_idx = 2 + i
+        out_label = f"[cap{i}]" if i < len(caption_pngs) - 1 else "[vcap]"
+        start = info["start"]
+        end = info["end"]
+        filters.append(
+            f"{current_label}[{input_idx}:v]overlay=0:0:enable='between(t\\,{start:.3f}\\,{end:.3f})'{out_label}"
+        )
+        current_label = out_label
+
+    final_filters = []
+    if watermark_filter:
+        final_filters.append(watermark_filter)
+    final_filters.append(f"tpad=stop_mode=clone:stop_duration={CROSSFADE_SECONDS}")
+
+    if final_filters:
+        filters.append(f"{current_label}{','.join(final_filters)}[vout]")
+        current_label = "[vout]"
+
+    filter_complex = ";".join(filters)
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", current_label,
+        "-map", "1:a",
         "-af", f"dynaudnorm=f=150:g=15,apad=pad_dur={CROSSFADE_SECONDS}",
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-threads", str(THREADS_PER_CLIP),
@@ -524,73 +532,6 @@ def _build_scene_clip(
     return out_path
 
 
-def _write_title_ass(
-    lines: list, out_path: str, width: int, height: int, duration: float,
-    title_fontsize: int = 92, subtitle_fontsize: int = 46,
-) -> str:
-    """
-    Writes the title-card ASS file. Each line's font is chosen per-line based on
-    whether that line's text is primarily Latin or Urdu/Arabic (via inline \\fn
-    override), since a title card's main title (often Urdu) and its hardcoded
-    subtitle (often English) can be different scripts within the same card.
-    """
-    line_height = title_fontsize + 20
-    title_text = lines[0] if lines else ""
-    title_font = _get_font_family(for_latin=_is_latin_text(title_text))
-    title_lines = _wrap_text_lines(title_text, width, title_fontsize)[:3]
-    n_title_lines = len(title_lines)
-
-    events = []
-    end_ts = _format_ass_time(duration)
-    for i, line in enumerate(title_lines):
-        offset = (i - (n_title_lines - 1) / 2) * line_height - 30
-        y = height / 2 + offset
-        events.append(
-            f"Dialogue: 0,0:00:00.00,{end_ts},Title,,0,0,0,,"
-            f"{{\\an5\\pos({width / 2:.0f},{y:.0f})\\fn{title_font}\\fs{title_fontsize}}}"
-            f"{_escape_ass_text(line)}"
-        )
-
-    if len(lines) > 1 and lines[1]:
-        subtitle_text = lines[1]
-        subtitle_font = _get_font_family(for_latin=_is_latin_text(subtitle_text))
-        subtitle_lines = _wrap_text_lines(subtitle_text, width, subtitle_fontsize)[:2]
-        subtitle_top = 50 + (n_title_lines - 1) * line_height
-        for j, sub_line in enumerate(subtitle_lines):
-            offset = subtitle_top + j * (subtitle_fontsize + 14)
-            y = height / 2 + offset
-            events.append(
-                f"Dialogue: 0,0:00:00.00,{end_ts},Title,,0,0,0,,"
-                f"{{\\an5\\pos({width / 2:.0f},{y:.0f})\\fn{subtitle_font}\\fs{subtitle_fontsize}\\bord3}}"
-                f"{_escape_ass_text(sub_line)}"
-            )
-
-    # Default/base style font doesn't matter much since every event carries its
-    # own \fn override above, but set it to the title's font as a sane fallback.
-    font_family = title_font
-
-    ass_content = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        f"PlayResX: {width}\n"
-        f"PlayResY: {height}\n"
-        "WrapStyle: 2\n"
-        "ScaledBorderAndShadow: yes\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
-        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
-        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Title,{font_family},{title_fontsize},&H00FFFFFF,&H000000FF,&H00000000,"
-        "&H00000000,0,0,0,0,100,100,0,0,1,4,1,5,20,20,20,1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        + "\n".join(events) + "\n"
-    )
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(ass_content)
-    return out_path
-
-
 def _build_title_card(
     lines: list,
     out_path: str,
@@ -600,27 +541,17 @@ def _build_title_card(
     fps: int = SCENE_FPS,
     bg_color: str = "0x141E30",
 ) -> str:
-    title_fontsize = 92
-    subtitle_fontsize = 46
-
-    ass_path = out_path + ".ass"
-    _write_title_ass(lines, ass_path, width, height, duration, title_fontsize, subtitle_fontsize)
+    png_path = out_path + ".title.png"
+    _render_title_card_png(lines, width, height, png_path)
 
     fade_out_start = max(0.0, duration - 0.6)
-    fonts_dir = _combined_fonts_dir()
-    subtitles_filter = f"subtitles=filename='{_escape_for_filter_path(ass_path)}'"
-    if fonts_dir:
-        subtitles_filter += f":fontsdir='{_escape_for_filter_path(fonts_dir)}'"
-    vf = (
-        f"{subtitles_filter},"
-        f"fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6"
-    )
 
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-vf", vf,
+        "-loop", "1", "-i", png_path,
+        "-filter_complex", f"[0:v][2:v]overlay=0:0,fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6",
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest",
@@ -728,7 +659,6 @@ def _join_mixed_transitions(
         return _join_with_crossfades(clip_paths, final_path, crossfade_seconds)
 
     if left_bound >= right_bound:
-        # Too few clips for a dedicated middle section; crossfade all
         return _join_with_crossfades(clip_paths, final_path, crossfade_seconds)
 
     tmp_dir = os.path.dirname(final_path) or "."
@@ -787,48 +717,25 @@ def _mix_background_music(video_path: str, music_path: str, output_path: str, mu
 
 
 def _sanitize_filename(name: str, max_length: int = 80) -> str:
-    """
-    Converts a topic/title string into a safe, readable filename.
-
-    Rules:
-      - Removes/replaces characters illegal in filenames (/, \\, :, *, ?, ", <, >, |, !, etc.)
-      - Collapses multiple spaces/hyphens into single ones
-      - Truncates to max_length to avoid overly long filenames
-      - Preserves Urdu/Arabic Unicode characters (they are valid in filenames on Linux/Mac)
-      - Falls back to "final_video" if the result is empty
-    """
     if not name:
         return "final_video.mp4"
 
-    # Ensure string and strip whitespace
     name = str(name).strip()
-
     if not name:
         return "final_video.mp4"
 
-    # Replace illegal filename characters with hyphens
-    # Windows illegal: < > : " / \ | ? * 
-    # Also common problematic chars: ! @ # $ % ^ & ( ) [ ] { } + = ` ~ '
-    # And whitespace/newlines
-    illegal_chars = r'''[<>:"/\\|?*!@#$%^&()\[\]{}+=`~'\n\r\t]'''
+    illegal_chars = "[<>:\"/\\\\|?*!@#$%^&()\\[\\]{}+=`~'\\n\\r\\t]"
     safe = re.sub(illegal_chars, "-", name)
-
-    # Collapse multiple spaces/hyphens/underscores into single hyphen
     safe = re.sub(r"[ \s_]+", "-", safe)
     safe = re.sub(r"-+", "-", safe)
-
-    # Remove leading/trailing hyphens
     safe = safe.strip("-")
 
-    # Truncate if too long (keep room for .mp4 extension)
     if len(safe) > max_length:
-        safe = safe[:max_length].rsplit("-", 1)[0]  # cut at last hyphen to avoid mid-word
+        safe = safe[:max_length].rsplit("-", 1)[0]
 
-    # If somehow empty after sanitization, fallback
     if not safe:
         return "final_video.mp4"
 
-    # Ensure .mp4 extension
     if not safe.lower().endswith(".mp4"):
         safe += ".mp4"
 
@@ -838,9 +745,9 @@ def _sanitize_filename(name: str, max_length: int = 80) -> str:
 def assemble_video(
     scenes: list,
     work_dir: str,
-    output_name: str = None,   # explicit override; if None, falls back to title, then topic
-    topic: str = None,         # fallback for auto-naming when no title/output_name is given
-    title: str = None,         # generated video title; used for both the intro card and the output filename
+    output_name: str = None,
+    topic: str = None,
+    title: str = None,
     channel_name: str = None,
     include_intro: bool = True,
     include_outro: bool = True,
@@ -903,7 +810,6 @@ def assemble_video(
     if progress_callback:
         progress_callback("join", 0, 1)
 
-    # Resolve output filename: explicit override > video title > topic > fallback
     if output_name:
         resolved_name = output_name
     elif title:
@@ -921,7 +827,7 @@ def assemble_video(
         _mix_background_music(final_path, music_path, music_mixed_path)
         os.replace(music_mixed_path, final_path)
     elif music_path:
-        print(f"[video_assembler] music_path '{music_path}' not found — skipping background music.")
+        print(f"[video_assembler] music_path '{music_path}' not found -- skipping background music.")
 
     if progress_callback:
         progress_callback("join", 1, 1)
