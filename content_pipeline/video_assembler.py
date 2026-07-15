@@ -38,7 +38,7 @@ except ImportError:
 # HARD-CODED FONT PATHS — points to content_pipeline/fonts/
 # ---------------------------------------------------------------------------
 
-FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "content_pipeline", "fonts")
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
 URDU_FONT_PATH = os.path.join(FONTS_DIR, "NotoNastaliqUrdu.ttf")
 LATIN_FONT_PATH = os.path.join(FONTS_DIR, "DejaVuSans.ttf")
