@@ -21,6 +21,19 @@ except ImportError:
     _HAS_PIL = False
     Image = ImageDraw = ImageFont = None
 
+# Optional: pure-Python Arabic shaping & BiDi reordering (no libraqm needed)
+try:
+    import arabic_reshaper
+    _HAS_ARABIC_RESHAPER = True
+except ImportError:
+    _HAS_ARABIC_RESHAPER = False
+
+try:
+    from bidi.algorithm import get_display
+    _HAS_BIDI = True
+except ImportError:
+    _HAS_BIDI = False
+
 # ---------------------------------------------------------------------------
 # Font resolution -- try bundled first, then fall back to system fonts
 # ---------------------------------------------------------------------------
@@ -183,6 +196,24 @@ def _is_latin_text(text: str) -> bool:
     return (arabic_count / len(letters)) < 0.15
 
 
+def _prepare_text_for_rendering(text: str, is_latin: bool) -> str:
+    """
+    For RTL scripts (Urdu/Arabic), reshape letters and apply BiDi reordering
+    so Pillow can render them correctly WITHOUT needing libraqm.
+    Falls back to raw text if arabic-reshaper / python-bidi are not installed.
+    """
+    if is_latin or not text:
+        return text
+
+    # If we have the optional libraries, reshape + reorder
+    if _HAS_ARABIC_RESHAPER and _HAS_BIDI:
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+
+    # Otherwise just return raw text (Pillow will render LTR; not ideal but won't crash)
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Pillow-based text rendering (replaces libass/ASS entirely)
 # ---------------------------------------------------------------------------
@@ -225,13 +256,15 @@ def _render_text_page(lines, width, height, fontsize, bottom_margin, out_path, f
         print(f"[render_text] Font load failed ({e}), using default")
         font = ImageFont.load_default()
 
-    direction = "ltr" if for_latin else "rtl"
     line_spacing = int(fontsize * 0.35)
     line_height = fontsize + line_spacing
 
+    # Prepare lines for rendering (reshape/reorder RTL if needed)
+    prepared_lines = [_prepare_text_for_rendering(line, for_latin) for line in lines]
+
     measured = []
-    for line in lines:
-        bb = draw.textbbox((0, 0), line, font=font, direction=direction)
+    for line in prepared_lines:
+        bb = draw.textbbox((0, 0), line, font=font)
         measured.append({
             "text": line,
             "w": bb[2] - bb[0],
@@ -260,8 +293,8 @@ def _render_text_page(lines, width, height, fontsize, bottom_margin, out_path, f
         y = y_start + i * line_height - m["top"]
 
         for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-            draw.text((x + dx, y + dy), m["text"], font=font, fill=(0, 0, 0, 160), direction=direction)
-        draw.text((x, y), m["text"], font=font, fill=(255, 255, 255, 255), direction=direction)
+            draw.text((x + dx, y + dy), m["text"], font=font, fill=(0, 0, 0, 160))
+        draw.text((x, y), m["text"], font=font, fill=(255, 255, 255, 255))
 
     img.save(out_path)
     return out_path
@@ -307,7 +340,6 @@ def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, su
         title_font = ImageFont.truetype(title_path, title_fontsize) if title_path else ImageFont.load_default()
     except Exception:
         title_font = ImageFont.load_default()
-    title_dir = "ltr" if is_title_latin else "rtl"
     title_lines = _wrap_text_lines(title_text, width, title_fontsize)[:3]
 
     subtitle_text = lines[1] if len(lines) > 1 else ""
@@ -317,8 +349,11 @@ def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, su
         sub_font = ImageFont.truetype(sub_path, subtitle_fontsize) if sub_path else ImageFont.load_default()
     except Exception:
         sub_font = ImageFont.load_default()
-    sub_dir = "ltr" if is_sub_latin else "rtl"
     subtitle_lines = _wrap_text_lines(subtitle_text, width, subtitle_fontsize)[:2] if subtitle_text else []
+
+    # Prepare text for rendering
+    title_lines = [_prepare_text_for_rendering(line, is_title_latin) for line in title_lines]
+    subtitle_lines = [_prepare_text_for_rendering(line, is_sub_latin) for line in subtitle_lines]
 
     title_line_h = title_fontsize + 20
     sub_line_h = subtitle_fontsize + 14
@@ -327,25 +362,25 @@ def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, su
     y_cursor = (height - total_h) // 2
 
     for line in title_lines:
-        bb = draw.textbbox((0, 0), line, font=title_font, direction=title_dir)
+        bb = draw.textbbox((0, 0), line, font=title_font)
         text_w = bb[2] - bb[0]
         x = (width - text_w) // 2 - bb[0]
         y = y_cursor - bb[1]
         for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 180), direction=title_dir)
-        draw.text((x, y), line, font=title_font, fill=(255, 255, 255, 255), direction=title_dir)
+            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 180))
+        draw.text((x, y), line, font=title_font, fill=(255, 255, 255, 255))
         y_cursor += title_line_h
 
     if subtitle_lines:
         y_cursor += gap - 10
         for line in subtitle_lines:
-            bb = draw.textbbox((0, 0), line, font=sub_font, direction=sub_dir)
+            bb = draw.textbbox((0, 0), line, font=sub_font)
             text_w = bb[2] - bb[0]
             x = (width - text_w) // 2 - bb[0]
             y = y_cursor - bb[1]
             for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-                draw.text((x + dx, y + dy), line, font=sub_font, fill=(0, 0, 0, 160), direction=sub_dir)
-            draw.text((x, y), line, font=sub_font, fill=(255, 255, 255, 255), direction=sub_dir)
+                draw.text((x + dx, y + dy), line, font=sub_font, fill=(0, 0, 0, 160))
+            draw.text((x, y), line, font=sub_font, fill=(255, 255, 255, 255))
             y_cursor += sub_line_h
 
     img.save(out_path)
@@ -524,7 +559,7 @@ def _build_scene_clip(
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-threads", str(THREADS_PER_CLIP),
         "-t", str(duration + CROSSFADE_SECONDS), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2,
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
         out_path,
     ]
@@ -554,7 +589,7 @@ def _build_title_card(
         "-filter_complex", f"[0:v][2:v]overlay=0:0,fade=t=in:st=0:d=0.5,fade=t=out:st={fade_out_start}:d=0.6",
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-t", str(duration), "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2, "-shortest",
         out_path,
     ]
     _run(cmd, "Title card render")
@@ -570,7 +605,7 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
         cmd = [
             "ffmpeg", "-y", "-i", clip_paths[0],
             "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2,
             "-movflags", "+faststart",
             final_path,
         ]
@@ -614,7 +649,7 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
         "-map", f"[{prev_v_label}]",
         "-map", f"[{prev_a_label}]",
         "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", 2,
         "-movflags", "+faststart",
         final_path,
     ]
