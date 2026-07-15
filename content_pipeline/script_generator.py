@@ -12,6 +12,16 @@ FIXES FOR URDU TEXT CORRUPTION:
   - Improved _extract_scenes_from_truncated to handle Urdu text safely
   - Added text sanitization to remove garbage characters
   - Added validation to detect corrupted Urdu text
+
+OTHER FIXES:
+  - _call_groq no longer risks a silent NameError: several retry branches
+    used to `continue` unconditionally (not gated on attempt count), so if
+    that happened on the very last attempt the loop would end without ever
+    calling `break` or `raise`, leaving `response` unbound.
+  - Prompts now include general "write like a human, not an AI" guidance,
+    plus much more specific Pakistani-Urdu narrator guidance (natural spoken
+    connectors, avoiding textbook/Persianized phrasing, avoiding
+    English-sentence-structure-translated-into-Urdu).
 """
 
 import json
@@ -102,18 +112,34 @@ def _scene_count_for_words(word_budget: int) -> tuple:
     return scene_low, scene_high
 
 
+def _humanize_guidance() -> str:
+    """General 'don't sound like an AI' guidance, applied regardless of language."""
+    return """
+
+WRITE LIKE AN ACTUAL PERSON, NOT AN AI:
+- Do NOT open with generic AI-narrator phrasing like "In this video, we will explore...", "Let's dive into...", "Picture this...", "Imagine a world where...", or "Fasten your seatbelts". Start with something specific and concrete instead — a scene, a number, a moment, a decision.
+- Avoid stock connector words that scream "AI-written": "moreover", "furthermore", "in conclusion", "additionally", "it is worth noting that". Use the connectors a real narrator would actually say out loud.
+- Do not make every scene the same length or the same shape (hook → fact → fact → transition). Vary rhythm: let some scenes be a quick punchy line, let others breathe with a longer explanation.
+- Do not open consecutive scenes the same way (e.g. don't start three scenes in a row with a rhetorical question, or three scenes in a row with a date/number).
+- It's fine — good, even — to use sentence fragments, short asides, and a rhetorical question here and there, the way a real narrator naturally talks. Don't overuse any single device though.
+- Avoid the "perfectly balanced paragraph" feel where every sentence is roughly the same length. Real speech is uneven."""
+
+
 def _urdu_style_notes(language_name: str) -> str:
     if language_name.strip().lower() != "urdu":
         return ""
     return """
 
-URDU STYLE GUIDANCE (very important):
-- Write like a Pakistani YouTube narrator talking to a general audience, not like a textbook or news bulletin.
-- Prefer everyday, commonly spoken Urdu vocabulary over heavy Persian/Arabic literary words.
-- Use natural sentence rhythm and short-to-medium sentences suited to narration.
-- It's fine to keep common English loanwords that Pakistanis actually use in speech (e.g. "invest", "company", "market", "percent") — but do not switch entire sentences to English.
-- Avoid word-for-word translated phrasing. Write the thought directly in Urdu the way a person would say it.
-- Vary sentence openings; avoid repeating the same connector words (e.g. "لیکن", "اس کے بعد") in every sentence."""
+URDU STYLE GUIDANCE (very important — this is what separates a real Pakistani YouTube narrator from a translated textbook):
+- Write like a Pakistani YouTube narrator talking directly to a viewer, not like a news bulletin, a Wikipedia article, or a government press release.
+- Use everyday spoken Urdu vocabulary — the Urdu an educated Pakistani actually uses when talking, not heavy Persian/Arabic literary words. Avoid overly formal/legal-sounding words like "لہذا", "نیز", "بایں وجہ", "مذکورہ بالا" — say it the simple way a person would say it out loud instead.
+- Do NOT translate English sentence structure word-for-word into Urdu. Think in Urdu first: restructure the sentence the way a Pakistani speaker would naturally phrase the same thought, rather than mirroring an English clause order.
+- Common English loanwords that Pakistanis actually use in speech are fine and expected (e.g. "invest", "company", "market", "percent", "deal", "profit") — but never switch a whole sentence to English.
+- Use natural spoken connectors and fillers where they'd genuinely occur — "دیکھیں", "اب یہاں سے کہانی دلچسپ ہوتی ہے", "سوچنے والی بات یہ ہے کہ" — instead of only the textbook connectors.
+- Vary sentence openings and connector words aggressively. Do not repeat the same connector (e.g. "لیکن", "اس کے بعد", "پھر") in every single sentence — real speech doesn't chain scenes that mechanically.
+- Use direct address occasionally — a rhetorical question aimed straight at the viewer ("آپ نے کبھی سوچا ہے...") lands well in this format, but don't repeat that exact device in every scene.
+- Short, punchy sentences are good for narration, but not every sentence needs to be short — let a few longer, more descriptive sentences appear where the story calls for it, the way a person telling a story naturally varies their pace.
+- Avoid literal, calque-like idioms. If an idea would sound stiff or foreign translated directly, rephrase it the way it's actually said in Pakistani Urdu."""
 
 
 # ─────────────────────────── Prompt Builders ───────────────────────
@@ -122,7 +148,7 @@ def _build_metadata_prompt(language_name: str, style_key: str) -> str:
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
     return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}
+Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
@@ -145,12 +171,14 @@ def _build_scenes_prompt(
     if is_first_chunk:
         hook_guidance = (
             "\n- The FIRST scene must open with a STRONG HOOK in the first 5 seconds "
-            "(a surprising fact, bold claim, or curiosity gap that stops the scroll)."
+            "(a surprising fact, bold claim, or curiosity gap that stops the scroll) — "
+            "but make it a genuinely specific, concrete hook (a real number, a real moment), "
+            "not a generic 'you won't believe what happened next' tease."
         )
 
     return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}
+Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
@@ -171,7 +199,7 @@ CRITICAL YOUTUBE NARRATION RULES:
 - Use (PAUSE) and (EMPHASIS) markers where the narrator should pause or stress a word.
 - Mark [B-ROLL: description] where background footage should appear while the narrator speaks.
 - Keep sentences short and punchy. Avoid nested clauses.
-- If this is the final chunk of the script, the LAST scene must end with a clear Call-To-Action (CTA): ask the viewer to subscribe, comment, or watch the next video.{hook_guidance}
+- If this is the final chunk of the script, the LAST scene must end with a clear Call-To-Action (CTA): ask the viewer to subscribe, comment, or watch the next video — phrased the way this specific narrator would actually say it, not a generic templated CTA.{hook_guidance}
 
 CRITICAL TEXT FORMATTING:
 - Use proper {language_name} punctuation (e.g., Urdu full stop: ۔ not .)
@@ -542,6 +570,14 @@ def _extract_failed_generation(e: "APIError") -> str:
 def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: int, depth: int = 0) -> dict:
     max_tokens = min(max_tokens, GROQ_TPM_LIMIT - GROQ_SAFETY_MARGIN)
 
+    # IMPORTANT: response must start as None and stay guarded. Several retry
+    # branches below `continue` unconditionally (not gated on attempt count)
+    # to honor a server-provided retry-after wait. If that happens to land on
+    # the LAST loop iteration, the for-loop ends normally without ever
+    # calling `break` or raising -- without this guard, the code after the
+    # loop would then reference an undefined `response` and crash with a
+    # confusing NameError instead of a clear "Groq failed" error.
+    response = None
     for attempt in range(4):
         try:
             response = client.chat.completions.create(
@@ -598,6 +634,12 @@ def _call_groq(client: Groq, system_prompt: str, user_content: str, max_tokens: 
                     time.sleep(4 + attempt * 3)
                     continue
             raise RuntimeError(f"Groq API error: {e}")
+
+    if response is None:
+        raise RuntimeError(
+            "Groq failed after retries: exhausted all retry attempts without a successful "
+            "response (likely kept hitting a short rate-limit wait on the final attempt)."
+        )
 
     raw = response.choices[0].message.content
     finish_reason = response.choices[0].finish_reason
