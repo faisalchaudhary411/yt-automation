@@ -28,6 +28,42 @@ try:
 except ImportError:
     _HAS_ARABIC_RESHAPER = False
 
+# ---------------------------------------------------------------------------
+# Script-marker stripping (PAUSE / EMPHASIS / B-ROLL directives)
+# ---------------------------------------------------------------------------
+# script_generator.py deliberately embeds "(PAUSE)", "(EMPHASIS)", and
+# "[B-ROLL: description]" in narration text -- these are directorial notes for
+# pacing/editing, not words meant to be shown to the viewer. Without
+# stripping them here too, on-screen captions would literally display
+# "(PAUSE)" and "[B-ROLL: old newspaper archive footage]" as caption text,
+# out of sync with the audio (which strips these in voice_generator.py).
+# Duplicated locally rather than imported from voice_generator.py so this
+# module keeps working standalone regardless of how it's deployed.
+
+_BROLL_MARKER_RE = re.compile(r"\[\s*B-?ROLL\s*:.*?\]", re.IGNORECASE | re.DOTALL)
+_PAUSE_MARKER_RE = re.compile(r"\(\s*PAUSE\s*\)", re.IGNORECASE)
+_EMPHASIS_MARKER_RE = re.compile(r"\(\s*EMPHASIS\s*\)", re.IGNORECASE)
+
+
+def _strip_narration_markers_for_captions(text: str) -> str:
+    """Removes script-writing directives before text is shown as an on-screen
+    caption. Unlike the TTS-side version, this does NOT spell out %/$ in
+    words -- captions should keep the literal symbols for reading."""
+    if not text:
+        return text
+
+    text = _BROLL_MARKER_RE.sub(" ", text)
+    # For captions (unlike audio) there's no need for an actual pause -- just
+    # drop the marker rather than inserting a visible comma.
+    text = _PAUSE_MARKER_RE.sub(" ", text)
+    text = _EMPHASIS_MARKER_RE.sub(" ", text)
+
+    text = re.sub(r"[,،]{2,}", "،", text)
+    text = re.sub(r"^[,،\s]+", "", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
 try:
     from bidi.algorithm import get_display
     _HAS_BIDI = True
@@ -120,8 +156,14 @@ def _find_font_in_dirs(filenames, dirs):
     return ""
 
 
-def _verify_font_has_arabic(font, sample="Urdu"):
-    """Quick check that the font contains Arabic-script glyphs."""
+def _verify_font_has_arabic(font, sample="اردو"):
+    """Quick check that the font contains Arabic-script glyphs.
+
+    NOTE: the sample MUST be actual Arabic/Urdu script text. Using a Latin
+    string here (e.g. the word "Urdu") would make this check pass for
+    virtually every font on the system, since any font can render Latin
+    letters -- defeating the whole point of the check.
+    """
     try:
         mask = font.getmask(sample)
         return len(mask) > 0
@@ -129,73 +171,11 @@ def _verify_font_has_arabic(font, sample="Urdu"):
         return False
 
 
-def _resolve_font(for_latin_text: bool = False) -> tuple:
-    if for_latin_text:
-        bundled_filename = "DejaVuSans.ttf"
-        bundled_family_name = "DejaVu Sans"
-        fallback_names = LATIN_FALLBACK_FONTS
-        label = "Latin"
-    else:
-        bundled_filename = "NotoNastaliqUrdu.ttf"
-        bundled_family_name = "Noto Nastaliq Urdu"
-        fallback_names = FALLBACK_FONT_NAMES
-        label = "Urdu/Arabic"
-
-    bundled_path = os.path.join(FONTS_DIR, bundled_filename)
-    print(f"[font_resolve:{label}] looking for bundled font at {bundled_path}")
-
-    if os.path.isfile(bundled_path):
-        problem = _validate_font_file(bundled_path)
-        if problem:
-            print(f"[font_resolve:{label}] FOUND bundled file but INVALID: {problem}")
-        else:
-            size = os.path.getsize(bundled_path)
-            print(f"[font_resolve:{label}] bundled file looks valid ({size} bytes)")
-            try:
-                result = subprocess.run(
-                    ["fc-scan", "--format=%{family}\n", bundled_path],
-                    capture_output=True, text=True, timeout=10
-                )
-                family = result.stdout.strip().split("\n")[0].strip()
-                if family:
-                    print(f"[font_resolve:{label}] fc-scan reports family='{family}' -- using it")
-                    return (family, FONTS_DIR)
-                print(f"[font_resolve:{label}] fc-scan returned no family name; using hardcoded '{bundled_family_name}'")
-            except Exception as e:
-                print(f"[font_resolve:{label}] fc-scan failed ({e}); using hardcoded '{bundled_family_name}'")
-            return (bundled_family_name, FONTS_DIR)
-    else:
-        print(f"[font_resolve:{label}] no bundled file found at that path")
-
-    for font_name in fallback_names:
-        try:
-            result = subprocess.run(
-                ["fc-list", font_name, ":file"],
-                capture_output=True, text=True, timeout=10
-            )
-            if result.stdout.strip():
-                print(f"[font_resolve:{label}] using system font '{font_name}' (fc-list found: {result.stdout.strip().splitlines()[0]})")
-                return (font_name, "")
-        except Exception:
-            continue
-
-    raise FileNotFoundError(
-        f"No {label}-capable font found. Tried: {fallback_names}\n\n"
-        "To fix this, either:\n"
-        "  a) Place a REAL, valid font file at:\n"
-        f"     {os.path.join(FONTS_DIR, bundled_filename)}\n"
-        "     (check the file size on GitHub -- it should be hundreds of KB, not a few bytes)\n"
-        "  b) Install system fonts: apt-get install fonts-noto-core fonts-freefont-ttf"
-    )
-
-
-# Resolve fonts at module load (fails fast if missing)
-(_RESOLVED_FONT_FAMILY, _RESOLVED_FONTS_DIR) = _resolve_font(for_latin_text=False)
-(_RESOLVED_LATIN_FONT, _RESOLVED_LATIN_FONTS_DIR) = _resolve_font(for_latin_text=True)
-
-
+# ---------------------------------------------------------------------------
 # Unicode blocks covering Arabic/Urdu script (including presentation forms used by
 # some fonts/renderers for joined letterforms)
+# ---------------------------------------------------------------------------
+
 _ARABIC_SCRIPT_RANGES = (
     (0x0600, 0x06FF),  # Arabic (includes Urdu-specific letters)
     (0x0750, 0x077F),  # Arabic Supplement
@@ -559,7 +539,7 @@ def _build_scene_clip(
     total_frames = int(duration * fps)
 
     fontsize = 40
-    narration_text = scene.get("narration", "")
+    narration_text = _strip_narration_markers_for_captions(scene.get("narration", ""))
     is_latin = _is_latin_text(narration_text)
 
     caption_pngs = _write_caption_pngs(
@@ -591,10 +571,17 @@ def _build_scene_clip(
         )
         current_label = out_label
 
+    # NOTE: we deliberately do NOT pad the clip's tail with tpad/apad here.
+    # xfade/acrossfade (used later when crossfading consecutive clips) blend
+    # the existing tail of one clip with the existing head of the next -- they
+    # don't need extra padding frames to work with. Adding a frozen-frame +
+    # silent-audio tail here used to cause a visible stutter/freeze on every
+    # scene transition that was NOT crossfaded (i.e. every hard-cut in the
+    # middle of the video, since only the first and last transitions actually
+    # get crossfaded).
     final_filters = []
     if watermark_filter:
         final_filters.append(watermark_filter)
-    final_filters.append(f"tpad=stop_mode=clone:stop_duration={CROSSFADE_SECONDS}")
 
     if final_filters:
         filters.append(f"{current_label}{','.join(final_filters)}[vout]")
@@ -606,10 +593,10 @@ def _build_scene_clip(
         "-filter_complex", filter_complex,
         "-map", current_label,
         "-map", "1:a",
-        "-af", f"dynaudnorm=f=150:g=15,apad=pad_dur={CROSSFADE_SECONDS}",
+        "-af", "dynaudnorm=f=150:g=15",
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-threads", str(THREADS_PER_CLIP),
-        "-t", str(duration + CROSSFADE_SECONDS), "-pix_fmt", "yuv420p",
+        "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
         "-avoid_negative_ts", "make_zero", "-fflags", "+genpts",
         out_path,
@@ -717,6 +704,7 @@ def _concat_stream_copy(clip_paths: list, output_path: str) -> str:
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
         "-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
         output_path,
     ]
     try:
@@ -725,6 +713,16 @@ def _concat_stream_copy(clip_paths: list, output_path: str) -> str:
         if os.path.exists(list_path):
             os.remove(list_path)
     return output_path
+
+
+def _remux_single(path: str, final_path: str) -> str:
+    """Copies a single already-encoded clip straight to final_path, adding
+    +faststart so the deliverable is web-playback-friendly."""
+    if os.path.abspath(path) == os.path.abspath(final_path):
+        return final_path
+    cmd = ["ffmpeg", "-y", "-i", path, "-c", "copy", "-movflags", "+faststart", final_path]
+    _run(cmd, "Final remux")
+    return final_path
 
 
 def _join_mixed_transitions(
@@ -849,17 +847,16 @@ def assemble_video(
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
 
-    clip_paths = []
+    intro_path = None
+    outro_path = None
 
     if include_intro:
         subtitle = f"A {channel_name} Story" if channel_name else "A Documentary Story"
-        clip_paths.append(
-            _build_title_card(
-                [title or "", subtitle],
-                os.path.join(clip_dir, "intro.mp4"),
-                duration=3.5,
-                bg_color=bg_color,
-            )
+        intro_path = _build_title_card(
+            [title or "", subtitle],
+            os.path.join(clip_dir, "intro.mp4"),
+            duration=3.5,
+            bg_color=bg_color,
         )
 
     total_scenes = len(scenes)
@@ -880,17 +877,14 @@ def assemble_video(
             clips_done += 1
             if progress_callback:
                 progress_callback("clips", clips_done, total_scenes)
-    clip_paths += scene_clip_paths
 
     if include_outro:
         subtitle = f"Subscribe to {channel_name} for more" if channel_name else "Subscribe for more stories like this"
-        clip_paths.append(
-            _build_title_card(
-                ["Thanks for watching!", subtitle],
-                os.path.join(clip_dir, "outro.mp4"),
-                duration=4.0,
-                bg_color=bg_color,
-            )
+        outro_path = _build_title_card(
+            ["Thanks for watching!", subtitle],
+            os.path.join(clip_dir, "outro.mp4"),
+            duration=4.0,
+            bg_color=bg_color,
         )
 
     if progress_callback:
@@ -906,7 +900,39 @@ def assemble_video(
         resolved_name = "final_video.mp4"
 
     final_path = os.path.join(work_dir, resolved_name)
-    _join_mixed_transitions(clip_paths, final_path, fade_at_start=include_intro, fade_at_end=include_outro)
+
+    # Join the scene clips among themselves first. Title cards already fade
+    # in/out on their own (see _build_title_card), so we deliberately do NOT
+    # crossfade a title card against the adjacent scene -- that would produce
+    # a double-fade (fade to bg color, then crossfade through it again).
+    # Instead, scene-to-scene crossfading only happens at the edges that
+    # AREN'T already covered by an intro/outro title card.
+    if len(scene_clip_paths) == 1:
+        scenes_joined_path = scene_clip_paths[0]
+    elif len(scene_clip_paths) == 0:
+        scenes_joined_path = None
+    else:
+        scenes_joined_path = os.path.join(clip_dir, "_scenes_joined.mp4")
+        _join_mixed_transitions(
+            scene_clip_paths, scenes_joined_path,
+            fade_at_start=not include_intro,
+            fade_at_end=not include_outro,
+        )
+
+    outer_pieces = []
+    if intro_path:
+        outer_pieces.append(intro_path)
+    if scenes_joined_path:
+        outer_pieces.append(scenes_joined_path)
+    if outro_path:
+        outer_pieces.append(outro_path)
+
+    if not outer_pieces:
+        raise RuntimeError("No clips to assemble into a final video.")
+    elif len(outer_pieces) == 1:
+        _remux_single(outer_pieces[0], final_path)
+    else:
+        _concat_stream_copy(outer_pieces, final_path)
 
     if music_path and os.path.isfile(music_path):
         music_mixed_path = os.path.join(work_dir, "final_with_music.mp4")
