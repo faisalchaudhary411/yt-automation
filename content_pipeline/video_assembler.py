@@ -225,61 +225,159 @@ def _prepare_text_for_rendering(text: str, is_latin: bool) -> str:
 # Pillow-based text rendering (replaces libass/ASS entirely)
 # ---------------------------------------------------------------------------
 
-def _resolve_font_path(for_latin: bool = False) -> str:
-    """Returns the hardcoded font path. Falls back to system search if missing."""
-    path = LATIN_FONT_PATH if for_latin else URDU_FONT_PATH
-    if os.path.isfile(path):
-        return path
+# Cache verified font paths so we don't re-run fc-list/font-loading/glyph
+# tests on every single caption page (this gets called many times per video).
+_VERIFIED_FONT_CACHE = {}
 
-    # Fallback: search system fonts
+
+def _candidate_font_paths(for_latin: bool) -> list:
+    """Builds an ordered list of font paths worth trying: the bundled file
+    first, then every system font matching any of the fallback family names
+    (via fc-list), in preference order. Does NOT validate any of them yet --
+    that happens in _resolve_font_path so each candidate can be tested for
+    real glyph coverage before being trusted."""
+    candidates = []
+
+    bundled = LATIN_FONT_PATH if for_latin else URDU_FONT_PATH
+    if os.path.isfile(bundled):
+        candidates.append(bundled)
+
     names = LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES
     for name in names:
         try:
+            # NOTE: the element argument must be "file", NOT ":file". A
+            # leading colon there is invalid fc-list syntax and silently
+            # returns empty output no matter what fonts are installed --
+            # this was quietly disabling the ENTIRE system-font fallback
+            # search, regardless of what was actually on the system.
             r = subprocess.run(
-                ["fc-list", name, ":file"],
+                ["fc-list", name, "file"],
                 capture_output=True, text=True, timeout=10
             )
-            if r.stdout.strip():
-                return r.stdout.strip().splitlines()[0].split(":")[0]
+            for line in r.stdout.strip().splitlines():
+                path = line.split(":")[0].strip()
+                if path and path not in candidates:
+                    candidates.append(path)
         except Exception:
             continue
+
+    return candidates
+
+
+def _resolve_font_path(for_latin: bool = False) -> str:
+    """Returns a font path that has actually been verified to (a) load
+    successfully with Pillow, and (b) for Urdu/Arabic, actually contain
+    Arabic-script glyphs -- not merely a path that happens to exist on disk.
+
+    This used to just check os.path.isfile() and return the first hit. That
+    meant a corrupted, empty, Git-LFS-pointer, or simply WRONG font file
+    sitting at the expected bundled path would be trusted and used without
+    question -- Pillow would either fail to load it (caught elsewhere) or,
+    worse, load it FINE (if it happens to be a valid font file, just not one
+    with Urdu glyphs) and silently produce tofu boxes. Every candidate is now
+    actually tested before being accepted.
+    """
+    cache_key = for_latin
+    if cache_key in _VERIFIED_FONT_CACHE:
+        return _VERIFIED_FONT_CACHE[cache_key]
+
+    tried = []
+    for path in _candidate_font_paths(for_latin):
+        problem = _validate_font_file(path)
+        if problem:
+            tried.append(f"{path} (rejected: {problem})")
+            continue
+        try:
+            test_font = ImageFont.truetype(path, 40)
+        except Exception as e:
+            tried.append(f"{path} (rejected: Pillow could not load it -- {e})")
+            continue
+
+        if for_latin or _verify_font_has_arabic(test_font):
+            _VERIFIED_FONT_CACHE[cache_key] = path
+            print(f"[font_resolve:{'Latin' if for_latin else 'Urdu/Arabic'}] "
+                  f"using verified font: {path}")
+            return path
+        else:
+            tried.append(f"{path} (rejected: loads fine but has NO Arabic/Urdu glyphs)")
+
+    label = "Latin" if for_latin else "Urdu/Arabic"
+    print(f"[font_resolve:{label}] NO valid {label} font found. Candidates tried:")
+    for t in tried:
+        print(f"    - {t}")
+    if not tried:
+        print(f"    - (no candidates found at all -- bundled path "
+              f"{LATIN_FONT_PATH if for_latin else URDU_FONT_PATH} doesn't exist, "
+              f"and fc-list found no system matches for "
+              f"{LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES})")
+
+    _VERIFIED_FONT_CACHE[cache_key] = ""
     return ""
 
 
 def _load_font_for_rendering(font_path: str, fontsize: int, for_latin: bool):
-    """Load a font and verify it can render the target script."""
-    if font_path:
-        try:
-            font = ImageFont.truetype(font_path, fontsize)
-        except Exception as e:
-            print(f"[font_load] truetype load failed ({e}), trying fallback search")
-            font = None
-    else:
-        font = None
+    """Load a font at the given (already-verified) path and size.
 
-    if font is None:
-        # Last resort: try to find ANY font that might work
-        fallback_path = _resolve_font_path(for_latin=for_latin)
-        if fallback_path:
-            try:
-                font = ImageFont.truetype(fallback_path, fontsize)
-            except Exception:
-                font = None
-
-    if font is None:
+    font_path is expected to come from _resolve_font_path, which only ever
+    returns paths that have already passed real glyph-coverage verification.
+    If font_path is empty, NO fallback silently substitutes a broken font --
+    this raises a loud, actionable error instead, because a silent fallback
+    here is exactly what caused tofu boxes to keep showing up invisibly in
+    Railway logs nobody was watching.
+    """
+    if not font_path:
+        label = "Latin" if for_latin else "Urdu/Arabic"
+        bundled = LATIN_FONT_PATH if for_latin else URDU_FONT_PATH
         raise RuntimeError(
-            "No usable font found for rendering. "
-            f"{'Latin' if for_latin else 'Urdu/Arabic'} text will show as tofu boxes. "
-            "Please place a valid .ttf font file in the 'content_pipeline/fonts/' folder or install system fonts."
+            f"No verified {label} font is available -- refusing to render with a "
+            f"guessed/broken font, since that's what was silently producing tofu boxes "
+            f"before. Checked bundled path:\n"
+            f"    {bundled}\n"
+            f"and system fonts matching: {LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES}\n\n"
+            f"To fix this:\n"
+            f"  1. On Railway, open a shell and run:\n"
+            f"       ls -la {os.path.dirname(bundled)}\n"
+            f"     Confirm the file is really there and its size is in the hundreds of KB "
+            f"(a few bytes or ~130 bytes usually means it's a Git LFS pointer, not the real font).\n"
+            f"  2. If it's missing or tiny, re-upload it to GitHub using the 'Add file > Upload "
+            f"files' button (not pasting/editing as text) -- editing a binary .ttf as text in "
+            f"GitHub's mobile web editor corrupts it.\n"
+            f"  3. As a more reliable belt-and-suspenders option, install the font system-wide "
+            f"instead of relying on the repo copy: add 'fonts-noto-core' (or 'fonts-noto-ttf') "
+            f"as an apt package in your Railway build (nixpacks.toml / apt.txt), which installs "
+            f"a real Noto Nastaliq Urdu / Noto Naskh Arabic font regardless of repo file state."
         )
 
-    # For Arabic/Urdu, verify the font actually has Arabic glyphs
-    if not for_latin and not _verify_font_has_arabic(font):
-        print(f"[WARN] Loaded font may not support Arabic/Urdu glyphs. "
-              f"Text may render as tofu boxes. Font: {font_path}")
-        # Don't raise here -- let it try, but warn the user
+    try:
+        font = ImageFont.truetype(font_path, fontsize)
+    except Exception as e:
+        raise RuntimeError(
+            f"Font at '{font_path}' passed verification earlier but failed to load now "
+            f"({e}). This shouldn't normally happen -- the file may have changed between "
+            f"checks."
+        ) from e
 
     return font
+
+
+def log_font_diagnostics():
+    """Prints exactly what font will be used for Latin and Urdu/Arabic text,
+    or exactly why none could be found. Safe to call anytime (never raises).
+    Runs automatically once at module import so this always shows up in
+    Railway logs without needing any extra steps."""
+    for for_latin in (True, False):
+        label = "Latin" if for_latin else "Urdu/Arabic"
+        try:
+            path = _resolve_font_path(for_latin=for_latin)
+            if not path:
+                print(f"[font_diagnostics] {label}: NO valid font found -- "
+                      f"captions/titles in this script will FAIL LOUDLY (not silently "
+                      f"show tofu) until this is fixed. See messages above for exact reasons.")
+        except Exception as e:
+            print(f"[font_diagnostics] {label}: diagnostic check itself failed: {e}")
+
+
+log_font_diagnostics()
 
 
 def _render_text_page(lines, width, height, fontsize, bottom_margin, out_path, for_latin=False):
