@@ -76,14 +76,34 @@ except ImportError:
 
 FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
+# NOTE ON FONT CHOICE: NotoNastaliqUrdu.ttf is kept here and still tried
+# first, but it will almost always FAIL verification and be skipped --
+# arabic_reshaper converts text into legacy "Arabic Presentation Forms"
+# codepoints (so this file can shape text WITHOUT a full OpenType shaping
+# engine, working around a HarfBuzz/libass regression in Replit's ffmpeg
+# build). Nastaliq fonts are built for real OpenType shaping and typically
+# have ZERO cmap entries for those legacy codepoints -- confirmed directly:
+# 30 of 37 characters in a real test sentence came back with no glyph at
+# all, i.e. tofu boxes, regardless of how valid the file itself is. This
+# isn't a font-file problem, it's a fundamental mismatch between this
+# rendering approach and how Nastaliq fonts are built. NotoSansArabic.ttf
+# (Naskh-style) is added below specifically because it DOES have full
+# presentation-forms coverage and was confirmed to render correctly with
+# this exact pipeline. If proper raqm/HarfBuzz shaping becomes available on
+# Replit later, Nastaliq can go back to working with no code change needed
+# here -- it's left in the candidate list rather than deleted.
 URDU_FONT_PATH = os.path.join(FONTS_DIR, "NotoNastaliqUrdu.ttf")
+NASKH_FONT_PATH = os.path.join(FONTS_DIR, "NotoSansArabic.ttf")
 LATIN_FONT_PATH = os.path.join(FONTS_DIR, "DejaVuSans.ttf")
 
-# Fallback fonts in order of preference (system-wide, no bundling needed)
+# Fallback fonts in order of preference (system-wide, no bundling needed).
+# Naskh/Sans Arabic listed before Nastaliq since they're the ones that
+# actually work with this file's current (non-raqm) rendering approach --
+# see the note on URDU_FONT_PATH above.
 FALLBACK_FONT_NAMES = [
-    "Noto Nastaliq Urdu",
     "Noto Naskh Arabic",
     "Noto Sans Arabic",
+    "Noto Nastaliq Urdu",
     "FreeSerif",
     "DejaVu Sans",
 ]
@@ -156,19 +176,67 @@ def _find_font_in_dirs(filenames, dirs):
     return ""
 
 
-def _verify_font_has_arabic(font, sample="اردو"):
-    """Quick check that the font contains Arabic-script glyphs.
+def _has_real_glyph_coverage(font_path: str, sample_text: str) -> bool:
+    """Checks whether EVERY non-whitespace character in sample_text has a
+    REAL, drawable glyph in the font at font_path -- not just any cmap
+    entry, and not a missing/.notdef placeholder.
 
-    NOTE: the sample MUST be actual Arabic/Urdu script text. Using a Latin
-    string here (e.g. the word "Urdu") would make this check pass for
-    virtually every font on the system, since any font can render Latin
-    letters -- defeating the whole point of the check.
+    This replaces an earlier version of this check that rendered the sample
+    with Pillow and looked at whether ANY ink came out. That approach was
+    fundamentally broken: a MISSING glyph still renders something (a visible
+    tofu-box placeholder) when drawn, so a render-based test can never tell
+    'real glyph' apart from 'tofu box' -- confirmed directly: a font with
+    zero real Arabic support still produced non-empty rendered pixels for
+    Arabic text. This version instead inspects the font's actual character
+    map and glyph outline data via fontTools, which can tell the difference.
+
+    IMPORTANT: sample_text must be the ACTUAL text Pillow will be asked to
+    draw at render time. For Arabic/Urdu that means text already run through
+    _prepare_text_for_rendering (reshaping + BiDi reordering) -- reshaping
+    converts text into Arabic Presentation Forms codepoints that some fonts
+    (e.g. Noto Nastaliq Urdu) have ZERO cmap entries for, even though they
+    render the unshaped base-Arabic-block text perfectly fine. Testing with
+    unshaped text would pass fonts that then fail at actual render time.
     """
     try:
-        mask = font.getmask(sample)
-        return len(mask) > 0
+        from fontTools.ttLib import TTFont
+        from fontTools.pens.boundsPen import BoundsPen
+    except ImportError:
+        # fontTools isn't installed -- can't do a reliable check here.
+        # _load_font_for_rendering will still catch outright load failures,
+        # so this isn't a silent failure mode, just a less precise one.
+        print("[font_resolve] fontTools not installed -- cannot verify real "
+              "glyph coverage (pip install fonttools for a reliable check). "
+              "Assuming this candidate is OK; it may still tofu at render time.")
+        return True
+
+    try:
+        tt = TTFont(font_path, lazy=True, fontNumber=0)
+        cmap = tt.getBestCmap()
+        glyph_set = tt.getGlyphSet()
     except Exception:
         return False
+
+    for ch in sample_text:
+        if not ch.strip():
+            continue
+        cp = ord(ch)
+        if cp not in cmap:
+            return False
+        try:
+            pen = BoundsPen(glyph_set)
+            glyph_set[cmap[cp]].draw(pen)
+        except Exception:
+            return False
+        if pen.bounds is None:
+            return False
+
+    return True
+
+
+# A real Urdu phrase (base Arabic-block characters) used to verify font
+# candidates. Deliberately includes a range of common letters.
+_URDU_VERIFICATION_PHRASE = "اردو ہے جس کا نام ہم جانتے ہیں داغ"
 
 
 # ---------------------------------------------------------------------------
@@ -231,16 +299,27 @@ _VERIFIED_FONT_CACHE = {}
 
 
 def _candidate_font_paths(for_latin: bool) -> list:
-    """Builds an ordered list of font paths worth trying: the bundled file
-    first, then every system font matching any of the fallback family names
-    (via fc-list), in preference order. Does NOT validate any of them yet --
-    that happens in _resolve_font_path so each candidate can be tested for
-    real glyph coverage before being trusted."""
+    """Builds an ordered list of font paths worth trying: the bundled
+    file(s) first, then every system font matching any of the fallback
+    family names (via fc-list), in preference order. Does NOT validate any
+    of them yet -- that happens in _resolve_font_path so each candidate can
+    be tested for real glyph coverage before being trusted."""
     candidates = []
 
-    bundled = LATIN_FONT_PATH if for_latin else URDU_FONT_PATH
-    if os.path.isfile(bundled):
-        candidates.append(bundled)
+    if for_latin:
+        bundled_paths = [LATIN_FONT_PATH]
+    else:
+        # NotoSansArabic.ttf (Naskh-style) listed first since it's the one
+        # confirmed to actually work with this file's reshaping approach.
+        # NotoNastaliqUrdu.ttf is still included -- it'll almost certainly
+        # fail verification and be skipped, but costs nothing to try, and
+        # means Nastaliq starts working automatically for free if raqm
+        # shaping is ever added later.
+        bundled_paths = [NASKH_FONT_PATH, URDU_FONT_PATH]
+
+    for bundled in bundled_paths:
+        if os.path.isfile(bundled):
+            candidates.append(bundled)
 
     names = LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES
     for name in names:
@@ -267,19 +346,21 @@ def _candidate_font_paths(for_latin: bool) -> list:
 def _resolve_font_path(for_latin: bool = False) -> str:
     """Returns a font path that has actually been verified to (a) load
     successfully with Pillow, and (b) for Urdu/Arabic, actually contain
-    Arabic-script glyphs -- not merely a path that happens to exist on disk.
-
-    This used to just check os.path.isfile() and return the first hit. That
-    meant a corrupted, empty, Git-LFS-pointer, or simply WRONG font file
-    sitting at the expected bundled path would be trusted and used without
-    question -- Pillow would either fail to load it (caught elsewhere) or,
-    worse, load it FINE (if it happens to be a valid font file, just not one
-    with Urdu glyphs) and silently produce tofu boxes. Every candidate is now
-    actually tested before being accepted.
+    REAL (non-placeholder) glyphs for the exact reshaped/reordered text this
+    file sends to Pillow at render time -- not merely a path that happens to
+    exist on disk, and not merely "renders SOME ink for raw Urdu letters"
+    (a font with zero real Arabic support still renders a visible tofu-box
+    placeholder, which is non-empty -- rendering-based checks can't tell the
+    difference; fontTools cmap/outline inspection can).
     """
     cache_key = for_latin
     if cache_key in _VERIFIED_FONT_CACHE:
         return _VERIFIED_FONT_CACHE[cache_key]
+
+    verification_sample = (
+        "Sample Text 123" if for_latin
+        else _prepare_text_for_rendering(_URDU_VERIFICATION_PHRASE, is_latin=False)
+    )
 
     tried = []
     for path in _candidate_font_paths(for_latin):
@@ -288,26 +369,28 @@ def _resolve_font_path(for_latin: bool = False) -> str:
             tried.append(f"{path} (rejected: {problem})")
             continue
         try:
-            test_font = ImageFont.truetype(path, 40)
+            ImageFont.truetype(path, 40)
         except Exception as e:
             tried.append(f"{path} (rejected: Pillow could not load it -- {e})")
             continue
 
-        if for_latin or _verify_font_has_arabic(test_font):
+        if for_latin or _has_real_glyph_coverage(path, verification_sample):
             _VERIFIED_FONT_CACHE[cache_key] = path
             print(f"[font_resolve:{'Latin' if for_latin else 'Urdu/Arabic'}] "
                   f"using verified font: {path}")
             return path
         else:
-            tried.append(f"{path} (rejected: loads fine but has NO Arabic/Urdu glyphs)")
+            tried.append(f"{path} (rejected: loads fine, but missing real glyphs for "
+                         f"the actual shaped/reordered text used at render time -- "
+                         f"likely needs raqm/HarfBuzz shaping, or lacks Arabic "
+                         f"Presentation Forms compatibility glyphs)")
 
     label = "Latin" if for_latin else "Urdu/Arabic"
     print(f"[font_resolve:{label}] NO valid {label} font found. Candidates tried:")
     for t in tried:
         print(f"    - {t}")
     if not tried:
-        print(f"    - (no candidates found at all -- bundled path "
-              f"{LATIN_FONT_PATH if for_latin else URDU_FONT_PATH} doesn't exist, "
+        print(f"    - (no candidates found at all -- bundled path(s) don't exist, "
               f"and fc-list found no system matches for "
               f"{LATIN_FALLBACK_FONTS if for_latin else FALLBACK_FONT_NAMES})")
 
