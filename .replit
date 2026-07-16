@@ -41,4 +41,4 @@ GITHUB_REPO = "faisalchaudhary411/yt-lite"
 
 [deployment]
 deploymentTarget = "vm"
-run = ["gunicorn", "-b", "0.0.0.0:8080", "main:app"]
+run = ["gunicorn", "-b", "0.0.0.0:5000", "main:app"]
