@@ -30,6 +30,8 @@ import secrets as pysecrets
 import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
+os.makedirs("output", exist_ok=True)
+
 from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
