@@ -4,10 +4,3 @@ expertMode = true
 
 [nix]
 channel = "stable-25_05"
-
-[deployment]
-deploymentTarget = "cloudrun"
-
-[deployment]
-deploymentTarget = "vm"
-run = ["gunicorn", "-b", "0.0.0.0:8080", "main:app"]
