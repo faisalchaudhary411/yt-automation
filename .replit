@@ -1,3 +1,4 @@
+cat > ~/workspace/.replit << 'EOF'
 modules = ["python-3.11", "python-3.12"]
 [agent]
 expertMode = true
@@ -30,7 +31,7 @@ waitForPort = 5000
 outputType = "webview"
 
 [[ports]]
-localPort = 5000
+localPort = 8080
 externalPort = 80
 
 [userenv]
@@ -42,3 +43,4 @@ GITHUB_REPO = "faisalchaudhary411/yt-lite"
 [deployment]
 deploymentTarget = "vm"
 run = ["gunicorn", "-b", "0.0.0.0:8080", "main:app"]
+EOF
