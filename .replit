@@ -1,46 +1,6 @@
-cat > ~/workspace/.replit << 'EOF'
-modules = ["python-3.11", "python-3.12"]
+modules = ["python-3.12"]
 [agent]
 expertMode = true
 
 [nix]
 channel = "stable-25_05"
-
-[workflows]
-runButton = "Project"
-
-[[workflows.workflow]]
-name = "Project"
-mode = "parallel"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Start application"
-
-[[workflows.workflow]]
-name = "Start application"
-author = "agent"
-
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "PORT=5000 python3 main.py"
-waitForPort = 5000
-
-[workflows.workflow.metadata]
-outputType = "webview"
-
-[[ports]]
-localPort = 8080
-externalPort = 80
-
-[userenv]
-
-[userenv.shared]
-GITHUB_BRANCH = "main"
-GITHUB_REPO = "faisalchaudhary411/yt-lite"
-
-[deployment]
-deploymentTarget = "vm"
-run = ["gunicorn", "-b", "0.0.0.0:8080", "main:app"]
-EOF
