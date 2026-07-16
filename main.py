@@ -1,12 +1,18 @@
 """
-Stage 1 orchestrator: Topic -> Script -> Voiceover -> Images -> Final MP4.
+Stage 1+2+3 orchestrator.
+
+Stage 1: Topic -> Script -> Voiceover -> Images -> Final MP4 (content_pipeline)
+Stage 2: Upload as private -> Telegram approval gate -> publish (youtube_*)
+Stage 3: Automation merged from the companion system (automation/):
+         subtitles (.srt + YouTube captions), branded thumbnails, SEO metadata
+         enhancement, comment auto-replies with spam filter, analytics
+         snapshots + digest, trending topic research, playlist management,
+         and a background scheduler tying them together.
 
 Run modes:
   1. Command line:  python main.py "Your topic here"
   2. Web:           run this file, then POST /generate with {"topic": "..."}
                      or use the simple form at GET /
-
-Nothing here uploads to YouTube or touches comments yet — that's Stage 2/3.
 
 Web generation runs as a background job: /generate kicks it off and returns
 immediately with a job_id, and the page polls /status/<job_id> for progress.
@@ -28,20 +34,26 @@ from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
+    SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
 from content_pipeline.image_fetcher import fetch_all_scene_images
-from content_pipeline.video_assembler import assemble_video
+from content_pipeline.video_assembler import assemble_video, _get_media_duration
+from automation.subtitles import compute_scene_start_times
 from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL
-from youtube_uploader import upload_video, publish_video
-from telegram_notifier import send_approval_request
+from youtube_uploader import upload_video, publish_video, set_thumbnail, upload_captions
+from telegram_notifier import send_approval_request, send_message
 
 app = Flask(__name__)
 
 # In-memory job store. Fine for a single-process dev server; jobs are lost on restart.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+# Background automation scheduler (comment replies, daily analytics, trending
+# refresh). Started at the bottom of this file in web mode; None in CLI mode.
+SCHEDULER = None
 
 PAGE = """
 <!doctype html>
@@ -366,6 +378,10 @@ const progressPercent = document.getElementById("progressPercent");
 const resultEl = document.getElementById("result");
 const btn = document.getElementById("genBtn");
 
+// Prefill the topic box when arriving from the Trending ideas page (/?topic=…)
+const prefillTopic = new URLSearchParams(window.location.search).get("topic");
+if (prefillTopic) { document.getElementById("topic").value = prefillTopic; }
+
 const STEP_LABELS = {
   queued: "Queued…",
   script: "Generating script…",
@@ -438,6 +454,12 @@ async function poll(jobId) {
                 "Approve &amp; Publish button has been sent.<br>" +
                 "Private preview available.</p>" +
                 "<a class='action-link' href='" + r.preview_url + "' target='_blank'>View on YouTube</a>";
+      }
+      if (r.srt_url) {
+        extra += "<a class='action-link' href='" + r.srt_url + "' download>Download subtitles (.srt)</a>";
+      }
+      if (r.thumbnail_url) {
+        extra += "<a class='action-link' href='" + r.thumbnail_url + "' download>Download thumbnail</a>";
       }
       resultEl.innerHTML =
         "<div class='card'>" +
@@ -571,12 +593,61 @@ def run_pipeline_job(
             music_path=BACKGROUND_MUSIC_PATH,
         )
 
+        # --- Stage 3a: subtitles, SEO metadata, thumbnail (merged features) ---
+        # Each feature is wrapped independently: none of them may break a
+        # video that already rendered successfully.
+        srt_url = None
+        try:
+            if SUBTITLES_ENABLED:
+                from automation.subtitles import write_srt
+                srt_path = write_srt(script["scenes"], work_dir, include_intro, include_outro)
+                srt_url = f"/output/{job_id}/{os.path.basename(srt_path)}"
+        except Exception as e:
+            print(f"Warning: subtitle generation failed ({e}). Continuing without SRT.")
+
+        thumbnail_url = None
+        thumbnail_path = None
+        try:
+            if THUMBNAILS_ENABLED:
+                from automation.thumbnails import generate_thumbnail
+                first_image = next(
+                    (s.get("image_path") for s in script["scenes"] if s.get("image_path")), None
+                )
+                thumbnail_path = os.path.join(work_dir, "thumbnail.jpg")
+                generate_thumbnail(script["title"], first_image, thumbnail_path)
+                thumbnail_url = f"/output/{job_id}/thumbnail.jpg"
+        except Exception as e:
+            print(f"Warning: thumbnail generation failed ({e}). Continuing without one.")
+            thumbnail_path = None
+
+        try:
+            from automation.seo import enhance_metadata
+            durations = [_get_media_duration(s["audio_path"]) for s in script["scenes"]]
+            scene_starts = compute_scene_start_times(durations, include_intro, include_outro)
+            enhanced = enhance_metadata(
+                {"title": script["title"],
+                 "description": script["description"],
+                 "tags": script["tags"]},
+                scene_start_times=scene_starts,
+                include_intro=include_intro,
+                attributions_path=os.path.join(work_dir, "attributions.txt"),
+                channel_name=CHANNEL_NAME,
+            )
+            script["description"] = enhanced["description"]
+            script["tags"] = enhanced["tags"]
+        except Exception as e:
+            print(f"Warning: SEO enhancement failed ({e}). Uploading original metadata.")
+
         result = {
+            "job_id": job_id,
             "topic": topic,
+            "language": language,
             "title": script["title"],
             "description": script["description"],
             "tags": script["tags"],
             "video_url": f"/output/{job_id}/{os.path.basename(video_path)}",
+            "srt_url": srt_url,
+            "thumbnail_url": thumbnail_url,
             "status": "ready_for_review",
         }
 
@@ -592,6 +663,16 @@ def run_pipeline_job(
                 tags=script["tags"],
                 access_token=access_token,
             )
+
+            if thumbnail_path:
+                try:
+                    set_thumbnail(video_id, thumbnail_path, access_token)
+                    print("[5/5] Custom thumbnail set on YouTube")
+                except Exception as e:
+                    # YouTube only accepts custom thumbnails from phone-verified
+                    # channels — the local JPG is still served in the result.
+                    print(f"Warning: thumbnail upload failed ({e}). "
+                          "Custom thumbnails require a phone-verified YouTube channel.")
 
             approval_token = pysecrets.token_urlsafe(16)
             approve_url = f"{REPL_URL}/approve/{video_id}?token={approval_token}"
@@ -755,7 +836,265 @@ def approve(video_id):
     draft["status"] = "published"
     github_write_json("drafts.json", history, message=f"Mark published: {draft['title']}")
 
-    return f"Published: {draft['title']} - https://youtube.com/watch?v={video_id}"
+    # --- Stage 3 post-publish hooks (each independent and non-fatal) ---
+    notes = []
+
+    try:
+        from automation import comments as comment_automation
+        if comment_automation.maybe_post_welcome_comment(video_id):
+            notes.append("welcome comment posted")
+    except Exception as e:
+        print(f"Warning: welcome comment failed ({e})")
+
+    try:
+        from automation import playlists as playlist_automation
+        if playlist_automation.maybe_add_on_publish(video_id):
+            notes.append("added to playlist")
+    except Exception as e:
+        print(f"Warning: playlist add failed ({e})")
+
+    if CAPTIONS_AUTO_UPLOAD and SUBTITLES_ENABLED and draft.get("job_id"):
+        srt_path = os.path.join("output", draft["job_id"], "subtitles.srt")
+        if os.path.isfile(srt_path):
+            try:
+                upload_captions(video_id, srt_path, draft.get("language", DEFAULT_LANGUAGE), access_token)
+                notes.append("captions uploaded")
+            except Exception as e:
+                print(f"Warning: captions upload failed ({e}). "
+                      "The .srt stays available in the job's output folder.")
+
+    try:
+        from automation import analytics as analytics_automation
+        analytics_automation.collect_snapshot([video_id])
+    except Exception as e:
+        print(f"Warning: analytics baseline failed ({e})")
+
+    try:
+        extra = f" ({', '.join(notes)})" if notes else ""
+        send_message(f"✅ Published: {draft['title']}{extra}\nhttps://youtube.com/watch?v={video_id}")
+    except Exception as e:
+        print(f"Warning: Telegram confirmation failed ({e})")
+
+    suffix = f" — {', '.join(notes)}" if notes else ""
+    return f"Published: {draft['title']} - https://youtube.com/watch?v={video_id}{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 routes: trending ideas, analytics, comment automation, scheduler
+# ---------------------------------------------------------------------------
+
+TRENDING_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trending ideas — {{ channel_name }}</title>
+<style>
+  body { margin:0; background:#0B1220; color:#EDEAE2;
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .container { max-width:720px; margin:0 auto; padding:20px; }
+  h1 { font-family:Georgia,serif; font-weight:400; font-size:24px; }
+  .eyebrow { font-size:12px; letter-spacing:0.16em; text-transform:uppercase;
+             color:#C6A454; font-weight:600; margin:18px 0 6px 0; }
+  .topic { background:#141B2D; border:1px solid rgba(198,164,84,0.22);
+           border-radius:12px; padding:14px 16px; margin-bottom:12px; }
+  .topic .title { font-size:15px; margin:0 0 6px 0; }
+  .meta { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .source { font-size:11px; color:#8B93A6; text-transform:uppercase; letter-spacing:0.06em; }
+  .score-track { flex:1; min-width:80px; height:6px; background:#1B2436;
+                 border-radius:3px; overflow:hidden; }
+  .score-fill { height:100%; background:linear-gradient(90deg,#C6A454,#DFC078); }
+  a.use { font-size:13px; color:#DFC078; text-decoration:none;
+          border:1px solid rgba(198,164,84,0.22); padding:5px 12px; border-radius:16px; }
+  a.use:hover { border-color:#C6A454; }
+  .nav { margin:16px 0; }
+  .nav a { color:#DFC078; font-size:13px; text-decoration:none; margin-right:16px; }
+  form { display:inline; }
+  button { background:none; border:1px solid rgba(198,164,84,0.22); color:#DFC078;
+           border-radius:16px; padding:5px 12px; font-size:13px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="container">
+  <p class="eyebrow">{{ channel_name }} · Stage 3</p>
+  <h1>Trending topic ideas</h1>
+  <div class="nav">
+    <a href="/">&larr; Back to studio</a>
+    <form method="post" action="/api/trending/refresh"><button type="submit">Refresh now</button></form>
+  </div>
+  {% if refreshed_at %}<p style="color:#8B93A6;font-size:12px;">Last refreshed: {{ refreshed_at }}</p>{% endif %}
+  {% for t in topics %}
+  <div class="topic">
+    <p class="title">{{ t.title }}</p>
+    <div class="meta">
+      <span class="source">{{ t.source }}</span>
+      <div class="score-track"><div class="score-fill" style="width: {{ t.score }}%;"></div></div>
+      <a class="use" href="/?topic={{ t.title | urlencode }}">Use this topic &rarr;</a>
+    </div>
+  </div>
+  {% else %}
+  <p style="color:#8B93A6;">No topics yet — hit “Refresh now” to fetch today's trending list.</p>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+ANALYTICS_PAGE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analytics — {{ channel_name }}</title>
+<style>
+  body { margin:0; background:#0B1220; color:#EDEAE2;
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .container { max-width:760px; margin:0 auto; padding:20px; }
+  h1 { font-family:Georgia,serif; font-weight:400; font-size:24px; }
+  .eyebrow { font-size:12px; letter-spacing:0.16em; text-transform:uppercase;
+             color:#C6A454; font-weight:600; margin:18px 0 6px 0; }
+  .cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }
+  .stat { background:#141B2D; border:1px solid rgba(198,164,84,0.22);
+          border-radius:12px; padding:16px 20px; flex:1; min-width:140px; }
+  .stat .num { font-size:26px; color:#DFC078; font-family:Georgia,serif; }
+  .stat .lbl { font-size:12px; color:#8B93A6; text-transform:uppercase; letter-spacing:0.06em; }
+  .stat .delta { font-size:12px; color:#34D399; }
+  table { width:100%; border-collapse:collapse; background:#141B2D;
+          border:1px solid rgba(198,164,84,0.22); border-radius:12px; overflow:hidden; }
+  th, td { text-align:left; padding:10px 14px; font-size:13px;
+           border-bottom:1px solid rgba(198,164,84,0.12); }
+  th { color:#8B93A6; text-transform:uppercase; font-size:11px; letter-spacing:0.06em; }
+  td.num { color:#DFC078; }
+  .nav { margin:16px 0; }
+  .nav a { color:#DFC078; font-size:13px; text-decoration:none; margin-right:16px; }
+  button { background:none; border:1px solid rgba(198,164,84,0.22); color:#DFC078;
+           border-radius:16px; padding:5px 12px; font-size:13px; cursor:pointer; }
+  form { display:inline; }
+</style>
+</head>
+<body>
+<div class="container">
+  <p class="eyebrow">{{ channel_name }} · Stage 3</p>
+  <h1>Channel analytics</h1>
+  <div class="nav">
+    <a href="/">&larr; Back to studio</a>
+    <form method="post" action="/api/analytics/refresh"><button type="submit">Take snapshot now</button></form>
+  </div>
+  {% set ch = report.channel %}
+  {% set d = report.channel_delta %}
+  {% if ch %}
+  <div class="cards">
+    <div class="stat"><div class="num">{{ "{:,}".format(ch.subscribers) }}</div>
+      <div class="lbl">Subscribers</div>
+      {% if d.subscribers_delta is defined and d.subscribers_delta %}<div class="delta">+{{ "{:,}".format(d.subscribers_delta) }} since last snapshot</div>{% endif %}</div>
+    <div class="stat"><div class="num">{{ "{:,}".format(ch.total_views) }}</div>
+      <div class="lbl">Total views</div>
+      {% if d.views_delta is defined and d.views_delta %}<div class="delta">+{{ "{:,}".format(d.views_delta) }} since last snapshot</div>{% endif %}</div>
+    <div class="stat"><div class="num">{{ "{:,}".format(ch.total_videos) }}</div>
+      <div class="lbl">Videos</div></div>
+  </div>
+  {% else %}
+  <p style="color:#8B93A6;">No channel snapshot yet — take one now, or let the daily scheduler job collect it.</p>
+  {% endif %}
+
+  {% if report.videos %}
+  <table>
+    <tr><th>Video</th><th>Views</th><th>&Delta; views</th><th>Likes</th><th>Comments</th></tr>
+    {% for v in report.videos %}
+    <tr>
+      <td><a href="https://youtube.com/watch?v={{ v.video_id }}" target="_blank"
+             style="color:#EDEAE2;text-decoration:none;">{{ v.title or v.video_id }}</a></td>
+      <td class="num">{{ "{:,}".format(v.views) }}</td>
+      <td class="num">{% if v.views_delta %}+{{ "{:,}".format(v.views_delta) }}{% else %}—{% endif %}</td>
+      <td class="num">{{ "{:,}".format(v.likes) }}</td>
+      <td class="num">{{ "{:,}".format(v.comments) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p style="color:#8B93A6;font-size:12px;">{{ report.snapshots_taken }} daily snapshot(s) stored. History lives in automation_analytics.json in your GitHub state repo.</p>
+  {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/trending")
+def trending_page():
+    from automation import trending as trending_automation
+    topics = trending_automation.get_trending()
+    state = github_read_json("automation_trending.json", default={}) or {}
+    return render_template_string(
+        TRENDING_PAGE, topics=topics,
+        refreshed_at=state.get("refreshed_at", ""),
+        channel_name=CHANNEL_NAME,
+    )
+
+
+@app.route("/api/trending")
+def trending_api():
+    from automation import trending as trending_automation
+    return jsonify({"topics": trending_automation.get_trending()})
+
+
+@app.route("/api/trending/refresh", methods=["POST"])
+def trending_refresh():
+    from automation import trending as trending_automation
+    try:
+        topics = trending_automation.refresh_trending()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    if request.form:
+        return redirect("/trending")
+    return jsonify({"topics": topics})
+
+
+@app.route("/analytics")
+def analytics_page():
+    from automation import analytics as analytics_automation
+    try:
+        report = analytics_automation.latest_report()
+    except Exception as e:
+        print(f"Warning: analytics report failed ({e})")
+        report = {"channel": {}, "channel_delta": {}, "videos": [], "snapshots_taken": 0}
+    return render_template_string(ANALYTICS_PAGE, report=report, channel_name=CHANNEL_NAME)
+
+
+@app.route("/api/analytics/refresh", methods=["POST"])
+def analytics_refresh():
+    from automation import analytics as analytics_automation
+    try:
+        analytics_automation.collect_snapshot()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    if request.form:
+        return redirect("/analytics")
+    return jsonify({"ok": True})
+
+
+@app.route("/comments/run", methods=["POST"])
+def comments_run():
+    """Manually trigger one comment-reply pass (the scheduler also runs these
+    automatically every COMMENT_CHECK_INTERVAL_MINUTES)."""
+    from automation import comments as comment_automation
+
+    def _run():
+        try:
+            summary = comment_automation.run_once()
+            print(f"[/comments/run] done: {summary}")
+        except Exception as e:
+            print(f"[/comments/run] failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"started": True})
+
+
+@app.route("/scheduler")
+def scheduler_status_endpoint():
+    from automation.scheduler import scheduler_status
+    return jsonify({"enabled": SCHEDULER is not None, "jobs": scheduler_status(SCHEDULER)})
 
 
 if __name__ == "__main__":
@@ -774,4 +1113,15 @@ if __name__ == "__main__":
         # that same download after a drop — until the first one finishes or
         # times out. That was the actual cause of downloads looking "stuck"
         # or failing to resume.
+
+        # Stage 3: start the background automation scheduler (comment reply
+        # loop, daily analytics snapshot, trending refresh, optional daily
+        # auto-video). Never let automation take the web app down with it.
+        try:
+            from automation.scheduler import start_scheduler
+            SCHEDULER = start_scheduler()
+        except Exception as e:
+            print(f"Warning: automation scheduler did not start ({e}). "
+                  "The web app continues without it.")
+
         app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), threaded=True)

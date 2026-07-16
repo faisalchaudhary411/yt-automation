@@ -122,6 +122,59 @@ WORK_DIR = "output"  # local scratch folder on Replit (audio/images/video before
 # will fight with the narration.
 BACKGROUND_MUSIC_PATH = os.environ.get("BACKGROUND_MUSIC_PATH", "assets/background_music.mp3")
 
+# ---------------------------------------------------------------------------
+# Stage 3 — Automation (merged features: comments, analytics, trending,
+# thumbnails, subtitles, playlists, scheduler). All state lives in the same
+# GitHub state repo as drafts/tokens; everything degrades gracefully if the
+# matching flag is off.
+# ---------------------------------------------------------------------------
+
+# Master switch for the background scheduler (comment loop, daily analytics,
+# trending refresh). The web app works fine with this off — you just lose the
+# recurring jobs.
+SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() == "true"
+
+# Comment automation
+AUTO_REPLY_ENABLED = os.environ.get("AUTO_REPLY_ENABLED", "true").lower() == "true"
+AI_REPLIES_ENABLED = os.environ.get("AI_REPLIES_ENABLED", "true").lower() == "true"
+MAX_REPLIES_PER_HOUR = int(os.environ.get("MAX_REPLIES_PER_HOUR", "20"))
+COMMENT_CHECK_INTERVAL_MINUTES = int(os.environ.get("COMMENT_CHECK_INTERVAL_MINUTES", "30"))
+WELCOME_COMMENT_ENABLED = os.environ.get("WELCOME_COMMENT_ENABLED", "true").lower() == "true"
+WELCOME_COMMENT_TEXT = os.environ.get(
+    "WELCOME_COMMENT_TEXT",
+    f"Welcome to {CHANNEL_NAME}! Drop your thoughts below — what story should we cover next?",
+)
+
+# Analytics: daily snapshot is always collected when the scheduler runs; this
+# only controls the optional Telegram digest.
+ANALYTICS_TELEGRAM_DIGEST = os.environ.get("ANALYTICS_TELEGRAM_DIGEST", "true").lower() == "true"
+
+# Trending topics
+TRENDING_REGION = os.environ.get("TRENDING_REGION", "US")
+TRENDING_SUBREDDITS = [
+    s.strip() for s in os.environ.get(
+        "TRENDING_SUBREDDITS", "history,Economics,finance,documentaries"
+    ).split(",") if s.strip()
+]
+
+# Thumbnails: generate + upload a branded thumbnail for every uploaded video.
+THUMBNAILS_ENABLED = os.environ.get("THUMBNAILS_ENABLED", "true").lower() == "true"
+
+# Subtitles: write subtitles.srt for every video and upload it as YouTube
+# captions once the video is approved/published.
+SUBTITLES_ENABLED = os.environ.get("SUBTITLES_ENABLED", "true").lower() == "true"
+CAPTIONS_AUTO_UPLOAD = os.environ.get("CAPTIONS_AUTO_UPLOAD", "true").lower() == "true"
+
+# Playlists: set PLAYLIST_ID in Secrets to auto-add every published video to
+# that playlist (find the ID in the playlist's YouTube URL).
+PLAYLIST_ID = os.environ.get("PLAYLIST_ID", "")
+AUTO_ADD_TO_PLAYLIST = os.environ.get("AUTO_ADD_TO_PLAYLIST", "true").lower() == "true"
+
+# OPT-IN: generate one video per day from the top trending topic. Off by
+# default — turn on only once you're happy with manual-run quality. Publishing
+# still always requires your Telegram approval.
+AUTO_DAILY_VIDEO = os.environ.get("AUTO_DAILY_VIDEO", "false").lower() == "true"
+
 
 def _gh_headers():
     return {

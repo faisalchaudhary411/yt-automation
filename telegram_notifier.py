@@ -18,6 +18,18 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
+def send_message(text: str):
+    """Sends a plain Telegram message. Used by the Stage 3 automation modules
+    (comment summaries, daily analytics digest, alerts). Silently no-ops when
+    Telegram isn't configured, so automation never crashes on it."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[Telegram not configured] {text}")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    resp.raise_for_status()
+
+
 def send_approval_request(title: str, approve_url: str, youtube_preview_url: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[Telegram not configured] Approve here: {approve_url}")

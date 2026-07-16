@@ -1,93 +1,82 @@
-# YouTube Automation — Stage 1 (Content Generation)
+# YouTube Automation — Merged System (Stage 1 + 2 + 3)
 
-Topic → Script (Groq) → Voiceover (ElevenLabs/gTTS) → Images (Pexels) → Final MP4 (FFmpeg).
+Your live system (Topic → Script → Voiceover → Images → MP4 → private upload →
+Telegram approval → publish) now merged with the missing features from the
+companion automation suite — adapted to this codebase's architecture instead of
+bolted on as-is.
 
-## Setup on Replit
+## What's new (Stage 3, merged from the companion system)
 
-1. Create a new **Python** Repl.
-2. Paste all these files in with the same folder structure:
-   ```
-   main.py
-   config.py
-   requirements.txt
-   content_pipeline/script_generator.py
-   content_pipeline/tts_generator.py
-   content_pipeline/image_fetcher.py
-   content_pipeline/video_assembler.py
-   ```
-3. In the Repl's **Secrets** tab (padlock icon), add:
-   - `GROQ_API_KEY` — from console.groq.com
-   - `PEXELS_API_KEY` — free, from pexels.com/api
-   - `ELEVENLABS_API_KEY` — optional, only if you want premium narration
-   - `ELEVENLABS_VOICE_ID` — optional, your cloned voice ID
-   - `GITHUB_TOKEN` — a fine-grained personal access token with contents:read/write
-     on a small repo you create just for this (e.g. `yt-automation-state`)
-   - `GITHUB_REPO` — e.g. `yourusername/yt-automation-state`
-4. Install FFmpeg: open the **Shell** tab in Replit and run:
-   ```
-   nix-env -iA nixpkgs.ffmpeg
-   ```
-   (or enable it via Replit's Nix packages panel if available on your plan)
-5. Click **Run** — this starts a small web page where you can type a topic and
-   click Generate. Or use the Shell to run it directly:
-   ```
-   python main.py "The Tulip Mania bubble of 1637"
-   ```
+| Feature | How it works here |
+|---|---|
+| **Comment auto-replies** | Background loop checks your published videos every 30 min, filters spam/offensive comments, and replies — AI-written via your existing Cerebras→SambaNova→Groq chain (no OpenAI key needed), with template fallback. State-tracked so it never double-replies, capped at 20 replies/hour. |
+| **Welcome comment** | Posted automatically as the first comment when you approve a video. (The old system's "pin" trick actually reported your own comment as spam — removed. YouTube's API can't pin; pin manually in Studio if you want.) |
+| **Subtitles (.srt)** | Every video gets a real subtitle file computed from exact scene timings — no Whisper, always in sync. Downloadable from the result card, and auto-uploaded as YouTube captions when you publish. |
+| **Branded thumbnails** | Generated per video (scene image + title in your verified fonts, gold accent, channel badge), auto-uploaded to YouTube after each upload. Note: YouTube only accepts custom thumbnails from phone-verified channels. |
+| **SEO enhancement** | Descriptions now get chapter timestamps (from real timings), hashtags, subscribe block, and any Wikimedia image credits. Titles stay LLM-written — the old system's "Ultimate Guide to…" rewriter was dropped on purpose. |
+| **Trending ideas** | `/trending` page: YouTube mostPopular + Reddit (r/history, r/Economics, r/finance, r/documentaries), scored and refreshed daily. "Use this topic →" pre-fills the generator form. |
+| **Analytics** | Daily snapshots of every published video + channel totals, stored in your GitHub state repo. `/analytics` page shows views/likes/comments with deltas, plus an optional daily Telegram digest. |
+| **Playlists** | Set `PLAYLIST_ID` in Secrets and every published video is auto-added. (The old system only logged this — it's implemented for real here.) |
+| **Scheduler** | APScheduler inside the Flask process (fits the Reserved VM deployment). See `/scheduler` for job status. Optional `AUTO_DAILY_VIDEO=true` generates one video/day from the top trending topic — still requires your Telegram approval to publish. |
 
-## What you get
-- A finished MP4 in the `output/` folder, ready to watch/review.
-- Title, description, and tags generated alongside it.
-- A running log of every draft saved to your `GITHUB_REPO` as `drafts.json`,
-  so nothing is lost if the Repl restarts.
+## File layout
 
-## Notes
-- First run will take a few minutes (script + ~15 audio clips + ~15 images + video render).
-- If ElevenLabs isn't configured, narration automatically falls back to free Google TTS (gTTS) —
-  lower quality but works with zero extra setup.
-- Nothing here uploads to YouTube yet. Review the MP4 first — Stage 2 (upload with your
-  approval step) comes next once you're happy with the video quality/style.
+```
+main.py                     # orchestrator (Stages 1+2+3 wired together)
+config.py                   # all settings incl. Stage 3 feature flags
+youtube_auth.py             # OAuth (unchanged — scopes already cover everything)
+youtube_uploader.py         # + set_thumbnail(), upload_captions()
+telegram_notifier.py        # + send_message() for digests/alerts
+content_pipeline/           # script / tts / images / video assembly (unchanged)
+automation/
+  youtube_client.py         # shared minimal YouTube API client (OAuth + requests)
+  comments.py               # comment fetch/reply/filter + welcome comment
+  analytics.py              # video/channel snapshots + reports
+  trending.py               # trending topics (YouTube + Reddit)
+  seo.py                    # description/tag enhancement
+  thumbnails.py             # branded thumbnail generator
+  subtitles.py              # exact-timing .srt builder
+  playlists.py              # real playlist create/add
+  scheduler.py              # APScheduler jobs
+```
 
----
+## New Replit Secrets (all optional — everything degrades gracefully)
 
-## Stage 2 — YouTube Upload + Approval Gate
+- `PLAYLIST_ID` — auto-add published videos to this playlist
+- `AUTO_DAILY_VIDEO` — `true` to enable one auto-generated video/day (default off)
+- `SCHEDULER_ENABLED` — `false` to turn off all background jobs (default on)
+- `AUTO_REPLY_ENABLED` / `AI_REPLIES_ENABLED` — comment automation controls
+- `COMMENT_CHECK_INTERVAL_MINUTES` (default 30), `MAX_REPLIES_PER_HOUR` (default 20)
+- `TRENDING_REGION` (default US), `TRENDING_SUBREDDITS` (comma-separated)
+- `ANALYTICS_TELEGRAM_DIGEST` — daily channel stats via Telegram (default on)
+- `THUMBNAILS_ENABLED` / `SUBTITLES_ENABLED` / `CAPTIONS_AUTO_UPLOAD` / `WELCOME_COMMENT_ENABLED`
+- `WELCOME_COMMENT_TEXT` — override the default welcome comment
 
-New files: `youtube_auth.py`, `youtube_uploader.py`, `telegram_notifier.py` (updated `main.py`).
+## Setup
 
-### 1. Google Cloud OAuth setup (one-time)
-1. Go to console.cloud.google.com → create/select a project.
-2. Enable the **YouTube Data API v3** (APIs & Services → Library → search it → Enable).
-3. APIs & Services → Credentials → **Create Credentials → OAuth client ID**.
-   - Application type: **Web application**
-   - Authorized redirect URI: `https://<your-repl-name>.<your-username>.repl.co/oauth2callback`
-     (use your actual Replit public URL — check the webview tab for the exact domain)
-4. Copy the Client ID and Client Secret.
-5. If prompted, configure the OAuth consent screen as **External** + add yourself as a test user
-   (or verify the app later if you want it fully public — test mode works fine for personal use).
+Same as before — plus one new package:
 
-### 2. Telegram bot setup (one-time)
-1. Message **@BotFather** on Telegram → `/newbot` → follow prompts → copy the token.
-2. Send your new bot any message (e.g. "hi") so it can message you back.
-3. In a browser, visit: `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-4. Find `"chat":{"id":123456789,...}` in the response — that number is your chat ID.
+```bash
+pip install -r requirements.txt   # adds apscheduler
+```
 
-### 3. New Replit Secrets to add
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `REPL_URL` — your Repl's public https URL, no trailing slash
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+No re-authorization needed: your existing YouTube OAuth grant
+(`youtube.upload` + `youtube.force-ssl`) already covers comments, captions,
+thumbnails, and playlists.
 
-### 4. Connect your channel (one-time)
-Visit `<REPL_URL>/authorize`, sign in with the Google account that owns your YouTube
-channel, approve access. That's it — the refresh token is saved to your GitHub state
-repo, so you won't need to do this again.
+## State files (all in your GitHub state repo)
 
-### 5. How it works from here
-1. You generate a video (web form or `python main.py "topic"`).
-2. It's uploaded to YouTube as **private** automatically.
-3. You get a Telegram message with the title, a private preview link, and an
-   **Approve & Publish** button.
-4. Tap it → the video flips to public. Ignore it → it just stays private forever.
+- `drafts.json` — every generated draft + approval tokens (as before)
+- `youtube_token.json` — OAuth refresh token (as before)
+- `automation_comments.json` — replied-comment IDs, welcome-comment log, rate-limit window
+- `automation_analytics.json` — daily metrics snapshots
+- `automation_trending.json` — cached trending topics
 
-Nothing publishes without your tap. If you ever want a video fully public later, you can
-always approve it whenever you get to reviewing it — it doesn't expire.
+## Deliberately NOT merged from the companion system
+
+- **SQLite database** — everything syncs into your GitHub state repo instead (one state system, survives Repl restarts)
+- **Community-post bot** — the YouTube Data API has no community-posts endpoint; it was a stub
+- **Monetization tracker** — was a stub returning zeros; real revenue data needs the Analytics API + a monetized channel
+- **OpenAI content generator** — your Cerebras/Groq chain is strictly better; AI comment replies reuse it
+- **REST API server / dashboard** — your Flask app already covers both
+- **Email notifications** — you already have Telegram, which is strictly faster for approvals

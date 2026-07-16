@@ -7,3 +7,4 @@ edge-tts
 arabic-reshaper==3.0.0
 python-bidi==0.4.2
 fonttools
+apscheduler>=3.10,<4.0
