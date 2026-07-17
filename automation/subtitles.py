@@ -47,9 +47,15 @@ def _srt_time(seconds: float) -> str:
 
 def compute_scene_start_times(
     durations: list, include_intro: bool, include_outro: bool, chapters: list = None,
+    crossfade_seconds: float = CROSSFADE_SECONDS, logo_sting_seconds: float = 0.0,
 ) -> list:
     """Start time of each scene in the FINAL video, matching the assembler's
-    transition logic (see module docstring)."""
+    transition logic (see module docstring). `crossfade_seconds` MUST match
+    whatever the video's style config actually used (see VIDEO_STYLES in
+    config.py) -- styles now have different crossfade durations, so passing
+    the wrong one will make captions drift out of sync. `logo_sting_seconds`
+    should be the logo sting's duration if one was actually prepended (see
+    LOGO_STING_ENABLED/CHANNEL_LOGO_PATH in config.py), else 0."""
     n = len(durations)
     card_by_index = get_chapter_card_scene_indices(chapters or [], n)
 
@@ -65,7 +71,7 @@ def compute_scene_start_times(
         groups.append(current)
 
     starts = [0.0] * n
-    cursor = INTRO_DURATION if include_intro else 0.0
+    cursor = (INTRO_DURATION if include_intro else 0.0) + logo_sting_seconds
 
     for g_idx, group in enumerate(groups):
         is_first_group = g_idx == 0
@@ -86,7 +92,7 @@ def compute_scene_start_times(
             starts[scene_i] = cursor
             cursor += durations[scene_i]
             if k < len(crossfaded) and crossfaded[k]:
-                cursor -= CROSSFADE_SECONDS
+                cursor -= crossfade_seconds
 
         if not is_last_group:
             cursor += CHAPTER_CARD_DURATION  # the chapter card that follows this group
@@ -95,10 +101,13 @@ def compute_scene_start_times(
 
 
 def build_srt(scenes: list, include_intro: bool = True, include_outro: bool = True,
-              chapters: list = None) -> str:
+              chapters: list = None, crossfade_seconds: float = CROSSFADE_SECONDS,
+              logo_sting_seconds: float = 0.0) -> str:
     """Builds SRT content from scene dicts (needs narration + audio_path)."""
     durations = [_get_media_duration(s["audio_path"]) for s in scenes]
-    starts = compute_scene_start_times(durations, include_intro, include_outro, chapters)
+    starts = compute_scene_start_times(
+        durations, include_intro, include_outro, chapters, crossfade_seconds, logo_sting_seconds,
+    )
 
     entries = []
     idx = 1
@@ -114,10 +123,14 @@ def build_srt(scenes: list, include_intro: bool = True, include_outro: bool = Tr
 
 
 def write_srt(scenes: list, work_dir: str, include_intro: bool = True,
-              include_outro: bool = True, chapters: list = None) -> str:
+              include_outro: bool = True, chapters: list = None,
+              crossfade_seconds: float = CROSSFADE_SECONDS,
+              logo_sting_seconds: float = 0.0) -> str:
     """Writes subtitles.srt into the job's work dir; returns the path."""
     srt_path = os.path.join(work_dir, "subtitles.srt")
     with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(build_srt(scenes, include_intro, include_outro, chapters))
+        f.write(build_srt(
+            scenes, include_intro, include_outro, chapters, crossfade_seconds, logo_sting_seconds,
+        ))
     print(f"[subtitles] SRT written: {srt_path}")
     return srt_path
