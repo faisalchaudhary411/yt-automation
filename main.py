@@ -34,6 +34,7 @@ from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
+    LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
     SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED,
 )
 from content_pipeline.script_generator import generate_script
@@ -596,6 +597,23 @@ def run_pipeline_job(
                 detail = "Joining final video…" if done == 0 else "Final video assembled"
             _set_progress(job_id, "video", frac, detail=detail)
 
+        style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
+        crossfade_seconds = style_conf.get("crossfade_seconds", 0.6)
+        style_music_path = style_conf.get("music_path")
+        music_path = (
+            style_music_path if style_music_path and os.path.isfile(style_music_path)
+            else BACKGROUND_MUSIC_PATH
+        )
+        # Must mirror video_assembler.assemble_video's own logo-sting check
+        # exactly, or subtitle/chapter timestamps will drift out of sync
+        # whenever a logo sting actually gets prepended to the video.
+        logo_sting_seconds = (
+            LOGO_STING_DURATION
+            if (include_intro and LOGO_STING_ENABLED and CHANNEL_LOGO_PATH
+                and os.path.isfile(CHANNEL_LOGO_PATH))
+            else 0.0
+        )
+
         video_path = assemble_video(
             script["scenes"], work_dir,
             title=script["title"],
@@ -604,7 +622,7 @@ def run_pipeline_job(
             include_outro=include_outro,
             style=style,
             progress_callback=_video_progress,
-            music_path=BACKGROUND_MUSIC_PATH,
+            music_path=music_path,
             chapters=script.get("chapters"),
         )
 
@@ -617,7 +635,8 @@ def run_pipeline_job(
                 from automation.subtitles import write_srt
                 srt_path = write_srt(
                     script["scenes"], work_dir, include_intro, include_outro,
-                    chapters=script.get("chapters"),
+                    chapters=script.get("chapters"), crossfade_seconds=crossfade_seconds,
+                    logo_sting_seconds=logo_sting_seconds,
                 )
                 srt_url = f"/output/{job_id}/{os.path.basename(srt_path)}"
         except Exception as e:
@@ -645,6 +664,7 @@ def run_pipeline_job(
             durations = [_get_media_duration(s["audio_path"]) for s in script["scenes"]]
             scene_starts = compute_scene_start_times(
                 durations, include_intro, include_outro, chapters=script.get("chapters"),
+                crossfade_seconds=crossfade_seconds, logo_sting_seconds=logo_sting_seconds,
             )
             enhanced = enhance_metadata(
                 {"title": script["title"],

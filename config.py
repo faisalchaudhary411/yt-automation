@@ -82,7 +82,16 @@ EDGE_VOICES = {
 DEFAULT_VOICE_GENDER = "female"
 
 # Video style presets: each shapes the narrator's tone (via the script prompt)
-# and the visual treatment (intro/outro color + Ken Burns zoom speed).
+# AND the visual/audio treatment -- intro/outro/chapter card color + accent bar,
+# Ken Burns zoom speed, transition pacing, and background music mood. Before
+# Phase 4 these all only differed by narrator tone + one background color;
+# now every style actually looks and feels different on screen, not just in
+# the voiceover.
+#
+# music_path is optional per style -- drop an MP3 at that path and this style
+# will use it; if it's missing, assemble_video() falls back to the single
+# BACKGROUND_MUSIC_PATH below so nothing breaks for styles you haven't
+# sourced music for yet.
 VIDEO_STYLES = {
     "documentary": {
         "name": "Documentary",
@@ -90,6 +99,9 @@ VIDEO_STYLES = {
                            "similar to Real Stories or History Channel specials",
         "bg_color": "0x141E30",
         "zoom_rate": 0.0008,
+        "accent_color": (198, 164, 84),      # brass gold -- matches the channel's thumbnail branding
+        "crossfade_seconds": 0.6,             # standard, measured pacing
+        "music_path": "assets/music_documentary.mp3",
     },
     "cinematic": {
         "name": "Cinematic / Dramatic",
@@ -97,6 +109,9 @@ VIDEO_STYLES = {
                            "similar to true-crime or mystery documentaries",
         "bg_color": "0x1A1A2E",
         "zoom_rate": 0.0005,
+        "accent_color": (140, 20, 20),        # deep blood red -- tense, high-stakes
+        "crossfade_seconds": 1.0,             # slower, more deliberate fades build tension
+        "music_path": "assets/music_cinematic.mp3",
     },
     "motivational": {
         "name": "Motivational",
@@ -104,6 +119,9 @@ VIDEO_STYLES = {
                            "similar to top self-improvement or success channels",
         "bg_color": "0x8A5A00",
         "zoom_rate": 0.0012,
+        "accent_color": (255, 149, 0),        # bright energetic amber
+        "crossfade_seconds": 0.3,             # snappy, high-energy cuts
+        "music_path": "assets/music_motivational.mp3",
     },
     "educational": {
         "name": "Educational / Explainer",
@@ -111,6 +129,9 @@ VIDEO_STYLES = {
                            "similar to popular science explainer channels",
         "bg_color": "0x1B4332",
         "zoom_rate": 0.0007,
+        "accent_color": (86, 196, 130),       # fresh green -- clear and approachable
+        "crossfade_seconds": 0.6,
+        "music_path": "assets/music_educational.mp3",
     },
 }
 DEFAULT_VIDEO_STYLE = "documentary"
@@ -129,7 +150,23 @@ WORK_DIR = "output"  # local scratch folder on Replit (audio/images/video before
 # YouTube Audio Library, Pixabay Music, Free Music Archive) and upload it to
 # this path in your repo. Keep it instrumental/ambient — anything with vocals
 # will fight with the narration.
+# Fallback background music, used when a style's own music_path (see
+# VIDEO_STYLES above) doesn't exist on disk yet.
 BACKGROUND_MUSIC_PATH = os.environ.get("BACKGROUND_MUSIC_PATH", "assets/background_music.mp3")
+
+# Lower-thirds (Phase 5 polish): a brief on-screen stamp of a real number the
+# narration just said (a year, a currency amount, a percentage) -- the kind
+# of stat-callout real documentary channels use. Purely rule-based (regex),
+# no LLM call needed -- see _extract_stat() in video_assembler.py.
+LOWER_THIRDS_ENABLED = os.environ.get("LOWER_THIRDS_ENABLED", "true").lower() != "false"
+
+# Logo sting (Phase 5 polish): a brief branded opener shown once before the
+# intro title card. This is a NO-OP until you actually put a logo image at
+# CHANNEL_LOGO_PATH -- assemble_video() checks os.path.isfile() and silently
+# skips it otherwise, so nothing changes for you until you add one.
+LOGO_STING_ENABLED = os.environ.get("LOGO_STING_ENABLED", "true").lower() != "false"
+CHANNEL_LOGO_PATH = os.environ.get("CHANNEL_LOGO_PATH", "assets/logo.png")
+LOGO_STING_DURATION = 1.3
 
 # ---------------------------------------------------------------------------
 # Stage 3 — Automation (merged features: comments, analytics, trending,
