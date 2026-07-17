@@ -40,7 +40,8 @@ except ImportError:
 # Duplicated locally rather than imported from voice_generator.py so this
 # module keeps working standalone regardless of how it's deployed.
 
-_BROLL_MARKER_RE = re.compile(r"\[\s*B-?ROLL\s*:.*?\]", re.IGNORECASE | re.DOTALL)
+_BROLL_MARKER_RE = re.compile(r"[\[\(]\s*B[\s\-]?ROLL\b[^\]\)]*[\]\)]", re.IGNORECASE | re.DOTALL)
+_BROLL_BARE_MARKER_RE = re.compile(r"\bB[\s\-]?ROLL\b\s*:?\s*[^۔.!?\n]*", re.IGNORECASE)
 _PAUSE_MARKER_RE = re.compile(r"\(\s*PAUSE\s*\)", re.IGNORECASE)
 _EMPHASIS_MARKER_RE = re.compile(r"\(\s*EMPHASIS\s*\)", re.IGNORECASE)
 
@@ -53,6 +54,7 @@ def _strip_narration_markers_for_captions(text: str) -> str:
         return text
 
     text = _BROLL_MARKER_RE.sub(" ", text)
+    text = _BROLL_BARE_MARKER_RE.sub(" ", text)
     # For captions (unlike audio) there's no need for an actual pause -- just
     # drop the marker rather than inserting a visible comma.
     text = _PAUSE_MARKER_RE.sub(" ", text)
@@ -720,6 +722,7 @@ def _build_scene_clip(
     if not scene.get("image_path") or not scene.get("audio_path"):
         raise RuntimeError(f"Scene {index} is missing an image or audio file.")
 
+    media_type = scene.get("media_type", "photo")
     duration = _get_media_duration(scene["audio_path"])
     fps = SCENE_FPS
     total_frames = int(duration * fps)
@@ -735,15 +738,32 @@ def _build_scene_clip(
 
     watermark_filter = _watermark_filter(channel_name)
 
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", scene["image_path"], "-i", scene["audio_path"]]
+    if media_type == "video":
+        # Real motion b-roll: loop the source clip indefinitely (-stream_loop
+        # -1) and let the final -t duration cut it to exactly the length we
+        # need, whether the source is shorter OR longer than that -- no need
+        # to probe its length first. It already has motion, so no Ken Burns
+        # zoompan here; just fill the frame without distorting the footage
+        # (force_original_aspect_ratio=increase + crop, rather than a
+        # stretch-to-fit scale) and normalize to our fixed output fps.
+        cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", scene["image_path"], "-i", scene["audio_path"]]
+        base_filters = [
+            f"scale={width}:{height}:force_original_aspect_ratio=increase",
+            f"crop={width}:{height}",
+            f"fps={fps}",
+            COLOR_GRADE_FILTER,
+        ]
+    else:
+        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", scene["image_path"], "-i", scene["audio_path"]]
+        base_filters = [
+            f"scale={width}:{height}",
+            f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
+            COLOR_GRADE_FILTER,
+        ]
+
     for info in caption_pngs:
         cmd += ["-loop", "1", "-i", info["path"]]
 
-    base_filters = [
-        f"scale={width}:{height}",
-        f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
-        COLOR_GRADE_FILTER,
-    ]
     filters = [f"[0:v]{','.join(base_filters)}[base]"]
 
     current_label = "[base]"

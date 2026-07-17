@@ -89,10 +89,16 @@ MAX_CONCURRENT_TTS = 6
 # Script-marker stripping (PAUSE / EMPHASIS / B-ROLL directives)
 # ---------------------------------------------------------------------------
 
-# Matches "[B-ROLL: anything]" (case-insensitive, tolerant of odd spacing) --
-# these are footage directions for the video assembler, never meant to be
-# spoken.
-_BROLL_MARKER_RE = re.compile(r"\[\s*B-?ROLL\s*:.*?\]", re.IGNORECASE | re.DOTALL)
+# Matches "[B-ROLL: anything]" -- the format the model is asked to use --
+# tolerant of odd spacing and of the model mixing bracket/paren types
+# (e.g. "[B-ROLL: ...)"), since LLMs don't always close brackets consistently.
+_BROLL_MARKER_RE = re.compile(r"[\[\(]\s*B[\s\-]?ROLL\b[^\]\)]*[\]\)]", re.IGNORECASE | re.DOTALL)
+
+# Fallback for when the model drops the brackets entirely (e.g. writes plain
+# "B-ROLL: modern risk control room" inline) -- without this, that text would
+# leak straight into narration and get spoken/captioned verbatim. Strips from
+# "B-ROLL" up to the next sentence-ending punctuation (or end of text).
+_BROLL_BARE_MARKER_RE = re.compile(r"\bB[\s\-]?ROLL\b\s*:?\s*[^۔.!?\n]*", re.IGNORECASE)
 
 # Matches "(PAUSE)" -- converted to a real Urdu comma so edge-tts produces an
 # actual audible pause, instead of speaking the literal word "pause".
@@ -113,6 +119,7 @@ def _strip_narration_markers(text: str) -> str:
         return text
 
     text = _BROLL_MARKER_RE.sub(" ", text)
+    text = _BROLL_BARE_MARKER_RE.sub(" ", text)
     text = _PAUSE_MARKER_RE.sub("،", text)
     text = _EMPHASIS_MARKER_RE.sub(" ", text)
 
