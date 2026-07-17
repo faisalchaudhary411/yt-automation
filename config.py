@@ -28,6 +28,15 @@ CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 
 CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "WealthThroughAges")
 
+# Real motion b-roll (Phase 3): mixes Pexels stock VIDEO clips in with the
+# usual Ken-Burns-panned photos, instead of every scene being a still image.
+# Kept as a minority of scenes on purpose -- occasional motion b-roll reads as
+# "professional documentary editing"; every single scene being stock footage
+# reads as generic stock-footage montage, and costs far more bandwidth/time
+# to download and re-encode on a phone-only, limited-bandwidth workflow.
+VIDEO_BROLL_ENABLED = os.environ.get("VIDEO_BROLL_ENABLED", "true").lower() != "false"
+VIDEO_BROLL_INTERVAL = 3  # roughly 1 in every N scenes attempts video b-roll first
+
 # Narration languages offered in the UI. Keys are standard language codes (also used
 # to tell Groq which language to write the script in via their display name).
 LANGUAGES = {

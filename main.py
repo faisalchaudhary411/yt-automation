@@ -629,7 +629,9 @@ def run_pipeline_job(
             if THUMBNAILS_ENABLED:
                 from automation.thumbnails import generate_thumbnail
                 first_image = next(
-                    (s.get("image_path") for s in script["scenes"] if s.get("image_path")), None
+                    (s.get("image_path") for s in script["scenes"]
+                     if s.get("image_path") and s.get("media_type", "photo") == "photo"),
+                    None,
                 )
                 thumbnail_path = os.path.join(work_dir, "thumbnail.jpg")
                 generate_thumbnail(script["title"], first_image, thumbnail_path)
