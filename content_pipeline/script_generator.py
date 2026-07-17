@@ -213,7 +213,7 @@ Do not include any text outside the JSON object."""
 
 def _build_scenes_prompt(
     language_name: str, style_key: str, word_budget: int, is_first_chunk: bool,
-    chapter_word_budget: int = 0, chapters_so_far: list = None,
+    chapter_word_budget: int = 0, chapters_so_far: list = None, is_last_chunk: bool = True,
 ) -> str:
     scene_low, scene_high = _scene_count_for_words(word_budget)
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
@@ -226,6 +226,21 @@ def _build_scenes_prompt(
             "(a surprising fact, bold claim, or curiosity gap that stops the scroll) — "
             "but make it a genuinely specific, concrete hook (a real number, a real moment), "
             "not a generic 'you won't believe what happened next' tease."
+        )
+
+    if is_last_chunk:
+        ending_guidance = (
+            "\n- This IS the final chunk of the entire script. The LAST scene must end with a "
+            "clear Call-To-Action (CTA): ask the viewer to subscribe, comment, or watch the next "
+            "video — phrased the way this specific narrator would actually say it, not a generic "
+            "templated CTA."
+        )
+    else:
+        ending_guidance = (
+            "\n- This is NOT the final chunk — more of the script is written after this in a "
+            "separate step. Do NOT end with a CTA, a sign-off, a subscribe/comment mention, "
+            "'in conclusion', or any other wrap-up language. End mid-story, as if the narration "
+            "simply continues past this point — because it does."
         )
 
     chapter_guidance = ""
@@ -245,7 +260,10 @@ Chapters used so far in this script: {used_text}. Do not reuse one of those name
   a short, evocative name (2-5 words) in {language_name}.
 - Scenes that CONTINUE the current chapter should simply omit "chapter_title" (or use "").
 - It's fine, and often correct, to have zero new chapters in this particular chunk if the story
-  hasn't reached a new turn yet."""
+  hasn't reached a new turn yet.
+- A named chapter is a SECTION HEADING, not an ending — it must never come with its own CTA,
+  sign-off, or subscribe/comment mention. Only the very last scene of the whole script (see
+  below) may ever do that."""
         chapter_schema_line = '\n      "chapter_title": "Optional — include ONLY on the scene where a new named chapter starts",'
 
     return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
@@ -270,9 +288,11 @@ CRITICAL LENGTH REQUIREMENT: the combined narration across every scene in THIS r
 CRITICAL YOUTUBE NARRATION RULES:
 - Every scene narration must be written as spoken words for a voiceover, not as prose to be read silently.
 - Use (PAUSE) and (EMPHASIS) markers where the narrator should pause or stress a word.
-- Mark [B-ROLL: description] where background footage should appear while the narrator speaks.
-- Keep sentences short and punchy. Avoid nested clauses.
-- If this is the final chunk of the script, the LAST scene must end with a clear Call-To-Action (CTA): ask the viewer to subscribe, comment, or watch the next video — phrased the way this specific narrator would actually say it, not a generic templated CTA.{hook_guidance}
+- Mark [B-ROLL: description] where background footage should appear while the narrator speaks — use
+  this EXACT format (square brackets, literal text "B-ROLL", a colon, then the description, then a
+  closing bracket) every time, since it's stripped out programmatically before narration is spoken
+  or captioned — anything not in this exact format risks being read aloud by mistake.
+- Keep sentences short and punchy. Avoid nested clauses.{ending_guidance}{hook_guidance}
 
 CRITICAL TEXT FORMATTING:
 - Use proper {language_name} punctuation (e.g., Urdu full stop: ۔ not .)
@@ -815,11 +835,12 @@ def _generate_metadata(client: Groq, topic: str, brief: str, language_name: str,
 def _generate_scenes_chunk(
     client: Groq, topic: str, brief: str, language_name: str, style: str,
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
-    chapter_word_budget: int = 0, chapters_so_far: list = None,
+    chapter_word_budget: int = 0, chapters_so_far: list = None, is_last_chunk: bool = True,
 ) -> dict:
     system_prompt = _build_scenes_prompt(
         language_name, style, word_budget, is_first_chunk,
         chapter_word_budget=chapter_word_budget, chapters_so_far=chapters_so_far,
+        is_last_chunk=is_last_chunk,
     )
     max_tokens = min(3000, max(600, word_budget * 6))
 
@@ -951,6 +972,7 @@ def generate_script(
         part = _generate_scenes_chunk(
             client, topic, brief, language_name, style, word_budget, is_first, previous_tail,
             chapter_word_budget=chapter_word_budget, chapters_so_far=chapter_state["chapters_so_far"],
+            is_last_chunk=(chunk_index == num_chunks - 1),
         )
         chunk_elapsed = time.time() - chunk_start
 

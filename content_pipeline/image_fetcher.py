@@ -21,13 +21,17 @@ import re
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor
-from config import PEXELS_API_KEY
+from config import PEXELS_API_KEY, VIDEO_BROLL_ENABLED, VIDEO_BROLL_INTERVAL
 
 PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
+PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 MAX_CONCURRENT_FETCHES = 6
 CANDIDATES_PER_SCENE = 8
+VIDEO_CANDIDATES_PER_SCENE = 4
 MIN_WIKIMEDIA_WIDTH = 800  # skip tiny thumbnails/icons that sneak into Commons search
+MIN_VIDEO_WIDTH = 1280
+MAX_VIDEO_BROLL_SECONDS = 20  # avoid picking a 3-minute stock clip just to loop 5s of it
 
 
 def _search_pexels(query: str, per_page: int = CANDIDATES_PER_SCENE) -> list:
@@ -48,7 +52,49 @@ def _search_pexels(query: str, per_page: int = CANDIDATES_PER_SCENE) -> list:
         return []
 
     photos = data.get("photos", [])
-    return [{"id": f"px-{p['id']}", "url": p["src"]["large2x"], "credit": None} for p in photos]
+    return [{"id": f"px-{p['id']}", "url": p["src"]["large2x"], "credit": None, "type": "photo"} for p in photos]
+
+
+def _search_pexels_videos(query: str, per_page: int = VIDEO_CANDIDATES_PER_SCENE) -> list:
+    """Returns a list of {id, url, credit, type: 'video'} dicts of short,
+    landscape, reasonably-sized stock video clips for the given query, or []
+    on no results/error/disabled. Picks the smallest file that's still >=
+    MIN_VIDEO_WIDTH wide, to keep downloads light on a limited-bandwidth
+    connection -- there's no quality benefit to a 4K download that's about to
+    be scaled down and cropped to 1080p anyway."""
+    if not VIDEO_BROLL_ENABLED or not PEXELS_API_KEY:
+        return []
+
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": query, "per_page": per_page, "orientation": "landscape"}
+
+    try:
+        resp = requests.get(PEXELS_VIDEO_SEARCH_URL, headers=headers, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", "?")
+        print(f"[image_fetcher] Pexels video search failed for '{query}' (HTTP {status}): {e}")
+        return []
+
+    candidates = []
+    for video in data.get("videos", []):
+        duration = video.get("duration") or 0
+        if duration and duration > MAX_VIDEO_BROLL_SECONDS * 6:
+            # Absurdly long source (e.g. a multi-minute drone reel) -- still
+            # loopable in principle, but usually means an odd/irrelevant match.
+            continue
+        files = [
+            f for f in (video.get("video_files") or [])
+            if f.get("file_type") == "video/mp4" and (f.get("width") or 0) >= MIN_VIDEO_WIDTH
+        ]
+        if not files:
+            continue
+        best = min(files, key=lambda f: f.get("width") or 10**9)
+        candidates.append({
+            "id": f"pxv-{video['id']}", "url": best["link"], "credit": None, "type": "video",
+        })
+    return candidates
 
 
 def _strip_html(text: str) -> str:
@@ -115,11 +161,12 @@ def _search_wikimedia_commons(query: str, per_page: int = CANDIDATES_PER_SCENE) 
             "id": f"wm-{page.get('pageid')}",
             "url": url,
             "credit": credit,
+            "type": "photo",
         })
     return candidates
 
 
-def _candidates_for_scene(keywords: str) -> list:
+def _candidates_for_scene(keywords: str, prefer_video: bool = False) -> list:
     """
     Searches with the scene's own keywords first; if that returns nothing (a
     too-specific or oddly-phrased query), falls back to a shorter, broader
@@ -127,9 +174,20 @@ def _candidates_for_scene(keywords: str) -> list:
     stock-photo library with little/no archival or historical imagery — falls
     back to Wikimedia Commons (openly licensed, has real archival material)
     for historical/archival subjects Pexels can't cover at all.
+
+    When `prefer_video` is True (a minority of scenes, see VIDEO_BROLL_INTERVAL),
+    tries Pexels' video search first for real motion b-roll, before falling
+    back to the same photo chain if no suitable video clip is found.
     """
     words = keywords.split()
     broader = " ".join(words[-2:]) if len(words) > 2 else None
+
+    if prefer_video:
+        video_candidates = _search_pexels_videos(keywords)
+        if not video_candidates and broader:
+            video_candidates = _search_pexels_videos(broader)
+        if video_candidates:
+            return video_candidates
 
     candidates = _search_pexels(keywords)
     if candidates:
@@ -181,9 +239,17 @@ def _write_attributions(scenes: list, work_dir: str) -> None:
 def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) -> list:
     """
     scenes: list of scene dicts (each with "image_keywords")
-    Returns the same list with added "image_path" and "image_credit" keys per scene.
-    "image_credit" is None unless the image came from Wikimedia Commons under a
-    license that requires attribution.
+    Returns the same list with added "image_path", "image_credit", and
+    "media_type" ("photo" or "video") keys per scene. "image_credit" is None
+    unless the image came from Wikimedia Commons under a license that
+    requires attribution. `image_path` holds a video file (.mp4) for scenes
+    that got real motion b-roll -- video_assembler branches on `media_type`
+    to render it correctly (see _build_scene_clip).
+
+    A minority of scenes (every VIDEO_BROLL_INTERVAL-th one, see config.py)
+    search Pexels' video library first for real b-roll footage before falling
+    back to the normal photo chain -- most scenes stay photos on purpose (see
+    VIDEO_BROLL_ENABLED's docstring in config.py for why).
 
     Runs the image *searches* concurrently (fast network calls), then assigns
     images to scenes sequentially so each scene gets the first candidate image
@@ -212,7 +278,12 @@ def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) 
 
     def search_one(i, scene):
         nonlocal search_done
-        candidate_lists[i] = _candidates_for_scene(scene["image_keywords"])
+        prefer_video = (
+            VIDEO_BROLL_ENABLED
+            and VIDEO_BROLL_INTERVAL > 0
+            and i % VIDEO_BROLL_INTERVAL == VIDEO_BROLL_INTERVAL - 1
+        )
+        candidate_lists[i] = _candidates_for_scene(scene["image_keywords"], prefer_video=prefer_video)
         if progress_callback:
             with search_lock:
                 search_done += 1
@@ -239,7 +310,8 @@ def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) 
     def download_one(i):
         nonlocal download_done
         if chosen[i]:
-            out_path = os.path.join(image_dir, f"scene_{i:03d}.jpg")
+            ext = ".mp4" if chosen[i].get("type") == "video" else ".jpg"
+            out_path = os.path.join(image_dir, f"scene_{i:03d}{ext}")
             if _download(chosen[i]["url"], out_path):
                 results[i] = out_path
         if progress_callback:
@@ -252,31 +324,38 @@ def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) 
         list(executor.map(download_one, range(total)))
 
     # Forward-fill: reuse the most recent successfully-downloaded image (and
-    # its credit) for any scene whose own fetch failed.
+    # its credit/type) for any scene whose own fetch failed.
     last_good_path = None
     last_good_credit = None
+    last_good_type = "photo"
     for i, scene in enumerate(scenes):
         if results[i]:
             scene["image_path"] = results[i]
             scene["image_credit"] = chosen[i].get("credit") if chosen[i] else None
+            scene["media_type"] = chosen[i].get("type", "photo") if chosen[i] else "photo"
             last_good_path = scene["image_path"]
             last_good_credit = scene["image_credit"]
+            last_good_type = scene["media_type"]
         else:
             scene["image_path"] = last_good_path
             scene["image_credit"] = last_good_credit
+            scene["media_type"] = last_good_type
 
     # Backward-fill: if the *leading* scene(s) failed and had nothing earlier
     # to reuse, fall back to the nearest later scene's image instead of
     # leaving image_path as None (which would crash video_assembler entirely).
     next_good_path = None
     next_good_credit = None
+    next_good_type = "photo"
     for i in range(total - 1, -1, -1):
         if results[i]:
             next_good_path = scenes[i]["image_path"]
             next_good_credit = scenes[i]["image_credit"]
+            next_good_type = scenes[i]["media_type"]
         elif not scenes[i].get("image_path"):
             scenes[i]["image_path"] = next_good_path
             scenes[i]["image_credit"] = next_good_credit
+            scenes[i]["media_type"] = next_good_type
 
     missing = [i for i, scene in enumerate(scenes) if not scene.get("image_path")]
     if missing:
@@ -288,7 +367,8 @@ def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) 
 
     _write_attributions(scenes, work_dir)
 
-    print(f"[image_fetcher] Images ready for {total} scene(s) "
-          f"({len(used_ids)} unique image(s) used).")
+    video_count = sum(1 for s in scenes if s.get("media_type") == "video")
+    print(f"[image_fetcher] Media ready for {total} scene(s) "
+          f"({len(used_ids)} unique file(s) used, {video_count} video b-roll).")
 
     return scenes
