@@ -54,14 +54,43 @@ def _format_timestamp(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def build_timestamps_block(scene_start_times: list, include_intro: bool) -> str:
+def build_timestamps_block(scene_start_times: list, include_intro: bool, chapters: list = None) -> str:
     """YouTube chapter list from actual scene start times. YouTube requires
-    the first chapter at 0:00 and at least 3 chapters to render them."""
+    the first chapter at 0:00 and at least 3 chapters to render them.
+
+    Prefers real named chapters (from generate_script()'s `chapters` list,
+    the same names shown as on-screen title cards) over generic "Part N"
+    labels. Falls back to the old generic numbering if there aren't enough
+    named chapters to reach YouTube's 3-entry minimum, so short or
+    single-chapter scripts still get a usable chapter list.
+    """
     if not scene_start_times or len(scene_start_times) < 2:
         return ""
-    lines = ["0:00 Intro"] if include_intro else []
-    for i, start in enumerate(scene_start_times, 1):
-        lines.append(f"{_format_timestamp(start)} Part {i}")
+
+    named = {
+        c["scene_index"]: c["title"]
+        for c in (chapters or [])
+        if c.get("title") and 0 < c.get("scene_index", -1) < len(scene_start_times)
+    }
+
+    def _generic_lines():
+        lines = ["0:00 Intro"] if include_intro else []
+        for i, start in enumerate(scene_start_times, 1):
+            lines.append(f"{_format_timestamp(start)} Part {i}")
+        return lines
+
+    if named:
+        lines = ["0:00 Intro"] if include_intro else []
+        if not lines:
+            lines.append(f"{_format_timestamp(scene_start_times[0])} Introduction")
+        for i, start in enumerate(scene_start_times):
+            if i in named:
+                lines.append(f"{_format_timestamp(start)} {named[i]}")
+        if len(lines) < 3:
+            lines = _generic_lines()
+    else:
+        lines = _generic_lines()
+
     # YouTube only renders chapters with >= 3 entries starting at 0:00.
     if len(lines) < 3 or not lines[0].startswith("0:00"):
         return ""
@@ -70,7 +99,7 @@ def build_timestamps_block(scene_start_times: list, include_intro: bool) -> str:
 
 def enhance_metadata(content: dict, scene_start_times: list = None,
                      include_intro: bool = True, attributions_path: str = None,
-                     channel_name: str = "") -> dict:
+                     channel_name: str = "", chapters: list = None) -> dict:
     """Returns a copy of content with description/tags enhanced for search.
     `content` needs title/description/tags; everything else is optional."""
     enhanced = dict(content)
@@ -80,7 +109,7 @@ def enhance_metadata(content: dict, scene_start_times: list = None,
 
     blocks = [description.strip()] if description.strip() else []
 
-    timestamps = build_timestamps_block(scene_start_times or [], include_intro)
+    timestamps = build_timestamps_block(scene_start_times or [], include_intro, chapters)
     if timestamps and "0:00" not in description:
         blocks.append("Chapters:\n" + timestamps)
 

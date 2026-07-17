@@ -30,8 +30,6 @@ import secrets as pysecrets
 import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
-os.makedirs("output", exist_ok=True)
-
 from config import (
     ensure_work_dir, github_write_json, github_read_json,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
@@ -140,7 +138,7 @@ PAGE = """
     color: var(--muted);
     margin-bottom: 6px;
   }
-  input[type=text], input:not([type]), select {
+  input[type=text], input:not([type]), select, textarea {
     width: 100%;
     background: var(--panel-raised);
     border: 1px solid var(--hairline);
@@ -150,7 +148,11 @@ PAGE = """
     font-size: 15px;
     font-family: inherit;
   }
-  input:focus, select:focus {
+  textarea {
+    resize: vertical;
+    min-height: 90px;
+  }
+  input:focus, select:focus, textarea:focus {
     outline: none;
     border-color: var(--gold);
     box-shadow: 0 0 0 3px rgba(198,164,84,0.15);
@@ -301,6 +303,13 @@ PAGE = """
       <div class="field">
         <label class="field-label" for="topic">Topic</label>
         <input id="topic" name="topic" placeholder="e.g. The Tulip Mania bubble of 1637" required>
+        <span class="hint">Keep this short — it becomes the video title and title card. Put the details below instead.</span>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="brief">Script details / instructions (optional)</label>
+        <textarea id="brief" name="brief" rows="5" placeholder="Angle, structure, specific facts or events to cover, sources, tone notes, what to avoid, etc. As long and detailed as you like — this guides the script only, never the title."></textarea>
+        <span class="hint">Use this for detail instead of the Topic box — it won't show up on the title card.</span>
       </div>
 
       <div class="field">
@@ -399,6 +408,7 @@ const STEP_LABELS = {
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const topic = document.getElementById("topic").value;
+  const brief = document.getElementById("brief").value;
   const language = document.getElementById("language").value;
   const duration = document.getElementById("duration").value;
   const voiceGender = document.getElementById("voiceGender").value;
@@ -417,7 +427,7 @@ form.addEventListener("submit", async (e) => {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      topic, language,
+      topic, brief, language,
       duration_minutes: duration,
       voice_gender: voiceGender,
       style: videoStyle,
@@ -522,6 +532,7 @@ def _set_progress(job_id: str, step: str, fraction: float, detail: str = None):
 def run_pipeline_job(
     job_id: str,
     topic: str,
+    brief: str = "",
     language: str = DEFAULT_LANGUAGE,
     duration_minutes: float = DEFAULT_DURATION_MINUTES,
     voice_gender: str = DEFAULT_VOICE_GENDER,
@@ -534,14 +545,15 @@ def run_pipeline_job(
         work_dir = ensure_work_dir(job_id)
 
         _set_progress(job_id, "script", 0.0, detail="Starting script generation…")
-        print(f"[1/4] Generating script for: {topic} (lang={language}, ~{duration_minutes}min, style={style})")
+        print(f"[1/4] Generating script for: {topic} (brief={'yes' if brief else 'no'}, "
+              f"lang={language}, ~{duration_minutes}min, style={style})")
 
         def _script_progress(chunks_done, total_chunks):
             frac = chunks_done / total_chunks if total_chunks else 0.0
             _set_progress(job_id, "script", frac, detail=f"Writing script: chunk {chunks_done}/{total_chunks}")
 
         script = generate_script(
-            topic, language=language, duration_minutes=duration_minutes, style=style,
+            topic, brief=brief, language=language, duration_minutes=duration_minutes, style=style,
             progress_callback=_script_progress,
         )
 
@@ -593,6 +605,7 @@ def run_pipeline_job(
             style=style,
             progress_callback=_video_progress,
             music_path=BACKGROUND_MUSIC_PATH,
+            chapters=script.get("chapters"),
         )
 
         # --- Stage 3a: subtitles, SEO metadata, thumbnail (merged features) ---
@@ -602,7 +615,10 @@ def run_pipeline_job(
         try:
             if SUBTITLES_ENABLED:
                 from automation.subtitles import write_srt
-                srt_path = write_srt(script["scenes"], work_dir, include_intro, include_outro)
+                srt_path = write_srt(
+                    script["scenes"], work_dir, include_intro, include_outro,
+                    chapters=script.get("chapters"),
+                )
                 srt_url = f"/output/{job_id}/{os.path.basename(srt_path)}"
         except Exception as e:
             print(f"Warning: subtitle generation failed ({e}). Continuing without SRT.")
@@ -625,7 +641,9 @@ def run_pipeline_job(
         try:
             from automation.seo import enhance_metadata
             durations = [_get_media_duration(s["audio_path"]) for s in script["scenes"]]
-            scene_starts = compute_scene_start_times(durations, include_intro, include_outro)
+            scene_starts = compute_scene_start_times(
+                durations, include_intro, include_outro, chapters=script.get("chapters"),
+            )
             enhanced = enhance_metadata(
                 {"title": script["title"],
                  "description": script["description"],
@@ -634,6 +652,7 @@ def run_pipeline_job(
                 include_intro=include_intro,
                 attributions_path=os.path.join(work_dir, "attributions.txt"),
                 channel_name=CHANNEL_NAME,
+                chapters=script.get("chapters"),
             )
             script["description"] = enhanced["description"]
             script["tags"] = enhanced["tags"]
@@ -736,6 +755,8 @@ def generate_endpoint():
     if not topic:
         return jsonify({"error": "Missing 'topic'"}), 400
 
+    brief = request.form.get("brief") or body.get("brief") or ""
+
     language = request.form.get("language") or body.get("language") or DEFAULT_LANGUAGE
     if language not in LANGUAGES:
         return jsonify({"error": f"Unsupported language '{language}'"}), 400
@@ -770,7 +791,7 @@ def generate_endpoint():
 
     thread = threading.Thread(
         target=run_pipeline_job,
-        args=(job_id, topic, language, duration_minutes, voice_gender, style, include_intro, include_outro),
+        args=(job_id, topic, brief, language, duration_minutes, voice_gender, style, include_intro, include_outro),
         daemon=True,
     )
     thread.start()

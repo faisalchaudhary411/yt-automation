@@ -613,6 +613,11 @@ SCENE_CRF = "20"
 THREADS_PER_CLIP = max(1, (os.cpu_count() or 2) // MAX_CONCURRENT_CLIPS)
 COLOR_GRADE_FILTER = "eq=contrast=1.08:saturation=0.92:brightness=0.02,vignette=PI/5"
 
+# Mid-video named chapter title cards (e.g. "The Warning Signs"). Shorter than
+# the intro/outro cards since they're a brief beat, not a full pause.
+# automation/subtitles.py mirrors this constant to keep .srt timing in sync.
+CHAPTER_CARD_DURATION = 2.2
+
 
 def _run(cmd: list, step_name: str) -> None:
     try:
@@ -906,6 +911,24 @@ def _remux_single(path: str, final_path: str) -> str:
     return final_path
 
 
+def get_chapter_card_scene_indices(chapters: list, total_scenes: int) -> dict:
+    """Turns generate_script()'s `chapters` list into {scene_index: title} for
+    scenes that should get a chapter title card immediately before them.
+
+    Scene index 0 is deliberately excluded — a chapter card right after the
+    intro card would be redundant. Both video_assembler (real ffmpeg join)
+    and automation/subtitles.py (timestamp math) call this so they can never
+    disagree about where the cards go.
+    """
+    result = {}
+    for c in chapters or []:
+        i = c.get("scene_index")
+        title = (c.get("title") or "").strip()
+        if title and isinstance(i, int) and 0 < i < total_scenes and i not in result:
+            result[i] = title
+    return result
+
+
 def _join_mixed_transitions(
     clip_paths: list, final_path: str,
     fade_at_start: bool = True, fade_at_end: bool = True,
@@ -1019,6 +1042,7 @@ def assemble_video(
     style: str = "documentary",
     progress_callback=None,
     music_path: str = None,
+    chapters: list = None,
 ) -> str:
     from config import VIDEO_STYLES, DEFAULT_VIDEO_STYLE
     style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
@@ -1087,24 +1111,57 @@ def assemble_video(
     # crossfade a title card against the adjacent scene -- that would produce
     # a double-fade (fade to bg color, then crossfade through it again).
     # Instead, scene-to-scene crossfading only happens at the edges that
-    # AREN'T already covered by an intro/outro title card.
-    if len(scene_clip_paths) == 1:
-        scenes_joined_path = scene_clip_paths[0]
-    elif len(scene_clip_paths) == 0:
-        scenes_joined_path = None
+    # AREN'T already covered by an intro/outro/chapter title card.
+    #
+    # Named chapters (from generate_script()'s `chapters` list) split the
+    # scenes into groups, with a chapter title card hard-cut in between each
+    # group -- the same "no double-fade against a card" rule as intro/outro,
+    # just applied at however many internal points the script calls for.
+    card_by_index = get_chapter_card_scene_indices(chapters, total_scenes)
+
+    if total_scenes == 0:
+        body_pieces = []
     else:
-        scenes_joined_path = os.path.join(clip_dir, "_scenes_joined.mp4")
-        _join_mixed_transitions(
-            scene_clip_paths, scenes_joined_path,
-            fade_at_start=not include_intro,
-            fade_at_end=not include_outro,
-        )
+        groups = []
+        current_group = []
+        for i, clip_path in enumerate(scene_clip_paths):
+            if i in card_by_index and current_group:
+                groups.append(("scenes", current_group))
+                current_group = []
+                card_path = os.path.join(clip_dir, f"chapter_{i}.mp4")
+                _build_title_card(
+                    [card_by_index[i]], card_path,
+                    duration=CHAPTER_CARD_DURATION, bg_color=bg_color,
+                )
+                groups.append(("card", card_path))
+            current_group.append(clip_path)
+        if current_group:
+            groups.append(("scenes", current_group))
+
+        scene_group_positions = [idx for idx, (kind, _) in enumerate(groups) if kind == "scenes"]
+        first_scene_group = scene_group_positions[0] if scene_group_positions else None
+        last_scene_group = scene_group_positions[-1] if scene_group_positions else None
+
+        body_pieces = []
+        for idx, (kind, payload) in enumerate(groups):
+            if kind == "card":
+                body_pieces.append(payload)
+                continue
+            fade_start = (not include_intro) if idx == first_scene_group else False
+            fade_end = (not include_outro) if idx == last_scene_group else False
+            if len(payload) == 1:
+                body_pieces.append(payload[0])
+            else:
+                joined_sub_path = os.path.join(clip_dir, f"_group_{idx}.mp4")
+                _join_mixed_transitions(
+                    payload, joined_sub_path, fade_at_start=fade_start, fade_at_end=fade_end,
+                )
+                body_pieces.append(joined_sub_path)
 
     outer_pieces = []
     if intro_path:
         outer_pieces.append(intro_path)
-    if scenes_joined_path:
-        outer_pieces.append(scenes_joined_path)
+    outer_pieces.extend(body_pieces)
     if outro_path:
         outer_pieces.append(outro_path)
 
