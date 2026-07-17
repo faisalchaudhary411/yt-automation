@@ -54,6 +54,18 @@ WORDS_PER_MINUTE = 150
 MIN_ACCEPTABLE_RATIO = 0.85
 CHUNK_TARGET_WORDS = 200
 
+# Named chapters (Phase 1 of the chapter title-card feature): scripts get
+# tagged with named sections (e.g. "The Warning Signs") at natural narrative
+# turns, roughly every CHAPTER_TARGET_MINUTES of narration. video_assembler
+# will later use these to insert mid-video title cards, and the SEO module
+# uses them for real (named) YouTube chapter timestamps instead of "Part 1/2/3".
+CHAPTER_TARGET_MINUTES = 1.75      # aim for a new chapter about this often
+MIN_CHAPTERS = 1
+MAX_CHAPTERS = 7
+MIN_CHAPTER_GAP_RATIO = 0.6        # a new chapter tag this soon after the last one is dropped
+MIN_CHAPTER_GAP_WORDS_FLOOR = 60
+CHAPTER_TITLE_MAX_CHARS = 60
+
 # Cerebras
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 CEREBRAS_MODEL = "gpt-oss-120b"
@@ -106,6 +118,17 @@ def _target_word_count(duration_minutes: float) -> int:
     return round(duration_minutes * WORDS_PER_MINUTE)
 
 
+def _desired_chapter_count(duration_minutes: float) -> int:
+    """How many named chapters to aim for across the whole script. Very short
+    videos get 1 (i.e. chapters effectively disabled — no natural room for
+    named sections), longer ones get progressively more, capped so a video
+    doesn't end up with a title card every few seconds."""
+    if duration_minutes < 2.5:
+        return MIN_CHAPTERS
+    count = round(duration_minutes / CHAPTER_TARGET_MINUTES)
+    return max(MIN_CHAPTERS, min(MAX_CHAPTERS, count))
+
+
 def _scene_count_for_words(word_budget: int) -> tuple:
     scene_low = max(2, round(word_budget / 90))
     scene_high = max(scene_low + 1, round(word_budget / 50))
@@ -123,6 +146,22 @@ WRITE LIKE AN ACTUAL PERSON, NOT AN AI:
 - Do not open consecutive scenes the same way (e.g. don't start three scenes in a row with a rhetorical question, or three scenes in a row with a date/number).
 - It's fine — good, even — to use sentence fragments, short asides, and a rhetorical question here and there, the way a real narrator naturally talks. Don't overuse any single device though.
 - Avoid the "perfectly balanced paragraph" feel where every sentence is roughly the same length. Real speech is uneven."""
+
+
+def _brief_block(brief: str) -> str:
+    """Formats the user's optional detailed brief as a labeled block for the LLM.
+
+    Kept separate from `topic` everywhere so a long, detailed brief can guide
+    the actual script content without ever leaking into (and lengthening) the
+    video title.
+    """
+    brief = (brief or "").strip()
+    if not brief:
+        return ""
+    return (
+        f"\n\nBRIEF / DETAILED INSTRUCTIONS FOR THIS SCRIPT (follow closely for content, "
+        f"structure, angle, and specific facts to include — this is NOT the title):\n{brief}"
+    )
 
 
 def _urdu_style_notes(language_name: str) -> str:
@@ -150,9 +189,21 @@ def _build_metadata_prompt(language_name: str, style_key: str) -> str:
 
 Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}
 
+You will be given a short TOPIC and, sometimes, a separate BRIEF with extra detail about what
+the video should cover. The BRIEF exists to help you write a more accurate description and tags
+— it is NOT source material for the title.
+
+TITLE RULES (very important):
+- Base the title on the TOPIC, not on the BRIEF. The BRIEF may be long and detailed; the title
+  must NOT grow to absorb that detail — it goes on a small title card, so it must stay short.
+- Target 40-70 characters. HARD CAP: 90 characters, never more.
+- Stay close to the spirit of the TOPIC phrase itself — punch it up for SEO/curiosity, but don't
+  bolt on extra clauses, sub-titles, or a list of the specific points from the BRIEF.
+- Prefer a single clean clause over stacked "X: Y and Z" style titles.
+
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
-  "title": "SEO-friendly YouTube title, under 100 characters, written in {language_name}",
+  "title": "SEO-friendly YouTube title following the TITLE RULES above, written in {language_name}",
   "description": "2-3 sentence YouTube description, written in {language_name}",
   "tags": ["tag1", "tag2", "..."]
 }}
@@ -161,7 +212,8 @@ Do not include any text outside the JSON object."""
 
 
 def _build_scenes_prompt(
-    language_name: str, style_key: str, word_budget: int, is_first_chunk: bool
+    language_name: str, style_key: str, word_budget: int, is_first_chunk: bool,
+    chapter_word_budget: int = 0, chapters_so_far: list = None,
 ) -> str:
     scene_low, scene_high = _scene_count_for_words(word_budget)
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
@@ -176,9 +228,29 @@ def _build_scenes_prompt(
             "not a generic 'you won't believe what happened next' tease."
         )
 
+    chapter_guidance = ""
+    chapter_schema_line = ""
+    if chapter_word_budget:
+        used = chapters_so_far or []
+        used_text = ", ".join(f"\"{t}\"" for t in used) if used else "(none yet)"
+        chapter_guidance = f"""
+
+NAMED CHAPTERS (used for on-screen chapter cards and YouTube chapter markers):
+This script is divided into a small number of named chapters/sections — like real documentary
+channels use (e.g. "The Rise", "The Warning Signs", "The Collapse") — shown as brief title cards
+partway through the video. Aim for a new chapter roughly every {chapter_word_budget} words of
+narration, but ONLY at a genuine turn in the story, never on a rigid schedule and never mid-thought.
+Chapters used so far in this script: {used_text}. Do not reuse one of those names again.
+- To START a new chapter at a scene, add "chapter_title": "..." to that scene's JSON object —
+  a short, evocative name (2-5 words) in {language_name}.
+- Scenes that CONTINUE the current chapter should simply omit "chapter_title" (or use "").
+- It's fine, and often correct, to have zero new chapters in this particular chunk if the story
+  hasn't reached a new turn yet."""
+        chapter_schema_line = '\n      "chapter_title": "Optional — include ONLY on the scene where a new named chapter starts",'
+
     return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}
+Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}{chapter_guidance}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
@@ -186,12 +258,13 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
     {{
       "narration": "2-4 sentences of narration for this scene, written in {language_name}",
       "image_keywords": "2-4 words IN ENGLISH describing what image should show for this scene",
-      "duration_seconds": 25
+      "duration_seconds": 25,{chapter_schema_line}
     }}
   ]
 }}
 
-CRITICAL: Do NOT include title, description, or tags. Only include the "scenes" array.
+CRITICAL: Do NOT include title, description, or tags. Only include the "scenes" array (each
+scene may optionally include "chapter_title" as described above).
 CRITICAL LENGTH REQUIREMENT: the combined narration across every scene in THIS response must add up to approximately {word_budget} words in total (aim for {word_budget}-{int(word_budget * 1.15)} words — never less). Use {scene_low}-{scene_high} scenes to hit that total, with each scene's narration long enough to read aloud in roughly its duration_seconds (~2.5 words per second). If you are unsure whether you have written enough, err on the side of writing more scenes and more narration per scene, not fewer. Do not include any text outside the JSON object.
 
 CRITICAL YOUTUBE NARRATION RULES:
@@ -240,6 +313,23 @@ def _sanitize_narration(text: str) -> str:
     if text and text[-1] not in ".!?۔":
         text += "۔"
     return text.strip()
+
+
+def _sanitize_chapter_title(raw) -> str:
+    """Cleans an LLM-provided chapter title. Returns "" for anything missing,
+    non-string, or empty after cleanup — callers treat that as 'no new chapter
+    starts here', which is always a safe fallback."""
+    if not raw or not isinstance(raw, str):
+        return ""
+    text = raw.strip().strip("\"'").strip()
+    text = GARBAGE_PATTERN.sub(" ", text)
+    text = _NEVER_LEGIT_CHARS.sub(" ", text)
+    text = _URL_NOISE_PATTERN.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.rstrip(".!?۔,;:").strip()
+    if len(text) > CHAPTER_TITLE_MAX_CHARS:
+        text = text[:CHAPTER_TITLE_MAX_CHARS].rsplit(" ", 1)[0].strip()
+    return text
 
 
 def _repair_json(raw: str) -> str:
@@ -307,6 +397,7 @@ def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int
             for scene in data["scenes"]:
                 if "narration" in scene:
                     scene["narration"] = _sanitize_narration(scene["narration"])
+                scene["chapter_title"] = _sanitize_chapter_title(scene.get("chapter_title"))
         return data
     except json.JSONDecodeError:
         pass
@@ -317,6 +408,7 @@ def _parse_llm_json(raw: str, attempt_more_tokens_callback=None, max_tokens: int
             for scene in data["scenes"]:
                 if "narration" in scene:
                     scene["narration"] = _sanitize_narration(scene["narration"])
+                scene["chapter_title"] = _sanitize_chapter_title(scene.get("chapter_title"))
         return data
     except json.JSONDecodeError:
         pass
@@ -709,9 +801,10 @@ def _call_llm(client: Groq, system_prompt: str, user_content: str, max_tokens: i
 
 # ─────────────────────────── Metadata / Scenes ───────────────────
 
-def _generate_metadata(client: Groq, topic: str, language_name: str, style: str) -> dict:
+def _generate_metadata(client: Groq, topic: str, brief: str, language_name: str, style: str) -> dict:
     system_prompt = _build_metadata_prompt(language_name, style)
-    part = _call_llm(client, system_prompt, f"Topic: {topic}", max_tokens=4096)
+    user_content = f"Topic: {topic}{_brief_block(brief)}"
+    part = _call_llm(client, system_prompt, user_content, max_tokens=4096)
     return {
         "title": part.get("title") or topic,
         "description": part.get("description") or "",
@@ -720,17 +813,21 @@ def _generate_metadata(client: Groq, topic: str, language_name: str, style: str)
 
 
 def _generate_scenes_chunk(
-    client: Groq, topic: str, language_name: str, style: str,
+    client: Groq, topic: str, brief: str, language_name: str, style: str,
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
+    chapter_word_budget: int = 0, chapters_so_far: list = None,
 ) -> dict:
-    system_prompt = _build_scenes_prompt(language_name, style, word_budget, is_first_chunk)
+    system_prompt = _build_scenes_prompt(
+        language_name, style, word_budget, is_first_chunk,
+        chapter_word_budget=chapter_word_budget, chapters_so_far=chapters_so_far,
+    )
     max_tokens = min(3000, max(600, word_budget * 6))
 
     if is_first_chunk:
-        user_content = f"Topic: {topic}"
+        user_content = f"Topic: {topic}{_brief_block(brief)}"
     else:
         user_content = (
-            f"Topic: {topic}\n\n"
+            f"Topic: {topic}{_brief_block(brief)}\n\n"
             f"This continues a script already in progress. The most recent narration so far "
             f"was:\n{previous_narration_tail}\n\n"
             f"Write the NEXT part of the same script, continuing the story naturally from "
@@ -766,15 +863,42 @@ def _generate_scenes_chunk(
     return part
 
 
+def _apply_chapter_tags(scenes: list, chapter_state: dict) -> None:
+    """Walks scenes in order, keeping any chapter_title that's far enough past
+    the previous chapter's start (per chapter_state['min_gap_words']), and
+    clearing (merging into the current chapter) any that come too soon —
+    the model is asked to pace chapters naturally, but this is the safety net
+    in case it tags too eagerly. Mutates `scenes` in place and updates
+    `chapter_state` for the next chunk to continue from."""
+    for scene in scenes:
+        words = len(scene.get("narration", "").split())
+        title = _sanitize_chapter_title(scene.get("chapter_title"))
+        if title and chapter_state["words_since_last"] >= chapter_state["min_gap_words"]:
+            chapter_state["chapters_so_far"].append(title)
+            chapter_state["words_since_last"] = 0
+            scene["chapter_title"] = title
+        else:
+            scene["chapter_title"] = ""
+        chapter_state["words_since_last"] += words
+
+
 # ─────────────────────────── Public API ──────────────────────────
 
 def generate_script(
     topic: str,
+    brief: str = "",
     language: str = DEFAULT_LANGUAGE,
     duration_minutes: float = DEFAULT_DURATION_MINUTES,
     style: str = DEFAULT_VIDEO_STYLE,
     progress_callback=None,
 ) -> dict:
+    """
+    `topic` should stay short — it's what becomes the video title / title card.
+    `brief` is optional and can be as long/detailed as needed: specific facts,
+    structure, angle, sources, things to emphasize or avoid. It shapes the
+    script content but is deliberately kept out of the title-generation input
+    so a detailed brief never bloats or mismatches the title card.
+    """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in Replit Secrets.")
 
@@ -782,12 +906,30 @@ def generate_script(
     total_target_words = _target_word_count(duration_minutes)
     num_chunks = max(1, math.ceil(total_target_words / CHUNK_TARGET_WORDS))
 
+    desired_chapters = _desired_chapter_count(duration_minutes)
+    chapter_word_budget = (
+        max(120, round(total_target_words / desired_chapters)) if desired_chapters > 1 else 0
+    )
+    min_chapter_gap_words = (
+        max(MIN_CHAPTER_GAP_WORDS_FLOOR, round(chapter_word_budget * MIN_CHAPTER_GAP_RATIO))
+        if chapter_word_budget else float("inf")
+    )
+    # Starting words_since_last at the gap threshold means the very first
+    # chapter tag the model produces is always allowed — the gap guard only
+    # matters for spacing *subsequent* chapters apart.
+    chapter_state = {
+        "chapters_so_far": [],
+        "words_since_last": min_chapter_gap_words,
+        "min_gap_words": min_chapter_gap_words,
+    }
+
     client = Groq(api_key=GROQ_API_KEY)
 
-    print(f"[script_generator] Starting: topic='{topic}', target={total_target_words} words "
-          f"across {num_chunks} chunk(s)")
+    print(f"[script_generator] Starting: topic='{topic}', brief={'yes (' + str(len(brief)) + ' chars)' if brief else 'none'}, "
+          f"target={total_target_words} words across {num_chunks} chunk(s), "
+          f"chapters={'disabled' if not chapter_word_budget else f'~every {chapter_word_budget} words'}")
 
-    metadata = _generate_metadata(client, topic, language_name, style)
+    metadata = _generate_metadata(client, topic, brief, language_name, style)
     print(f"[script_generator] Metadata generated: \"{metadata['title']}\"")
 
     if progress_callback:
@@ -807,9 +949,12 @@ def generate_script(
 
         chunk_start = time.time()
         part = _generate_scenes_chunk(
-            client, topic, language_name, style, word_budget, is_first, previous_tail,
+            client, topic, brief, language_name, style, word_budget, is_first, previous_tail,
+            chapter_word_budget=chapter_word_budget, chapters_so_far=chapter_state["chapters_so_far"],
         )
         chunk_elapsed = time.time() - chunk_start
+
+        _apply_chapter_tags(part["scenes"], chapter_state)
 
         all_scenes.extend(part["scenes"])
         remaining_words -= _count_narration_words(part["scenes"])
@@ -822,19 +967,26 @@ def generate_script(
             progress_callback(chunk_index + 1, num_chunks)
 
     actual_total_words = _count_narration_words(all_scenes)
+    chapters = [
+        {"title": s["chapter_title"], "scene_index": i}
+        for i, s in enumerate(all_scenes) if s.get("chapter_title")
+    ]
     print(f"[script_generator] target={total_target_words} words, actual={actual_total_words} words, "
-          f"{len(all_scenes)} scenes across {num_chunks} chunk(s)")
+          f"{len(all_scenes)} scenes across {num_chunks} chunk(s), {len(chapters)} named chapter(s): "
+          f"{[c['title'] for c in chapters]}")
 
     return {
         "title": metadata["title"],
         "description": metadata["description"],
         "tags": metadata["tags"],
         "scenes": all_scenes,
+        "chapters": chapters,
     }
 
 
 if __name__ == "__main__":
     import sys
     topic = sys.argv[1] if len(sys.argv) > 1 else "The Tulip Mania bubble of 1637"
-    result = generate_script(topic)
+    brief = sys.argv[2] if len(sys.argv) > 2 else ""
+    result = generate_script(topic, brief=brief)
     print(json.dumps(result, indent=2, ensure_ascii=False))
