@@ -66,6 +66,47 @@ def _strip_narration_markers_for_captions(text: str) -> str:
 
     return text.strip()
 
+
+# ---------------------------------------------------------------------------
+# Lower-third stat extraction (Phase 5 polish)
+# ---------------------------------------------------------------------------
+# Purely rule-based (no LLM call): looks for the kind of concrete number a
+# documentary would want to stamp on screen -- a currency amount, a
+# percentage, a year, or an "N-year(s)" span. Digits/currency symbols read
+# fine regardless of the narration's language, so this works even inside
+# Urdu narration with embedded Latin numerals. Only the FIRST match (by the
+# priority order below) is used per scene, so a scene never gets more than
+# one stamp even if it mentions several numbers.
+
+_STAT_CURRENCY_RE = re.compile(
+    r"[£$€]\s?\d[\d,]*(?:\.\d+)?\s?(?:thousand|million|billion|trillion|k|m|bn)?",
+    re.IGNORECASE,
+)
+_STAT_PERCENT_RE = re.compile(r"\b\d+(?:\.\d+)?\s?%")
+_STAT_YEAR_SPAN_RE = re.compile(r"\b\d+[\s-]?years?[\s-]?old\b", re.IGNORECASE)
+_STAT_BIG_NUMBER_RE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
+_STAT_MULTIPLIER_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s?(?:thousand|million|billion|trillion)\b", re.IGNORECASE
+)
+_STAT_YEAR_RE = re.compile(r"\b(1[5-9]\d{2}|20\d{2})\b")
+
+_STAT_PATTERNS = [
+    _STAT_CURRENCY_RE, _STAT_PERCENT_RE, _STAT_YEAR_SPAN_RE,
+    _STAT_BIG_NUMBER_RE, _STAT_MULTIPLIER_RE, _STAT_YEAR_RE,
+]
+
+
+def _extract_stat(text: str) -> str:
+    """Returns the first documentary-worthy stat found in `text`, or "" if
+    none. `text` should already have B-ROLL/PAUSE/EMPHASIS markers stripped."""
+    if not text:
+        return ""
+    for pattern in _STAT_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            return m.group(0).strip()
+    return ""
+
 try:
     from bidi.algorithm import get_display
     _HAS_BIDI = True
@@ -545,8 +586,13 @@ def _write_caption_pngs(text, width, height, fontsize, bottom_margin, duration, 
     return png_infos
 
 
-def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, subtitle_fontsize=46):
-    """Renders a title card to a full-size transparent PNG."""
+def _render_title_card_png(
+    lines, width, height, out_path, title_fontsize=92, subtitle_fontsize=46,
+    accent_color: tuple = (198, 164, 84),
+):
+    """Renders a title card to a full-size transparent PNG. `accent_color` draws
+    a short bar under the title -- gives each video style (see VIDEO_STYLES) its
+    own on-screen color identity instead of every style's cards looking alike."""
     if not _HAS_PIL:
         raise RuntimeError("Pillow is required. Install it: pip install pillow")
 
@@ -569,10 +615,13 @@ def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, su
     title_lines = [_prepare_text_for_rendering(line, is_title_latin) for line in title_lines]
     subtitle_lines = [_prepare_text_for_rendering(line, is_sub_latin) for line in subtitle_lines]
 
+    bar_h = 6
+    bar_gap = 22  # space above and below the accent bar
     title_line_h = title_fontsize + 20
     sub_line_h = subtitle_fontsize + 14
-    gap = 30 if subtitle_lines else 0
-    total_h = len(title_lines) * title_line_h + gap + len(subtitle_lines) * sub_line_h
+    show_bar = bool(title_lines)  # every card with a title gets the style's accent bar
+    bar_block_h = (bar_gap * 2 + bar_h) if show_bar else 0
+    total_h = len(title_lines) * title_line_h + bar_block_h + len(subtitle_lines) * sub_line_h
     y_cursor = (height - total_h) // 2
 
     for line in title_lines:
@@ -585,8 +634,15 @@ def _render_title_card_png(lines, width, height, out_path, title_fontsize=92, su
         draw.text((x, y), line, font=title_font, fill=(255, 255, 255, 255))
         y_cursor += title_line_h
 
+    if show_bar:
+        bar_y = y_cursor + bar_gap
+        draw.rectangle(
+            [width // 2 - 60, bar_y, width // 2 + 60, bar_y + bar_h],
+            fill=(*accent_color, 255),
+        )
+        y_cursor += bar_block_h
+
     if subtitle_lines:
-        y_cursor += gap - 10
         for line in subtitle_lines:
             bb = draw.textbbox((0, 0), line, font=sub_font)
             text_w = bb[2] - bb[0]
@@ -711,9 +767,54 @@ def _zoompan_expr(index: int, zoom_rate: float) -> str:
     return f"z='{z_expr}':x='{x_expr}':y='{y_expr}'"
 
 
+def _render_lower_third_png(
+    stat_text: str, width: int, height: int, out_path: str,
+    accent_color: tuple = (198, 164, 84), fontsize: int = 54,
+) -> str:
+    """Renders a brief stat-callout graphic (a year, currency amount, a
+    percentage) as a transparent PNG: a dark box with a colored accent
+    stripe on its left edge. Positioned bottom-LEFT specifically so it never
+    collides with the bottom-CENTER captions or the bottom-RIGHT channel
+    watermark (see _watermark_filter)."""
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required. Install it: pip install pillow")
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    is_latin = _is_latin_text(stat_text)
+    font_path = _resolve_font_path(for_latin=is_latin)
+    font = _load_font_for_rendering(font_path, fontsize, is_latin)
+    text = _prepare_text_for_rendering(stat_text, is_latin)
+
+    bb = draw.textbbox((0, 0), text, font=font)
+    text_w = bb[2] - bb[0]
+    text_h = bb[3] - bb[1]
+
+    pad_x, pad_y = 28, 18
+    stripe_w = 6
+    box_w = text_w + pad_x * 2 + stripe_w
+    box_h = text_h + pad_y * 2
+
+    box_x0 = 60
+    box_y0 = height - 210 - box_h  # well above the caption band near the bottom
+    box_x1 = box_x0 + box_w
+    box_y1 = box_y0 + box_h
+
+    draw.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(10, 12, 18, 200))
+    draw.rectangle([box_x0, box_y0, box_x0 + stripe_w, box_y1], fill=(*accent_color, 255))
+
+    text_x = box_x0 + stripe_w + pad_x - bb[0]
+    text_y = box_y0 + pad_y - bb[1]
+    draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255, 255))
+
+    img.save(out_path)
+    return out_path
+
+
 def _build_scene_clip(
     scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008,
-    channel_name: str = None,
+    channel_name: str = None, accent_color: tuple = (198, 164, 84),
 ) -> str:
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
@@ -735,6 +836,18 @@ def _build_scene_clip(
         narration_text, width, height, fontsize, bottom_margin=90,
         duration=duration, out_dir=clip_dir, prefix=f"scene_{index:03d}", for_latin=is_latin,
     )
+
+    from config import LOWER_THIRDS_ENABLED
+    lower_third_info = None
+    if LOWER_THIRDS_ENABLED and duration >= 2.5:
+        stat_text = _extract_stat(narration_text)
+        if stat_text:
+            lt_start = 0.3
+            lt_end = min(duration - 0.2, lt_start + 3.2)
+            if lt_end > lt_start:
+                lt_path = os.path.join(clip_dir, f"scene_{index:03d}_stat.png")
+                _render_lower_third_png(stat_text, width, height, lt_path, accent_color=accent_color)
+                lower_third_info = {"path": lt_path, "start": lt_start, "end": lt_end}
 
     watermark_filter = _watermark_filter(channel_name)
 
@@ -763,19 +876,31 @@ def _build_scene_clip(
 
     for info in caption_pngs:
         cmd += ["-loop", "1", "-i", info["path"]]
+    if lower_third_info:
+        cmd += ["-loop", "1", "-i", lower_third_info["path"]]
 
     filters = [f"[0:v]{','.join(base_filters)}[base]"]
 
     current_label = "[base]"
     for i, info in enumerate(caption_pngs):
         input_idx = 2 + i
-        out_label = f"[cap{i}]" if i < len(caption_pngs) - 1 else "[vcap]"
+        is_last_overlay = (i == len(caption_pngs) - 1) and not lower_third_info
+        out_label = f"[cap{i}]" if not is_last_overlay else "[vcap]"
         start = info["start"]
         end = info["end"]
         filters.append(
             f"{current_label}[{input_idx}:v]overlay=0:0:enable='between(t\\,{start:.3f}\\,{end:.3f})'{out_label}"
         )
         current_label = out_label
+
+    if lower_third_info:
+        lt_input_idx = 2 + len(caption_pngs)
+        start = lower_third_info["start"]
+        end = lower_third_info["end"]
+        filters.append(
+            f"{current_label}[{lt_input_idx}:v]overlay=0:0:enable='between(t\\,{start:.3f}\\,{end:.3f})'[vstat]"
+        )
+        current_label = "[vstat]"
 
     # NOTE: we deliberately do NOT pad the clip's tail with tpad/apad here.
     # xfade/acrossfade (used later when crossfading consecutive clips) blend
@@ -819,9 +944,10 @@ def _build_title_card(
     height: int = 1080,
     fps: int = SCENE_FPS,
     bg_color: str = "0x141E30",
+    accent_color: tuple = (198, 164, 84),
 ) -> str:
     png_path = out_path + ".title.png"
-    _render_title_card_png(lines, width, height, png_path)
+    _render_title_card_png(lines, width, height, png_path, accent_color=accent_color)
 
     fade_out_start = max(0.0, duration - 0.6)
 
@@ -837,6 +963,35 @@ def _build_title_card(
         out_path,
     ]
     _run(cmd, "Title card render")
+    return out_path
+
+
+def _build_logo_sting(
+    logo_path: str, out_path: str, duration: float, bg_color: str,
+    width: int = 1920, height: int = 1080, fps: int = SCENE_FPS,
+) -> str:
+    """A brief (~1-1.5s) branded opener: the channel logo faded in/out over a
+    solid background, shown once before the intro title card. Scales the
+    logo to fit within ~40% of the frame, preserving its aspect ratio,
+    regardless of the source image's own size/shape."""
+    max_w = int(width * 0.4)
+    max_h = int(height * 0.4)
+    fade_out_start = max(0.0, duration - 0.4)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-i", logo_path,
+        "-filter_complex",
+        f"[2:v]scale='min({max_w},iw)':'min({max_h},ih)':force_original_aspect_ratio=decrease[logo];"
+        f"[0:v][logo]overlay=(W-w)/2:(H-h)/2,fade=t=in:st=0:d=0.3,fade=t=out:st={fade_out_start}:d=0.4",
+        "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
+        "-t", str(duration), "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest",
+        out_path,
+    ]
+    _run(cmd, "Logo sting render")
     return out_path
 
 
@@ -1064,16 +1219,27 @@ def assemble_video(
     music_path: str = None,
     chapters: list = None,
 ) -> str:
-    from config import VIDEO_STYLES, DEFAULT_VIDEO_STYLE
+    from config import (
+        VIDEO_STYLES, DEFAULT_VIDEO_STYLE, LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
+    )
     style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
     bg_color = style_conf["bg_color"]
     zoom_rate = style_conf["zoom_rate"]
+    accent_color = style_conf.get("accent_color", (198, 164, 84))
+    crossfade_seconds = style_conf.get("crossfade_seconds", CROSSFADE_SECONDS)
 
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
 
+    logo_sting_path = None
     intro_path = None
     outro_path = None
+
+    if include_intro and LOGO_STING_ENABLED and CHANNEL_LOGO_PATH and os.path.isfile(CHANNEL_LOGO_PATH):
+        logo_sting_path = _build_logo_sting(
+            CHANNEL_LOGO_PATH, os.path.join(clip_dir, "logo_sting.mp4"),
+            duration=LOGO_STING_DURATION, bg_color=bg_color,
+        )
 
     if include_intro:
         subtitle = f"A {channel_name} Story" if channel_name else "A Documentary Story"
@@ -1081,7 +1247,7 @@ def assemble_video(
             [title or "", subtitle],
             os.path.join(clip_dir, "intro.mp4"),
             duration=3.5,
-            bg_color=bg_color,
+            bg_color=bg_color, accent_color=accent_color,
         )
 
     total_scenes = len(scenes)
@@ -1093,7 +1259,7 @@ def assemble_video(
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLIPS) as executor:
         futures = {
-            executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate, channel_name=channel_name): i
+            executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate, channel_name=channel_name, accent_color=accent_color): i
             for i, scene in enumerate(scenes)
         }
         for future in as_completed(futures):
@@ -1109,7 +1275,7 @@ def assemble_video(
             ["Thanks for watching!", subtitle],
             os.path.join(clip_dir, "outro.mp4"),
             duration=4.0,
-            bg_color=bg_color,
+            bg_color=bg_color, accent_color=accent_color,
         )
 
     if progress_callback:
@@ -1151,7 +1317,7 @@ def assemble_video(
                 card_path = os.path.join(clip_dir, f"chapter_{i}.mp4")
                 _build_title_card(
                     [card_by_index[i]], card_path,
-                    duration=CHAPTER_CARD_DURATION, bg_color=bg_color,
+                    duration=CHAPTER_CARD_DURATION, bg_color=bg_color, accent_color=accent_color,
                 )
                 groups.append(("card", card_path))
             current_group.append(clip_path)
@@ -1175,10 +1341,13 @@ def assemble_video(
                 joined_sub_path = os.path.join(clip_dir, f"_group_{idx}.mp4")
                 _join_mixed_transitions(
                     payload, joined_sub_path, fade_at_start=fade_start, fade_at_end=fade_end,
+                    crossfade_seconds=crossfade_seconds,
                 )
                 body_pieces.append(joined_sub_path)
 
     outer_pieces = []
+    if logo_sting_path:
+        outer_pieces.append(logo_sting_path)
     if intro_path:
         outer_pieces.append(intro_path)
     outer_pieces.extend(body_pieces)
