@@ -178,7 +178,8 @@ URDU STYLE GUIDANCE (very important — this is what separates a real Pakistani 
 - Vary sentence openings and connector words aggressively. Do not repeat the same connector (e.g. "لیکن", "اس کے بعد", "پھر") in every single sentence — real speech doesn't chain scenes that mechanically.
 - Use direct address occasionally — a rhetorical question aimed straight at the viewer ("آپ نے کبھی سوچا ہے...") lands well in this format, but don't repeat that exact device in every scene.
 - Short, punchy sentences are good for narration, but not every sentence needs to be short — let a few longer, more descriptive sentences appear where the story calls for it, the way a person telling a story naturally varies their pace.
-- Avoid literal, calque-like idioms. If an idea would sound stiff or foreign translated directly, rephrase it the way it's actually said in Pakistani Urdu."""
+- Avoid literal, calque-like idioms. If an idea would sound stiff or foreign translated directly, rephrase it the way it's actually said in Pakistani Urdu.
+- CRITICAL FOR TTS: write PROPER NOUNS — people's names, company names, place names — phonetically IN URDU SCRIPT, the way a Pakistani news anchor would say and write them, not in Latin/English letters. For example write "نک لیسن" not "Nick Leeson", "بیئرنگز بینک" not "Barings Bank", "نکئی" not "Nikkei". The text-to-speech voice reads Urdu script naturally but stumbles badly on raw English letters dropped into an Urdu sentence — every name left in Latin script comes out mispronounced and jarring."""
 
 
 # ─────────────────────────── Prompt Builders ───────────────────────

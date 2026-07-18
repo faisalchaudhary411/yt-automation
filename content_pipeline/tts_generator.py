@@ -49,14 +49,13 @@ what should be displayed):
      the number-spelling functions below convert digit sequences into full
      Urdu words rather than leaving bare digits for the voice to guess at.
 
-     HONESTY NOTE on the number spelling: Urdu number words from 21-99 (other
-     than round tens like 20/30/40/...) are irregular -- similar to Hindi --
-     and not something that can be reliably reconstructed from general
-     knowledge without risking a wrong word. Rather than guess and risk
-     introducing a NEW mispronunciation, non-round two-digit numbers fall
-     back to reading each digit separately (safe, if less natural). If fully
-     natural compound number words matter, provide a verified Urdu 1-99
-     number chart and _URDU_COMPOUND_TENS below can be filled in properly.
+     NOTE on the number spelling: _URDU_COMPOUND_TENS below has the full
+     21-99 Urdu number chart filled in (standard Hindustani/Urdu numeral
+     vocabulary), so most numbers now read as a natural compound word (e.g.
+     827 -> "آٹھ سو ستائیس", not digit-by-digit). Digit-by-digit reading is
+     now only a fallback for genuinely out-of-range input. If you ever hear
+     a specific number mispronounced, that's a one-line dict fix -- just
+     report the exact number.
 """
 
 import os
@@ -141,18 +140,24 @@ def _strip_narration_markers(text: str) -> str:
 # the symbol in English mid-Urdu-sentence, which is a jarring language switch.
 _PERCENT_RE = re.compile(r"(\d[\d,.]*)\s*%")
 
-# "$500" -> "500 ڈالر" (dollar). Same reasoning as above -- spelled out in
-# Urdu so the whole sentence stays in one language/register.
+# "$500" -> "500 ڈالر" (dollar), "£500" -> "500 پاؤنڈ" (pound), "€500" -> "500
+# یورو" (euro). Same reasoning as above -- spelled out in Urdu so the whole
+# sentence stays in one language/register. (£/€ were missing entirely before
+# -- a bare "£827 million" left the £ symbol for the Urdu voice to stumble on.)
 _DOLLAR_PREFIX_RE = re.compile(r"\$\s*(\d[\d,.]*)")
+_POUND_PREFIX_RE = re.compile(r"£\s*(\d[\d,.]*)")
+_EURO_PREFIX_RE = re.compile(r"€\s*(\d[\d,.]*)")
 
 
 def _normalize_numbers_and_currency(text: str) -> str:
-    """Spells out %/$ in Urdu words so the voice doesn't switch languages
+    """Spells out %/$/£/€ in Urdu words so the voice doesn't switch languages
     mid-sentence to read a bare symbol."""
     if not text:
         return text
     text = _PERCENT_RE.sub(r"\1 فیصد", text)
     text = _DOLLAR_PREFIX_RE.sub(r"\1 ڈالر", text)
+    text = _POUND_PREFIX_RE.sub(r"\1 پاؤنڈ", text)
+    text = _EURO_PREFIX_RE.sub(r"\1 یورو", text)
     return text
 
 
@@ -169,6 +174,14 @@ _PRONUNCIATION_FIXES = {
     # the intended meaning in history/finance narration) and other readings
     # like "مَلَک" (malak/angel). The damma (ُ) forces the "mulk" reading.
     "ملک": "مُلک",
+    # "بنا" (banaa, "made/built" -- e.g. "بنا دیا") was being read by the
+    # voice as "بن" (ban, "become"), dropping the long-vowel ending. The
+    # fatha forces the intended "banaa" reading instead.
+    "بنا": "بَنا",
+    # "بنک" (a shorter alternate spelling of "bank") was being mispronounced;
+    # "بینک" is the standard Urdu spelling for the loanword and reads
+    # correctly, so any occurrence of the shorter form is normalized to it.
+    "بنک": "بینک",
 }
 
 _PRONUNCIATION_FIX_PATTERNS = {
@@ -250,8 +263,8 @@ def _transliterate_english_loanwords(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Bare digits force the same kind of script/phonetic-rules switch as English
 # loanwords. Spelling numbers out in Urdu words keeps the whole utterance in
-# one system. See the HONESTY NOTE in the module docstring re: irregular
-# 21-99 compound words falling back to digit-by-digit reading.
+# one system -- see the NOTE in the module docstring: the full 21-99 chart
+# is filled in below, so this reads as natural compound words, not digits.
 
 _URDU_ONES = {
     0: "صفر", 1: "ایک", 2: "دو", 3: "تین", 4: "چار", 5: "پانچ",
@@ -268,23 +281,38 @@ _URDU_TENS_ROUND = {
     60: "ساٹھ", 70: "ستر", 80: "اسی", 90: "نوے",
 }
 
-# Irregular compound tens (21, 22, 23, ... 91-99) are NOT filled in here --
-# see the HONESTY NOTE above. Paste a verified Urdu 1-99 number chart to get
-# these filled in with confidence; e.g. _URDU_COMPOUND_TENS[83] = "تراسی".
-#
-# Exception: 47 is added below since "1947" (Partition/independence) comes up
-# constantly in Pakistani history content and "انیس سو سینتالیس" is an
-# extremely well-established, unambiguous term -- confidence here is much
-# higher than for an arbitrary two-digit number. If it turns out wrong when
-# you listen to it, tell me and I'll pull it back out.
+# Full Urdu compound-tens chart (21-99, excluding round tens already in
+# _URDU_TENS_ROUND above). Standard Hindustani/Urdu numeral vocabulary --
+# the same words used in Pakistani news, textbooks, and everyday counting.
+# If you listen to a generated video and hear one of these mispronounced or
+# using an unfamiliar regional variant, tell Claude the specific number and
+# it's a one-line fix (each entry below is independent).
 _URDU_COMPOUND_TENS = {
-    47: "سینتالیس",
+    21: "اکیس", 22: "بائیس", 23: "تیئس", 24: "چوبیس", 25: "پچیس",
+    26: "چھبیس", 27: "ستائیس", 28: "اٹھائیس", 29: "انتیس",
+    31: "اکتیس", 32: "بتیس", 33: "تینتیس", 34: "چونتیس", 35: "پینتیس",
+    36: "چھتیس", 37: "سینتیس", 38: "اڑتیس", 39: "انتالیس",
+    41: "اکتالیس", 42: "بیالیس", 43: "تینتالیس", 44: "چوالیس",
+    45: "پینتالیس", 46: "چھیالیس",
+    47: "سینتالیس",  # "1947" (Partition) makes this the best-confirmed entry
+    48: "اڑتالیس", 49: "انچاس",
+    51: "اکاون", 52: "باون", 53: "ترپن", 54: "چون", 55: "پچپن",
+    56: "چھپن", 57: "ستاون", 58: "اٹھاون", 59: "انسٹھ",
+    61: "اکسٹھ", 62: "باسٹھ", 63: "تریسٹھ", 64: "چونسٹھ", 65: "پینسٹھ",
+    66: "چھیاسٹھ", 67: "سڑسٹھ", 68: "اڑسٹھ", 69: "انہتر",
+    71: "اکہتر", 72: "بہتر", 73: "تہتر", 74: "چوہتر", 75: "پچھتر",
+    76: "چھہتر", 77: "ستتر", 78: "اٹھہتر", 79: "انیاسی",
+    81: "اکیاسی", 82: "بیاسی", 83: "تراسی", 84: "چوراسی", 85: "پچاسی",
+    86: "چھیاسی", 87: "ستاسی", 88: "اٹھاسی", 89: "نواسی",
+    91: "اکیانوے", 92: "بیانوے", 93: "ترانوے", 94: "چورانوے",
+    95: "پچانوے", 96: "چھیانوے", 97: "ستانوے", 98: "اٹھانوے", 99: "ننانوے",
 }
 
 
 def _urdu_two_digit_words(n: int) -> str:
-    """Converts 0-99 to Urdu words. Falls back to digit-by-digit reading for
-    irregular compounds not yet in _URDU_COMPOUND_TENS."""
+    """Converts 0-99 to Urdu words using the full compound-tens chart above.
+    Digit-by-digit reading is now only a safety net for out-of-range input
+    (shouldn't trigger for any normal 0-99 number)."""
     if n < 0 or n > 99:
         return str(n)
     if n < 10:
@@ -368,6 +396,26 @@ def _spell_out_numbers(text: str) -> str:
 # Urdu text pre-processing for better TTS output
 # ---------------------------------------------------------------------------
 
+def _preprocess_generic_text(text: str) -> str:
+    """Lightweight preprocessing for non-Urdu languages (English, Spanish,
+    etc.): strips script-writing markers and ensures clean sentence-ending
+    punctuation, but does NOT spell out numbers/currency into Urdu words or
+    run Urdu-specific pronunciation fixes -- those neural voices read "$827
+    million", "40%", "1995" etc. natively just fine on their own, and forcing
+    Urdu-script number words into them is exactly what used to make English
+    narration seem to "skip" every number (the voice couldn't read the Urdu
+    text it had been given)."""
+    if not text:
+        return text
+
+    text = _strip_narration_markers(text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip()
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
 def _preprocess_urdu_text(text: str) -> str:
     """
     Cleans and prepares Urdu text for TTS to sound more natural.
@@ -431,9 +479,21 @@ def _preprocess_urdu_text(text: str) -> str:
     return text.strip()
 
 
-def _rate_to_edge_format(rate: str) -> str:
-    """Converts a friendly rate name to the percent string edge-tts's Communicate expects."""
-    return {"slow": "-10%", "default": "+0%", "fast": "+10%"}.get(rate, "+0%")
+_URDU_LANG_CODES = ("ur", "urd", "urdu", "ur-pk", "ur-in")
+
+
+def _rate_to_edge_format(rate: str, language: str = "ur") -> str:
+    """Converts a friendly rate name to the percent string edge-tts's
+    Communicate expects. Non-Urdu neural voices (e.g. English) have a
+    noticeably faster natural cadence at the same relative rate offset, so
+    they get an extra -10 points across the board to actually sound "slow"
+    rather than merely "slightly less fast"."""
+    base = {"slow": -10, "default": 0, "fast": 10}.get(rate, 0)
+    lang = (language or "ur").lower().strip()
+    if lang not in _URDU_LANG_CODES:
+        base -= 10
+    base = max(base, -50)
+    return f"{base:+d}%"
 
 
 def _pitch_to_edge_format(pitch: str) -> str:
@@ -532,12 +592,18 @@ def _resolve_voice(language: str, voice_gender: str) -> str:
 # Async TTS generation
 # ---------------------------------------------------------------------------
 
-async def _tts_edge_async(text: str, out_path: str, voice: str, rate: str = "slow", pitch: str = "default"):
+async def _tts_edge_async(
+    text: str, out_path: str, voice: str, rate: str = "slow", pitch: str = "default",
+    language: str = "ur",
+):
     """
     Generates TTS audio using edge-tts.
 
     rate: "slow" | "default" | "fast" — passed as a real Communicate parameter
     pitch: "low" | "default" | "high" — passed as a real Communicate parameter
+    language: which text preprocessing to apply (see _preprocess_urdu_text vs
+    _preprocess_generic_text below) -- this MUST match the actual narration
+    language, or numbers/loanwords get spelled out into the wrong script.
 
     IMPORTANT: edge-tts's Communicate class does not parse SSML embedded in its
     `text` argument -- it treats that string as literal spoken text. Previous
@@ -545,17 +611,25 @@ async def _tts_edge_async(text: str, out_path: str, voice: str, rate: str = "slo
     which edge-tts then read aloud verbatim (the actual cause of narration
     speaking its own markup). Prosody is now set the only way edge-tts actually
     supports it: as real constructor keyword arguments. Script-writing markers
-    like (PAUSE)/(EMPHASIS)/[B-ROLL: ...] are stripped in _preprocess_urdu_text
-    before any text reaches this function, for the same underlying reason --
-    they are not spoken content.
+    like (PAUSE)/(EMPHASIS)/[B-ROLL: ...] are stripped before any text reaches
+    this function, for the same underlying reason -- they are not spoken content.
     """
-    processed_text = _preprocess_urdu_text(text)
+    lang = (language or "ur").lower().strip()
+    if lang in _URDU_LANG_CODES:
+        processed_text = _preprocess_urdu_text(text)
+    else:
+        # BUG FIX: this used to always call _preprocess_urdu_text regardless
+        # of language, which spelled English numbers/currency out into Urdu
+        # words ("827" -> Urdu digit-words) and fed that Urdu script to an
+        # English voice -- which can't read it, so numbers seemed to just
+        # vanish from English narration entirely.
+        processed_text = _preprocess_generic_text(text)
     processed_text = _split_long_sentences(processed_text)
 
     communicate = edge_tts.Communicate(
         processed_text,
         voice,
-        rate=_rate_to_edge_format(rate),
+        rate=_rate_to_edge_format(rate, language=lang),
         pitch=_pitch_to_edge_format(pitch),
     )
     await communicate.save(out_path)
@@ -571,7 +645,7 @@ def generate_scene_audio(
 ):
     """Writes an mp3 to out_path using edge-tts with Pakistani Urdu voice."""
     voice = _resolve_voice(language, voice_gender)
-    asyncio.run(_tts_edge_async(text, out_path, voice, rate, pitch))
+    asyncio.run(_tts_edge_async(text, out_path, voice, rate, pitch, language=language))
 
 
 async def _generate_all_async(
@@ -596,7 +670,7 @@ async def _generate_all_async(
         narration = scene.get("narration", "")
 
         async with semaphore:
-            await _tts_edge_async(narration, out_path, voice, rate, pitch)
+            await _tts_edge_async(narration, out_path, voice, rate, pitch, language=language)
 
         scene["audio_path"] = out_path
         done_count += 1
