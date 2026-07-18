@@ -236,6 +236,42 @@ def _write_attributions(scenes: list, work_dir: str) -> None:
     print(f"[image_fetcher] {len(credited)} image(s) require attribution — see {path}")
 
 
+def fetch_thumbnail_image(keywords: str, work_dir: str) -> str:
+    """Downloads ONE dedicated background photo for the YouTube thumbnail,
+    using a search query built for visual impact (see the "thumbnail_keywords"
+    field generate_script() now returns) rather than reusing whatever image a
+    random narration scene happened to end up with. A per-scene image is
+    chosen to match that scene's specific narration line, which is often a
+    poor, unrelated-looking thumbnail (e.g. an establishing shot) -- this
+    searches specifically for a striking, on-topic image for the whole video.
+
+    Photos only (no video b-roll -- a thumbnail needs a single still frame).
+    Returns the downloaded file path, or "" if no image could be found/
+    downloaded (caller should fall back to a solid brand-colored backdrop,
+    which generate_thumbnail() already does automatically for a missing path).
+    """
+    candidates = _search_pexels(keywords)
+    if not candidates:
+        words = keywords.split()
+        broader = " ".join(words[-2:]) if len(words) > 2 else None
+        if broader:
+            candidates = _search_pexels(broader)
+    if not candidates:
+        candidates = _search_wikimedia_commons(keywords)
+
+    if not candidates:
+        print(f"[image_fetcher] No thumbnail image found for '{keywords}' -- "
+              "generate_thumbnail() will fall back to a solid backdrop.")
+        return ""
+
+    out_path = os.path.join(work_dir, "thumbnail_bg.jpg")
+    if _download(candidates[0]["url"], out_path):
+        return out_path
+
+    print(f"[image_fetcher] Thumbnail image download failed for '{keywords}'.")
+    return ""
+
+
 def fetch_all_scene_images(scenes: list, work_dir: str, progress_callback=None) -> list:
     """
     scenes: list of scene dicts (each with "image_keywords")

@@ -966,26 +966,80 @@ def _build_title_card(
     return out_path
 
 
+def _render_logo_sting_png(
+    logo_path: str, width: int, height: int, out_path: str,
+    accent_color: tuple = (198, 164, 84), channel_name: str = None,
+) -> str:
+    """Composites the logo + a colored accent bar + the channel name into one
+    PNG (same technique as the title cards), scaling the logo to fit within
+    ~34% of the frame while preserving its aspect ratio. This composited
+    frame then gets a gentle zoom-in via ffmpeg (see _build_logo_sting) --
+    the same Ken Burns technique already used for photo scenes, applied here
+    at a much subtler rate so a plain static logo doesn't feel like a dead
+    frame."""
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required. Install it: pip install pillow")
+
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+    logo = Image.open(logo_path).convert("RGBA")
+    max_w, max_h = int(width * 0.34), int(height * 0.34)
+    scale = min(max_w / logo.width, max_h / logo.height, 1.0)
+    logo = logo.resize((max(1, round(logo.width * scale)), max(1, round(logo.height * scale))), Image.LANCZOS)
+
+    logo_x = (width - logo.width) // 2
+    logo_y = (height - logo.height) // 2 - (30 if channel_name else 0)
+    canvas.paste(logo, (logo_x, logo_y), logo)
+
+    draw = ImageDraw.Draw(canvas)
+    bar_y = logo_y + logo.height + 26
+    draw.rectangle([width // 2 - 50, bar_y, width // 2 + 50, bar_y + 5], fill=(*accent_color, 255))
+
+    if channel_name:
+        font_path = _resolve_font_path(for_latin=True)
+        if font_path:
+            font = ImageFont.truetype(font_path, 34)
+            text = channel_name.upper()
+            bb = draw.textbbox((0, 0), text, font=font)
+            text_w = bb[2] - bb[0]
+            tx = (width - text_w) // 2 - bb[0]
+            ty = bar_y + 22 - bb[1]
+            for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+                draw.text((tx + dx, ty + dy), text, font=font, fill=(0, 0, 0, 160))
+            draw.text((tx, ty), text, font=font, fill=(255, 255, 255, 255))
+
+    canvas.save(out_path)
+    return out_path
+
+
 def _build_logo_sting(
     logo_path: str, out_path: str, duration: float, bg_color: str,
+    accent_color: tuple = (198, 164, 84), channel_name: str = None,
     width: int = 1920, height: int = 1080, fps: int = SCENE_FPS,
 ) -> str:
-    """A brief (~1-1.5s) branded opener: the channel logo faded in/out over a
-    solid background, shown once before the intro title card. Scales the
-    logo to fit within ~40% of the frame, preserving its aspect ratio,
-    regardless of the source image's own size/shape."""
-    max_w = int(width * 0.4)
-    max_h = int(height * 0.4)
+    """A brief (~1-1.5s) branded opener shown once before the intro title
+    card: the composited logo/accent-bar/channel-name frame from
+    _render_logo_sting_png, given a gentle zoom-in (same Ken Burns technique
+    as photo scenes, at a subtler rate) and the same vignette/color-grade
+    treatment as everything else, rather than sitting as a flat static card."""
+    clip_dir = os.path.dirname(out_path)
+    png_path = out_path + ".sting.png"
+    _render_logo_sting_png(logo_path, width, height, png_path, accent_color=accent_color, channel_name=channel_name)
+
     fade_out_start = max(0.0, duration - 0.4)
+    total_frames = int(duration * fps)
+    logo_zoom_rate = 0.0006  # gentle -- this is a brief brand beat, not a Ken Burns scene
 
     cmd = [
         "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
+        "-loop", "1", "-i", png_path,
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-i", logo_path,
         "-filter_complex",
-        f"[2:v]scale='min({max_w},iw)':'min({max_h},ih)':force_original_aspect_ratio=decrease[logo];"
-        f"[0:v][logo]overlay=(W-w)/2:(H-h)/2,fade=t=in:st=0:d=0.3,fade=t=out:st={fade_out_start}:d=0.4",
+        f"color=c={bg_color}:s={width}x{height}:r={fps}[bg];"
+        f"[bg][0:v]overlay=(W-w)/2:(H-h)/2:format=auto,"
+        f"zoompan={_zoompan_expr(0, logo_zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps},"
+        f"{COLOR_GRADE_FILTER},"
+        f"fade=t=in:st=0:d=0.3,fade=t=out:st={fade_out_start}:d=0.4",
         "-c:v", "libx264", "-preset", INTERMEDIATE_PRESET, "-crf", SCENE_CRF,
         "-t", str(duration), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2", "-shortest",
@@ -1239,6 +1293,7 @@ def assemble_video(
         logo_sting_path = _build_logo_sting(
             CHANNEL_LOGO_PATH, os.path.join(clip_dir, "logo_sting.mp4"),
             duration=LOGO_STING_DURATION, bg_color=bg_color,
+            accent_color=accent_color, channel_name=channel_name,
         )
 
     if include_intro:

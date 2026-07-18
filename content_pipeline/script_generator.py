@@ -202,11 +202,28 @@ TITLE RULES (very important):
   bolt on extra clauses, sub-titles, or a list of the specific points from the BRIEF.
 - Prefer a single clean clause over stacked "X: Y and Z" style titles.
 
+THUMBNAIL FIELDS (separate from the video itself — used only for the clickable
+YouTube thumbnail image, which needs its own dedicated background photo and a
+bold number, not whatever image a random narration scene happened to use):
+- "thumbnail_keywords": a 2-4 word ENGLISH photo-search query for a striking,
+  dramatic, ON-TOPIC background image representing the WHOLE story at a
+  glance — think "what single image would make someone stop scrolling",
+  not a literal illustration of one scene. E.g. for a stock market crash
+  story: "stock market crash chaos", not "coffee shop meeting".
+- "thumbnail_stat": the SINGLE most attention-grabbing number from the whole
+  story, formatted short and bold for a thumbnail overlay (e.g. "800% CRASH",
+  "£20,000 LOST", "233 YEARS"). Always in {language_name} number format but
+  keep it under 20 characters. Pick the number a real finance-YouTube
+  thumbnail would use to get clicks — not necessarily the first number
+  mentioned, the most dramatic one in the whole story.
+
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
   "title": "SEO-friendly YouTube title following the TITLE RULES above, written in {language_name}",
   "description": "2-3 sentence YouTube description, written in {language_name}",
-  "tags": ["tag1", "tag2", "..."]
+  "tags": ["tag1", "tag2", "..."],
+  "thumbnail_keywords": "2-4 word English photo search query, see THUMBNAIL FIELDS above",
+  "thumbnail_stat": "short bold stat for the thumbnail, see THUMBNAIL FIELDS above"
 }}
 
 Do not include any text outside the JSON object."""
@@ -830,6 +847,11 @@ def _generate_metadata(client: Groq, topic: str, brief: str, language_name: str,
         "title": part.get("title") or topic,
         "description": part.get("description") or "",
         "tags": part.get("tags") or [],
+        # Falls back to the topic itself as a search query, and no stat
+        # overlay, if the model omits these -- generate_thumbnail() already
+        # handles a missing/empty stat gracefully.
+        "thumbnail_keywords": (part.get("thumbnail_keywords") or topic).strip(),
+        "thumbnail_stat": (part.get("thumbnail_stat") or "").strip(),
     }
 
 
@@ -1004,6 +1026,8 @@ def generate_script(
         "tags": metadata["tags"],
         "scenes": all_scenes,
         "chapters": chapters,
+        "thumbnail_keywords": metadata["thumbnail_keywords"],
+        "thumbnail_stat": metadata["thumbnail_stat"],
     }
 
 
