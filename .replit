@@ -40,5 +40,5 @@ GITHUB_BRANCH = "main"
 GITHUB_REPO = "faisalchaudhary411/yt-lite"
 
 [deployment]
-deploymentTarget = "vm"
+deploymentTarget = "cloudrun"
 run = ["gunicorn", "-b", "0.0.0.0:5000", "main:app"]
