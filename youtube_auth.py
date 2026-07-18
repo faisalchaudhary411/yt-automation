@@ -12,6 +12,7 @@ One-time setup (see README Stage 2 section):
 """
 
 import os
+import json
 import requests
 from config import github_read_json, github_write_json
 
@@ -59,14 +60,40 @@ def exchange_code_for_tokens(code: str):
             "https://myaccount.google.com/permissions and try /authorize again."
         )
 
-    github_write_json(TOKEN_STATE_PATH, {"refresh_token": tokens["refresh_token"]},
-                       message="Store YouTube OAuth refresh token")
+    # Try GitHub first, fall back to local file
+    try:
+        github_write_json(TOKEN_STATE_PATH, {"refresh_token": tokens["refresh_token"]},
+                           message="Store YouTube OAuth refresh token")
+        print("Refresh token saved to GitHub.")
+    except Exception as e:
+        print(f"Warning: Could not save token to GitHub ({e}). Saving locally.")
+        local_path = os.path.join("output", TOKEN_STATE_PATH)
+        os.makedirs("output", exist_ok=True)
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump({"refresh_token": tokens["refresh_token"]}, f)
+        print(f"Refresh token saved locally to {local_path}")
+
     return tokens
 
 
 def get_access_token() -> str:
     """Uses the stored refresh_token to mint a fresh access_token for this request."""
-    stored = github_read_json(TOKEN_STATE_PATH)
+    stored = None
+
+    # Try GitHub first
+    try:
+        stored = github_read_json(TOKEN_STATE_PATH)
+    except Exception as e:
+        print(f"GitHub read failed ({e}), trying local fallback")
+
+    # Try local fallback
+    if not stored or "refresh_token" not in stored:
+        local_path = os.path.join("output", TOKEN_STATE_PATH)
+        if os.path.isfile(local_path):
+            with open(local_path, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+            print("Loaded refresh token from local fallback.")
+
     if not stored or "refresh_token" not in stored:
         raise RuntimeError(
             f"No YouTube auth on file. Visit {REPL_URL}/authorize once to connect your channel."
