@@ -26,6 +26,7 @@ OTHER FIXES:
 
 import json
 import math
+import random
 import re
 import time
 import requests
@@ -65,6 +66,80 @@ MAX_CHAPTERS = 7
 MIN_CHAPTER_GAP_RATIO = 0.6        # a new chapter tag this soon after the last one is dropped
 MIN_CHAPTER_GAP_WORDS_FLOOR = 60
 CHAPTER_TITLE_MAX_CHARS = 60
+
+# Rotating narrative approaches (picked randomly per video in generate_script).
+# The single biggest lever for videos NOT feeling like the same template
+# reskinned with different facts is varying HOW the story is told, not just
+# WHAT it's about -- two different financial-collapse stories told the same
+# "rise then fall, chronological" way every time will feel repetitive even
+# though the topics differ. This list gives each video a different opening
+# hook technique and a different narrative throughline, so the AI isn't
+# defaulting to the same structure every time. If the user's own BRIEF
+# already specifies an act/section structure, that takes priority for the
+# body of the video -- the frame mainly shapes the opening hook and the
+# narrative voice/throughline, not a structure that would fight the brief.
+NARRATIVE_FRAMES = [
+    {
+        "name": "cold_open_rewind",
+        "hook": "Open at the single most dramatic moment of the whole story — the collapse, "
+                "the discovery, the crisis point — as if dropping the viewer right into it. "
+                "Then pull back with something like 'to understand how we got here...' and "
+                "tell the story from the beginning.",
+        "voice": "Periodically circle back to that opening moment as a reference point the "
+                 "story is building toward.",
+    },
+    {
+        "name": "investigative_question",
+        "hook": "Open by posing the central mystery as a direct, concrete question to the "
+                "viewer — the exact question this video is going to answer (e.g. 'How does a "
+                "233-year-old bank disappear in six weeks?'), not something vague.",
+        "voice": "Structure the narration like an investigation slowly answering that opening "
+                 "question, rather than a flat chronological retelling.",
+    },
+    {
+        "name": "single_character_lens",
+        "hook": "Open by introducing the one central person at the heart of this story — where "
+                "they were, what they were doing, in a specific concrete moment — before "
+                "zooming out to the larger events.",
+        "voice": "Keep returning to this person's decisions and perspective as the throughline "
+                 "connecting the bigger events, rather than detached bird's-eye narration.",
+    },
+    {
+        "name": "countdown_warning_signs",
+        "hook": "Open by stating plainly that there were warning signs everyone ignored, and "
+                "that this video is going to count them down.",
+        "voice": "Structure the narrative around a running count of missed warning signs "
+                 "building toward the collapse.",
+    },
+    {
+        "name": "myth_vs_reality",
+        "hook": "Open by stating the popular myth or misconception people have about this "
+                "story, then immediately promise to correct it with what actually happened.",
+        "voice": "Periodically contrast the popular version of events with the messier reality "
+                 "throughout the narration.",
+    },
+    {
+        "name": "ticking_clock",
+        "hook": "Open by establishing a specific, tight timeframe (a number of days, weeks, or "
+                "hours) that the core disaster unfolded in, emphasizing how fast it happened.",
+        "voice": "Reference specific time markers (day one, week two, the following month, "
+                 "etc.) throughout to keep the sense of a ticking clock alive.",
+    },
+    {
+        "name": "then_vs_now",
+        "hook": "Open by connecting this historical story to something the viewer would "
+                "recognize today, then promise to show where that connection actually came from.",
+        "voice": "Draw a line periodically between the historical events and their modern echo "
+                 "or legacy.",
+    },
+    {
+        "name": "rise_and_fall",
+        "hook": "Open with a strong, concrete hook about the peak of success this story "
+                "reaches, before revealing that it's about to collapse.",
+        "voice": "Tell this as a classic rise-and-fall arc, chronologically, letting the irony "
+                 "of the peak versus the fall do the work.",
+    },
+]
 
 # Cerebras
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
@@ -232,19 +307,29 @@ Do not include any text outside the JSON object."""
 def _build_scenes_prompt(
     language_name: str, style_key: str, word_budget: int, is_first_chunk: bool,
     chapter_word_budget: int = 0, chapters_so_far: list = None, is_last_chunk: bool = True,
+    narrative_frame: dict = None,
 ) -> str:
     scene_low, scene_high = _scene_count_for_words(word_budget)
     narrator_style = VIDEO_STYLES.get(style_key, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])["narrator_style"]
 
-    # YouTube-specific guidance for first and last scenes
+    # YouTube-specific guidance for first and last scenes. The specific hook
+    # TECHNIQUE and the narrative THROUGHLINE come from the randomly-chosen
+    # narrative_frame (see NARRATIVE_FRAMES) so different videos don't all
+    # open and unfold the same way -- if a frame wasn't provided, fall back
+    # to a generic instruction rather than erroring.
+    frame_voice_guidance = ""
+    if narrative_frame:
+        frame_voice_guidance = f"\n\nNARRATIVE APPROACH FOR THIS VIDEO: {narrative_frame['voice']}"
+
     hook_guidance = ""
     if is_first_chunk:
-        hook_guidance = (
-            "\n- The FIRST scene must open with a STRONG HOOK in the first 5 seconds "
-            "(a surprising fact, bold claim, or curiosity gap that stops the scroll) — "
-            "but make it a genuinely specific, concrete hook (a real number, a real moment), "
-            "not a generic 'you won't believe what happened next' tease."
+        hook_technique = (
+            narrative_frame["hook"] if narrative_frame else
+            "Open with a surprising fact, bold claim, or curiosity gap that stops the scroll — "
+            "a genuinely specific, concrete hook (a real number, a real moment), not a generic "
+            "'you won't believe what happened next' tease."
         )
+        hook_guidance = f"\n- The FIRST scene must open with a STRONG HOOK in the first 5 seconds. {hook_technique}"
 
     if is_last_chunk:
         ending_guidance = (
@@ -284,9 +369,17 @@ Chapters used so far in this script: {used_text}. Do not reuse one of those name
   below) may ever do that."""
         chapter_schema_line = '\n      "chapter_title": "Optional — include ONLY on the scene where a new named chapter starts",'
 
+    if narrative_frame:
+        frame_voice_guidance += (
+            "\n(If the user's own BRIEF specifies its own act/section structure, follow that "
+            "structure for the body of the video — apply the narrative approach above mainly to "
+            "the opening hook and the narrative voice/throughline, don't fight the brief's "
+            "structure.)"
+        )
+
     return f"""You are a scriptwriter for a YouTube channel about history and finance (channel: {CHANNEL_NAME}). Write as {narrator_style}.
 
-Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}{chapter_guidance}
+Write the ENTIRE response in {language_name}. Do not mix in another language unless {language_name} is English.{_urdu_style_notes(language_name)}{_humanize_guidance()}{chapter_guidance}{frame_voice_guidance}
 
 Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
 {{
@@ -859,11 +952,12 @@ def _generate_scenes_chunk(
     client: Groq, topic: str, brief: str, language_name: str, style: str,
     word_budget: int, is_first_chunk: bool, previous_narration_tail: str,
     chapter_word_budget: int = 0, chapters_so_far: list = None, is_last_chunk: bool = True,
+    narrative_frame: dict = None,
 ) -> dict:
     system_prompt = _build_scenes_prompt(
         language_name, style, word_budget, is_first_chunk,
         chapter_word_budget=chapter_word_budget, chapters_so_far=chapters_so_far,
-        is_last_chunk=is_last_chunk,
+        is_last_chunk=is_last_chunk, narrative_frame=narrative_frame,
     )
     max_tokens = min(3000, max(600, word_budget * 6))
 
@@ -935,6 +1029,7 @@ def generate_script(
     duration_minutes: float = DEFAULT_DURATION_MINUTES,
     style: str = DEFAULT_VIDEO_STYLE,
     progress_callback=None,
+    narrative_frame_name: str = None,
 ) -> dict:
     """
     `topic` should stay short — it's what becomes the video title / title card.
@@ -942,6 +1037,12 @@ def generate_script(
     structure, angle, sources, things to emphasize or avoid. It shapes the
     script content but is deliberately kept out of the title-generation input
     so a detailed brief never bloats or mismatches the title card.
+
+    `narrative_frame_name` picks a specific entry from NARRATIVE_FRAMES by
+    name (e.g. "investigative_question") instead of a random one — mainly
+    useful for testing/re-generating with a specific approach on purpose.
+    Leave it None (the default) to get a random one each time, which is what
+    keeps consecutive videos from all opening/unfolding the same way.
     """
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in Replit Secrets.")
@@ -949,6 +1050,18 @@ def generate_script(
     language_name = LANGUAGES.get(language, LANGUAGES[DEFAULT_LANGUAGE])
     total_target_words = _target_word_count(duration_minutes)
     num_chunks = max(1, math.ceil(total_target_words / CHUNK_TARGET_WORDS))
+
+    if narrative_frame_name:
+        narrative_frame = next(
+            (f for f in NARRATIVE_FRAMES if f["name"] == narrative_frame_name),
+            None,
+        )
+        if not narrative_frame:
+            print(f"[script_generator] Unknown narrative_frame_name '{narrative_frame_name}', "
+                  "picking a random one instead.")
+            narrative_frame = random.choice(NARRATIVE_FRAMES)
+    else:
+        narrative_frame = random.choice(NARRATIVE_FRAMES)
 
     desired_chapters = _desired_chapter_count(duration_minutes)
     chapter_word_budget = (
@@ -971,7 +1084,8 @@ def generate_script(
 
     print(f"[script_generator] Starting: topic='{topic}', brief={'yes (' + str(len(brief)) + ' chars)' if brief else 'none'}, "
           f"target={total_target_words} words across {num_chunks} chunk(s), "
-          f"chapters={'disabled' if not chapter_word_budget else f'~every {chapter_word_budget} words'}")
+          f"chapters={'disabled' if not chapter_word_budget else f'~every {chapter_word_budget} words'}, "
+          f"narrative_frame='{narrative_frame['name']}'")
 
     metadata = _generate_metadata(client, topic, brief, language_name, style)
     print(f"[script_generator] Metadata generated: \"{metadata['title']}\"")
@@ -995,7 +1109,7 @@ def generate_script(
         part = _generate_scenes_chunk(
             client, topic, brief, language_name, style, word_budget, is_first, previous_tail,
             chapter_word_budget=chapter_word_budget, chapters_so_far=chapter_state["chapters_so_far"],
-            is_last_chunk=(chunk_index == num_chunks - 1),
+            is_last_chunk=(chunk_index == num_chunks - 1), narrative_frame=narrative_frame,
         )
         chunk_elapsed = time.time() - chunk_start
 
@@ -1028,6 +1142,7 @@ def generate_script(
         "chapters": chapters,
         "thumbnail_keywords": metadata["thumbnail_keywords"],
         "thumbnail_stat": metadata["thumbnail_stat"],
+        "narrative_frame": narrative_frame["name"],
     }
 
 
