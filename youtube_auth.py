@@ -12,9 +12,8 @@ One-time setup (see README Stage 2 section):
 """
 
 import os
-import json
 import requests
-from config import github_read_json, github_write_json
+from config import github_read_json, github_write_json, GITHUB_REPO, GITHUB_BRANCH
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -60,40 +59,31 @@ def exchange_code_for_tokens(code: str):
             "https://myaccount.google.com/permissions and try /authorize again."
         )
 
-    # Try GitHub first, fall back to local file
-    try:
-        github_write_json(TOKEN_STATE_PATH, {"refresh_token": tokens["refresh_token"]},
-                           message="Store YouTube OAuth refresh token")
-        print("Refresh token saved to GitHub.")
-    except Exception as e:
-        print(f"Warning: Could not save token to GitHub ({e}). Saving locally.")
-        local_path = os.path.join("output", TOKEN_STATE_PATH)
-        os.makedirs("output", exist_ok=True)
-        with open(local_path, "w", encoding="utf-8") as f:
-            json.dump({"refresh_token": tokens["refresh_token"]}, f)
-        print(f"Refresh token saved locally to {local_path}")
+    write_result = github_write_json(TOKEN_STATE_PATH, {"refresh_token": tokens["refresh_token"]},
+                                      message="Store YouTube OAuth refresh token")
 
+    # Don't just trust the write call — read it back from GitHub to confirm
+    # the token is actually there before telling the caller it succeeded.
+    # This is what makes it possible to tell "it silently failed" apart from
+    # "it worked but you were looking in the wrong place/repo/branch".
+    verify = github_read_json(TOKEN_STATE_PATH)
+    if not verify or verify.get("refresh_token") != tokens["refresh_token"]:
+        raise RuntimeError(
+            f"GitHub write call returned {write_result.get('content', {}).get('sha', 'no sha')} "
+            f"but reading '{TOKEN_STATE_PATH}' back from {GITHUB_REPO} (branch: {GITHUB_BRANCH}) "
+            "did not show the new token. Check GITHUB_REPO/GITHUB_BRANCH/GITHUB_TOKEN in Secrets "
+            "match the repo you're actually looking at."
+        )
+
+    commit_url = write_result.get("commit", {}).get("html_url", "(no commit URL returned)")
+    print(f"[youtube_auth] Token verified written to {GITHUB_REPO}/{TOKEN_STATE_PATH} "
+          f"(branch: {GITHUB_BRANCH}). Commit: {commit_url}")
     return tokens
 
 
 def get_access_token() -> str:
     """Uses the stored refresh_token to mint a fresh access_token for this request."""
-    stored = None
-
-    # Try GitHub first
-    try:
-        stored = github_read_json(TOKEN_STATE_PATH)
-    except Exception as e:
-        print(f"GitHub read failed ({e}), trying local fallback")
-
-    # Try local fallback
-    if not stored or "refresh_token" not in stored:
-        local_path = os.path.join("output", TOKEN_STATE_PATH)
-        if os.path.isfile(local_path):
-            with open(local_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-            print("Loaded refresh token from local fallback.")
-
+    stored = github_read_json(TOKEN_STATE_PATH)
     if not stored or "refresh_token" not in stored:
         raise RuntimeError(
             f"No YouTube auth on file. Visit {REPL_URL}/authorize once to connect your channel."

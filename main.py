@@ -871,8 +871,16 @@ def oauth2callback():
     code = request.args.get("code")
     if not code:
         return "Missing 'code' from Google — authorization may have failed.", 400
-    exchange_code_for_tokens(code)
-    return "YouTube channel connected. You can close this tab and return to the app."
+    try:
+        exchange_code_for_tokens(code)
+    except Exception as e:
+        print(f"[oauth2callback] Token exchange/storage failed: {e}")
+        return (
+            "YouTube connection FAILED — the token was not saved. "
+            f"Details: {e}",
+            500,
+        )
+    return "YouTube channel connected and token verified in GitHub. You can close this tab and return to the app."
 
 
 @app.route("/approve/<video_id>")
