@@ -9,11 +9,17 @@ The donor system's thumbnail_generator.py was broken (it passed an invalid
 uploaded anything). This rewrite leans on the live system's infrastructure
 instead:
 
-  - background: the video's own first scene image, cover-cropped to 16:9 —
-    instantly on-topic, unlike a random solid color
+  - background: a DEDICATED photo searched specifically for thumbnail visual
+    impact (see image_fetcher.fetch_thumbnail_image + generate_script()'s
+    "thumbnail_keywords" field) — not a random narration scene's image, which
+    is chosen to match one specific line of narration and often looks nothing
+    like a compelling standalone thumbnail
+  - a bold stat callout (generate_script()'s "thumbnail_stat", e.g. "800%
+    CRASH") in the video style's accent color — the kind of number-forward
+    treatment real finance/history thumbnails use to earn clicks
   - text: rendered with content_pipeline.video_assembler's verified font
     resolution + RTL shaping, so Urdu/Arabic titles render correctly
-  - styling: dark gradient for readability, gold accent bar + channel name
+  - styling: dark gradient for readability, accent-colored bar + channel name
     matching the channel's visual identity
 """
 
@@ -54,7 +60,7 @@ def _add_gradient(img: Image.Image) -> Image.Image:
     return Image.alpha_composite(img, overlay)
 
 
-def _draw_title(img: Image.Image, title: str) -> Image.Image:
+def _draw_title(img: Image.Image, title: str, accent_color: tuple = GOLD[:3]) -> Image.Image:
     draw = ImageDraw.Draw(img)
     is_latin = _is_latin_text(title)
     font_path = _resolve_font_path(for_latin=is_latin)
@@ -83,10 +89,10 @@ def _draw_title(img: Image.Image, title: str) -> Image.Image:
         draw.text((x, y - bb[1]), prepared, font=font, fill=(255, 255, 255, 255))
         y += line_h
 
-    # Gold accent bar above the title — the channel's brand color.
+    # Accent bar above the title — matches the video's own style accent color.
     bar_y = THUMB_SIZE[1] - total_h - 92
     draw.rectangle([THUMB_SIZE[0] // 2 - 60, bar_y, THUMB_SIZE[0] // 2 + 60, bar_y + 6],
-                   fill=GOLD)
+                   fill=(*accent_color, 255))
     return img
 
 
@@ -109,8 +115,39 @@ def _draw_channel_badge(img: Image.Image, channel_name: str) -> Image.Image:
     return img
 
 
+def _draw_stat_callout(img: Image.Image, stat_text: str, accent_color: tuple = GOLD[:3]) -> Image.Image:
+    """Draws a large, bold number/stat near the top-left of the thumbnail
+    (e.g. "800% CRASH") — the kind of number-forward treatment real finance
+    and history YouTube thumbnails use to earn clicks, distinct from the
+    smaller in-video lower-third stat stamp."""
+    if not stat_text:
+        return img
+    draw = ImageDraw.Draw(img)
+    is_latin = _is_latin_text(stat_text)
+    font_path = _resolve_font_path(for_latin=is_latin)
+    if not font_path:
+        return img
+
+    fontsize = 88
+    font = ImageFont.truetype(font_path, fontsize)
+    text = _prepare_text_for_rendering(stat_text, is_latin)
+
+    x, y = 50, 40
+    bb = draw.textbbox((x, y), text, font=font)
+    pad_x, pad_y = 22, 14
+    draw.rounded_rectangle(
+        [bb[0] - pad_x, bb[1] - pad_y, bb[2] + pad_x, bb[3] + pad_y],
+        radius=10, fill=(10, 12, 18, 210),
+    )
+    for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 160))
+    draw.text((x, y), text, font=font, fill=(*accent_color, 255))
+    return img
+
+
 def generate_thumbnail(title: str, background_image_path: str, out_path: str,
-                       channel_name: str = CHANNEL_NAME) -> str:
+                       channel_name: str = CHANNEL_NAME, stat_text: str = "",
+                       accent_color: tuple = GOLD[:3]) -> str:
     """Builds the thumbnail and saves it as a JPEG (YouTube requires < 2MB)."""
     if background_image_path and os.path.isfile(background_image_path):
         img = Image.open(background_image_path).convert("RGB")
@@ -123,7 +160,8 @@ def generate_thumbnail(title: str, background_image_path: str, out_path: str,
         img = Image.new("RGBA", THUMB_SIZE, (20, 30, 48, 255))
 
     img = _add_gradient(img)
-    img = _draw_title(img, title)
+    img = _draw_title(img, title, accent_color=accent_color)
+    img = _draw_stat_callout(img, stat_text, accent_color=accent_color)
     img = _draw_channel_badge(img, channel_name)
 
     img.convert("RGB").save(out_path, "JPEG", quality=90)
