@@ -241,10 +241,22 @@ def github_read_json(path, default=None):
 
 
 def github_write_json(path, data, message="update state"):
-    """Write/overwrite a JSON file in the state repo (creates it if missing)."""
+    """Write/overwrite a JSON file in the state repo (creates it if missing).
+    Falls back to local file if GitHub API fails."""
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}"
-    get_resp = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH})
-    sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+
+    # Try to get existing file SHA
+    sha = None
+    try:
+        get_resp = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH})
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+        elif get_resp.status_code == 404:
+            sha = None  # file doesn't exist yet, we'll create it
+        else:
+            print(f"Warning: GitHub GET {path} returned {get_resp.status_code}: {get_resp.text[:200]}")
+    except Exception as e:
+        print(f"Warning: GitHub GET failed ({e}), will try local fallback")
 
     payload = {
         "message": message,
@@ -254,9 +266,26 @@ def github_write_json(path, data, message="update state"):
     if sha:
         payload["sha"] = sha
 
-    put_resp = requests.put(url, headers=_gh_headers(), json=payload)
-    put_resp.raise_for_status()
-    return put_resp.json()
+    try:
+        put_resp = requests.put(url, headers=_gh_headers(), json=payload)
+        if put_resp.status_code in (200, 201):
+            return put_resp.json()
+        # If GitHub fails, log it and fall through to local save
+        print(f"Warning: GitHub PUT {path} returned {put_resp.status_code}: {put_resp.text[:300]}")
+    except Exception as e:
+        print(f"Warning: GitHub PUT failed ({e})")
+
+    # --- LOCAL FALLBACK ---
+    local_path = os.path.join(WORK_DIR, path)
+    dir_name = os.path.dirname(local_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    else:
+        os.makedirs(WORK_DIR, exist_ok=True)
+    with open(local_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"Saved {path} locally to {local_path} (GitHub unavailable)")
+    return {"local_path": local_path}
 
 
 def ensure_work_dir(job_id=None):
