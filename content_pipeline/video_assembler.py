@@ -722,14 +722,32 @@ def _render_title_card_png(
 # Rest of the configuration
 # ---------------------------------------------------------------------------
 
-MAX_CONCURRENT_CLIPS = 3
+MAX_CONCURRENT_CLIPS = max(1, os.cpu_count() or 2)
 X264_PRESET = "veryfast"
 FFMPEG_TIMEOUT_SECONDS = 1200
 SCENE_FPS = 15
 CROSSFADE_SECONDS = 0.6
-INTERMEDIATE_PRESET = "faster"
+# NOTE ON SPEED vs QUALITY: x264's -preset controls encode SPEED and file-size
+# efficiency at a given -crf -- it does NOT change visual quality when CRF is
+# held fixed (CRF targets a perceptual quality level; a faster preset just
+# spends less CPU effort finding the most efficient way to hit that same
+# quality target, trading a bit of file size for a lot of speed). Since scene
+# clips are re-encoded again at the final join step in most paths anyway,
+# there's no reason to spend "faster"-preset time on an intermediate that
+# gets re-compressed a second time regardless. Switched from "faster" to
+# "veryfast" here purely for render speed -- SCENE_CRF (quality target) is
+# unchanged.
+INTERMEDIATE_PRESET = "veryfast"
 SCENE_CRF = "20"
-THREADS_PER_CLIP = max(1, (os.cpu_count() or 2) // MAX_CONCURRENT_CLIPS)
+_CPU_COUNT = os.cpu_count() or 2
+# One ffmpeg process per available core, each single-threaded for x264 itself
+# (see -filter_threads/-filter_complex_threads below for the OTHER form of
+# parallelism this pipeline actually benefits more from). Previously this
+# divided a fixed MAX_CONCURRENT_CLIPS of 3 across however many cores existed,
+# which on a 2-vCPU box meant 3 processes oversubscribing 2 cores -- pure
+# contention with no upside. Tying both numbers to the real core count avoids
+# that regardless of the machine size a given deployment happens to have.
+THREADS_PER_CLIP = max(1, _CPU_COUNT // MAX_CONCURRENT_CLIPS)
 COLOR_GRADE_FILTER = "eq=contrast=1.08:saturation=0.92:brightness=0.02,vignette=PI/5"
 
 # Mid-video named chapter title cards (e.g. "The Warning Signs"). Shorter than
@@ -1012,6 +1030,8 @@ def _build_scene_clip(
 
     cmd += [
         "-filter_complex", filter_complex,
+        "-filter_threads", str(THREADS_PER_CLIP),
+        "-filter_complex_threads", str(THREADS_PER_CLIP),
         "-map", current_label,
         "-map", "1:a",
         "-af", "dynaudnorm=f=150:g=15",
