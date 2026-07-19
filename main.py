@@ -882,8 +882,6 @@ def oauth2callback():
         )
     return build_callback_html(tokens)
 
-    return "YouTube channel connected and token verified in GitHub. You can close this tab and return to the app."
-
 @app.route("/approve/<video_id>")
 def approve(video_id):
     submitted_token = request.args.get("token", "")
