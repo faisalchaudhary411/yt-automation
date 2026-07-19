@@ -27,7 +27,6 @@ import time
 import uuid
 import threading
 import secrets as pysecrets
-from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL, build_callback_html
 import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
@@ -43,7 +42,7 @@ from content_pipeline.tts_generator import generate_all_scene_audio
 from content_pipeline.image_fetcher import fetch_all_scene_images
 from content_pipeline.video_assembler import assemble_video, _get_media_duration
 from automation.subtitles import compute_scene_start_times
-from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL
+from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL, build_callback_html
 from youtube_uploader import upload_video, publish_video, set_thumbnail, upload_captions
 from telegram_notifier import send_approval_request, send_message
 
