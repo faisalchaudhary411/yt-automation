@@ -42,17 +42,52 @@ except ImportError:
 # this falls back to the bare command name so the error message a caller
 # gets ("No such file or directory: 'ffmpeg'") is at least the same one as
 # before, rather than a new, more confusing failure mode.
-FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
-FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
+def _resolve_ffmpeg_bin() -> str:
+    """Finds a working ffmpeg binary, in order of preference:
+    1. Whatever 'ffmpeg' resolves to on PATH (system/Nix install) -- fastest,
+       and works fine in environments (like Replit's interactive Shell) where
+       a Nix-provided ffmpeg is actually on PATH for this process.
+    2. The static ffmpeg binary bundled by the 'imageio-ffmpeg' pip package.
+       This is the reliable fallback for deployment targets (e.g. Replit's
+       Cloud Run deployments) that don't consistently carry system/Nix
+       packages from replit.nix into the deployed container the way the
+       interactive workspace does -- imageio-ffmpeg ships its own static
+       binary as part of the Python package, so it's present regardless of
+       what the OS-level container does or doesn't have installed.
+    3. Bare 'ffmpeg' as an absolute last resort, so the eventual error
+       message is at least the familiar 'No such file or directory: ffmpeg'
+       rather than something more confusing.
+    """
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        bundled_path = imageio_ffmpeg.get_ffmpeg_exe()
+        print(f"[video_assembler] system ffmpeg not found on PATH -- using bundled "
+              f"imageio-ffmpeg binary instead: {bundled_path}")
+        return bundled_path
+    except Exception as e:
+        print(f"[video_assembler] WARNING: system ffmpeg not found on PATH, and "
+              f"imageio-ffmpeg fallback also failed ({e}). Falling back to bare "
+              f"'ffmpeg', which will likely fail. Install it: "
+              f"pip install imageio-ffmpeg --break-system-packages")
+        return "ffmpeg"
 
-if FFMPEG_BIN == "ffmpeg":
-    print("[video_assembler] WARNING: ffmpeg not found via shutil.which() at import "
-          "time -- falling back to bare 'ffmpeg' on PATH, which may fail. Check that "
-          "ffmpeg is installed (e.g. via replit.nix) and that this process's "
-          "environment actually includes it.")
-if FFPROBE_BIN == "ffprobe":
-    print("[video_assembler] WARNING: ffprobe not found via shutil.which() at import "
-          "time -- falling back to bare 'ffprobe' on PATH, which may fail.")
+
+FFMPEG_BIN = _resolve_ffmpeg_bin()
+# ffprobe is NOT bundled by imageio-ffmpeg (it only ships ffmpeg itself), so
+# there's no equivalent drop-in fallback here. This is fine: _get_media_duration
+# below no longer hard-depends on ffprobe being present -- it tries ffprobe
+# first (fast, when available) and falls back to parsing ffmpeg's own stderr
+# output otherwise, so the whole pipeline works even on a container that has
+# neither a system ffmpeg NOR ffprobe (only the bundled imageio-ffmpeg binary).
+FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
+_HAS_SYSTEM_FFPROBE = shutil.which("ffprobe") is not None
+
+if not _HAS_SYSTEM_FFPROBE:
+    print("[video_assembler] ffprobe not found on PATH -- media duration will be "
+          "read by parsing ffmpeg's own output instead (see _get_media_duration).")
 
 # ---------------------------------------------------------------------------
 # Script-marker stripping (PAUSE / EMPHASIS / B-ROLL directives)
@@ -766,21 +801,50 @@ def _watermark_filter(channel_name: str, fontsize: int = 26) -> str:
     )
 
 
-def _get_media_duration(path: str) -> float:
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def _get_duration_via_ffmpeg(path: str) -> float:
+    """Fallback duration reader for environments with no ffprobe available
+    (e.g. a deployment container that only has the imageio-ffmpeg-bundled
+    ffmpeg binary, not a full system ffmpeg+ffprobe install). ffmpeg always
+    prints a 'Duration: HH:MM:SS.xx' line to stderr when given an input via
+    -i, even with no output file, so this needs no ffprobe at all."""
     result = subprocess.run(
-        [
-            FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", path,
-        ],
+        [FFMPEG_BIN, "-i", path],
         capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS,
     )
-    duration_str = (result.stdout or "").strip()
-    if not duration_str:
-        stderr_tail = (result.stderr or "").strip().splitlines()[-10:]
+    stderr = result.stderr or ""
+    m = _FFMPEG_DURATION_RE.search(stderr)
+    if not m:
+        stderr_tail = stderr.strip().splitlines()[-10:]
         raise RuntimeError(
-            f"ffprobe could not read duration for {path}: " + " | ".join(stderr_tail)
+            f"Could not determine duration for {path} via ffmpeg either: "
+            + " | ".join(stderr_tail)
         )
-    return float(duration_str)
+    hours, minutes, seconds = m.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _get_media_duration(path: str) -> float:
+    if _HAS_SYSTEM_FFPROBE:
+        result = subprocess.run(
+            [
+                FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", path,
+            ],
+            capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+        duration_str = (result.stdout or "").strip()
+        if duration_str:
+            return float(duration_str)
+        # ffprobe ran but gave nothing useful -- fall through to the ffmpeg-based
+        # method below rather than failing outright.
+        stderr_tail = (result.stderr or "").strip().splitlines()[-5:]
+        print(f"[video_assembler] ffprobe returned no duration for {path} "
+              f"({' | '.join(stderr_tail)}) -- falling back to ffmpeg parsing.")
+
+    return _get_duration_via_ffmpeg(path)
 
 
 def _zoompan_expr(index: int, zoom_rate: float) -> str:
