@@ -9,4 +9,4 @@ python-bidi==0.4.2
 fonttools
 apscheduler>=3.10,<4.0
 gunicorn==21.2.0
-ffmpeg
+imageio-ffmpeg
