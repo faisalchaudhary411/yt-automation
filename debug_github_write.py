@@ -1,16 +1,3 @@
-"""
-One-off diagnostic: tests the exact same GitHub write path youtube_auth.py
-uses, in isolation, with full raw request/response visibility -- so we don't
-have to repeat the whole Google OAuth dance (single-use auth code) every time
-we want to test this.
-
-Run this directly in the Replit Shell:
-    python3 debug_github_write.py
-
-Delete this file once the real issue is found and fixed -- it's a throwaway
-debugging tool, not part of the app.
-"""
-
 import os
 import base64
 import json
@@ -49,12 +36,9 @@ repo_resp = requests.get(f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}", headers=heade
 print(f"Status: {repo_resp.status_code}")
 if repo_resp.status_code != 200:
     print(f"Body: {repo_resp.text[:500]}")
-    print("\n^ If this is 404: either the repo name is wrong, or the token has")
-    print("  zero access to it. If this is 401: the token itself is invalid/expired.")
 else:
     info = repo_resp.json()
-    print(f"Repo found: {info.get('full_name')}, private={info.get('private')}, "
-          f"default_branch={info.get('default_branch')}")
+    print(f"Repo found: {info.get('full_name')}, private={info.get('private')}, default_branch={info.get('default_branch')}")
 
 print("\n" + "=" * 60)
 print("STEP 2: GET the test file (expected: 404, it doesn't exist yet)")
@@ -80,11 +64,7 @@ print(f"Status: {put_resp.status_code}")
 print(f"Body: {put_resp.text[:1000]}")
 
 if put_resp.status_code not in (200, 201):
-    print("\n^^^ THIS is the real error. Whatever status/body is printed above")
-    print("    is the actual reason the write fails -- read the message in the")
-    print("    body carefully, GitHub's API error messages are usually specific")
-    print("    (e.g. 'Resource not accessible by personal access token',")
-    print("    'Branch not found', 'Bad credentials', etc.)")
+    print("\n^^^ THIS is the real error.")
 else:
     print("\nWrite succeeded! Reading it back immediately...")
     verify_resp = requests.get(url, headers=headers, params={"ref": GITHUB_BRANCH})
@@ -92,6 +72,3 @@ else:
     if verify_resp.status_code == 200:
         content = base64.b64decode(verify_resp.json()["content"]).decode("utf-8")
         print(f"Read-back content: {content}")
-        print("\nEverything works fine through direct requests. If youtube_auth.py")
-        print("still fails, the bug is specific to something in that file, not")
-        print("your GitHub token/repo/permissions.")
