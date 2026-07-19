@@ -42,10 +42,3 @@ GITHUB_REPO = "faisalchaudhary411/yt-lite"
 [deployment]
 deploymentTarget = "cloudrun"
 run = ["gunicorn", "-b", "0.0.0.0:5000", "--timeout", "600", "--workers", "1", "--threads", "4", "main:app"]
-[userenv.shared]
-GITHUB_BRANCH = "main"
-GITHUB_REPO = "faisalchaudhary411/yt-lite"
-
-[deployment]
-deploymentTarget = "cloudrun"
-run = ["gunicorn", "-b", "0.0.0.0:5000", "main:app"]
