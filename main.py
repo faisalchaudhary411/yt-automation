@@ -873,7 +873,7 @@ def oauth2callback():
     if not code:
         return "Missing 'code' from Google — authorization may have failed.", 400
     try:
-        exchange_code_for_tokens(code)
+        tokens = exchange_code_for_tokens(code)
     except Exception as e:
         print(f"[oauth2callback] Token exchange/storage failed: {e}")
         return (
@@ -881,6 +881,8 @@ def oauth2callback():
             f"Details: {e}",
             500,
         )
+    return build_callback_html(tokens)
+
     return "YouTube channel connected and token verified in GitHub. You can close this tab and return to the app."
 
 
