@@ -12,6 +12,7 @@ One-time setup (see README Stage 2 section):
 """
 
 import os
+import time
 import requests
 from config import github_read_json, github_write_json, GITHUB_REPO, GITHUB_BRANCH
 
@@ -61,18 +62,29 @@ def exchange_code_for_tokens(code: str):
 
     write_result = github_write_json(TOKEN_STATE_PATH, {"refresh_token": tokens["refresh_token"]},
                                       message="Store YouTube OAuth refresh token")
+    print(f"[youtube_auth] Raw GitHub write response: {write_result}")
 
     # Don't just trust the write call — read it back from GitHub to confirm
     # the token is actually there before telling the caller it succeeded.
-    # This is what makes it possible to tell "it silently failed" apart from
-    # "it worked but you were looking in the wrong place/repo/branch".
-    verify = github_read_json(TOKEN_STATE_PATH)
+    # GitHub's API can have a brief propagation delay right after a write, so
+    # this retries a few times with short pauses before concluding it
+    # genuinely failed, rather than reporting a false failure on a write that
+    # actually succeeded a split second earlier.
+    verify = None
+    for attempt in range(4):
+        if attempt:
+            time.sleep(1.5)
+        verify = github_read_json(TOKEN_STATE_PATH)
+        if verify and verify.get("refresh_token") == tokens["refresh_token"]:
+            break
+
     if not verify or verify.get("refresh_token") != tokens["refresh_token"]:
         raise RuntimeError(
             f"GitHub write call returned {write_result.get('content', {}).get('sha', 'no sha')} "
             f"but reading '{TOKEN_STATE_PATH}' back from {GITHUB_REPO} (branch: {GITHUB_BRANCH}) "
-            "did not show the new token. Check GITHUB_REPO/GITHUB_BRANCH/GITHUB_TOKEN in Secrets "
-            "match the repo you're actually looking at."
+            "still did not show the new token after retrying for ~4.5s. Check GITHUB_REPO/"
+            "GITHUB_BRANCH/GITHUB_TOKEN in Secrets match the repo you're actually looking at, "
+            "and confirm the token has write access to that specific repo."
         )
 
     commit_url = write_result.get("commit", {}).get("html_url", "(no commit URL returned)")
