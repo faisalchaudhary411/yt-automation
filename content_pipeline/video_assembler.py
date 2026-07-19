@@ -7,6 +7,7 @@ Scenes are joined with short crossfade dissolves.
 """
 
 import os
+import shutil
 import subprocess
 import re
 import math
@@ -27,6 +28,31 @@ try:
     _HAS_ARABIC_RESHAPER = True
 except ImportError:
     _HAS_ARABIC_RESHAPER = False
+
+# ---------------------------------------------------------------------------
+# Resolved ffmpeg / ffprobe binary paths
+# ---------------------------------------------------------------------------
+# On Replit (and some other hosts), the interactive Shell's PATH can differ
+# from the PATH actually inherited by the Flask/gunicorn app process -- the
+# binaries live under a Nix store path that isn't always exported into every
+# process's environment. Resolving these ONCE, here, at import time, means
+# every subprocess call below uses an exact, known-good absolute path
+# instead of relying on bare "ffmpeg"/"ffprobe" strings resolving via PATH at
+# call time. If shutil.which can't find them (e.g. truly not installed),
+# this falls back to the bare command name so the error message a caller
+# gets ("No such file or directory: 'ffmpeg'") is at least the same one as
+# before, rather than a new, more confusing failure mode.
+FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
+
+if FFMPEG_BIN == "ffmpeg":
+    print("[video_assembler] WARNING: ffmpeg not found via shutil.which() at import "
+          "time -- falling back to bare 'ffmpeg' on PATH, which may fail. Check that "
+          "ffmpeg is installed (e.g. via replit.nix) and that this process's "
+          "environment actually includes it.")
+if FFPROBE_BIN == "ffprobe":
+    print("[video_assembler] WARNING: ffprobe not found via shutil.which() at import "
+          "time -- falling back to bare 'ffprobe' on PATH, which may fail.")
 
 # ---------------------------------------------------------------------------
 # Script-marker stripping (PAUSE / EMPHASIS / B-ROLL directives)
@@ -743,7 +769,7 @@ def _watermark_filter(channel_name: str, fontsize: int = 26) -> str:
 def _get_media_duration(path: str) -> float:
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", path,
         ],
         capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS,
@@ -859,7 +885,7 @@ def _build_scene_clip(
         # zoompan here; just fill the frame without distorting the footage
         # (force_original_aspect_ratio=increase + crop, rather than a
         # stretch-to-fit scale) and normalize to our fixed output fps.
-        cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", scene["image_path"], "-i", scene["audio_path"]]
+        cmd = [FFMPEG_BIN, "-y", "-stream_loop", "-1", "-i", scene["image_path"], "-i", scene["audio_path"]]
         base_filters = [
             f"scale={width}:{height}:force_original_aspect_ratio=increase",
             f"crop={width}:{height}",
@@ -867,7 +893,7 @@ def _build_scene_clip(
             COLOR_GRADE_FILTER,
         ]
     else:
-        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", scene["image_path"], "-i", scene["audio_path"]]
+        cmd = [FFMPEG_BIN, "-y", "-loop", "1", "-i", scene["image_path"], "-i", scene["audio_path"]]
         base_filters = [
             f"scale={width}:{height}",
             f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
@@ -952,7 +978,7 @@ def _build_title_card(
     fade_out_start = max(0.0, duration - 0.6)
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         "-f", "lavfi", "-i", f"color=c={bg_color}:s={width}x{height}:r={fps}:d={duration}",
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-loop", "1", "-i", png_path,
@@ -1031,7 +1057,7 @@ def _build_logo_sting(
     logo_zoom_rate = 0.0006  # gentle -- this is a brief brand beat, not a Ken Burns scene
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         "-loop", "1", "-i", png_path,
         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-filter_complex",
@@ -1056,7 +1082,7 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
 
     if n == 1:
         cmd = [
-            "ffmpeg", "-y", "-i", clip_paths[0],
+            FFMPEG_BIN, "-y", "-i", clip_paths[0],
             "-c:v", "libx264", "-preset", X264_PRESET, "-crf", SCENE_CRF, "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
             "-movflags", "+faststart",
@@ -1096,7 +1122,7 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
     filter_complex = ";".join(filter_parts)
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", f"[{prev_v_label}]",
@@ -1117,7 +1143,7 @@ def _concat_stream_copy(clip_paths: list, output_path: str) -> str:
             escaped = os.path.abspath(p).replace("'", "'\''")
             f.write(f"file '{escaped}'\n")
     cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+        FFMPEG_BIN, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
         "-c", "copy", "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         output_path,
@@ -1135,7 +1161,7 @@ def _remux_single(path: str, final_path: str) -> str:
     +faststart so the deliverable is web-playback-friendly."""
     if os.path.abspath(path) == os.path.abspath(final_path):
         return final_path
-    cmd = ["ffmpeg", "-y", "-i", path, "-c", "copy", "-movflags", "+faststart", final_path]
+    cmd = [FFMPEG_BIN, "-y", "-i", path, "-c", "copy", "-movflags", "+faststart", final_path]
     _run(cmd, "Final remux")
     return final_path
 
@@ -1220,7 +1246,7 @@ def _mix_background_music(video_path: str, music_path: str, output_path: str, mu
         return video_path
 
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         "-i", video_path,
         "-stream_loop", "-1", "-i", music_path,
         "-filter_complex",
