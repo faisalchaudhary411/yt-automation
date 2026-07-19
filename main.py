@@ -27,6 +27,7 @@ import time
 import uuid
 import threading
 import secrets as pysecrets
+from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL, build_callback_html
 import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
