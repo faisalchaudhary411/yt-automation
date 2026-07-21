@@ -138,7 +138,12 @@ def _strip_narration_markers(text: str) -> str:
 
 # "50%" -> "50 فیصد" ("feesad" / percent). Left bare, edge-tts tends to read
 # the symbol in English mid-Urdu-sentence, which is a jarring language switch.
-_PERCENT_RE = re.compile(r"(\d[\d,.]*)\s*%")
+# NOTE: matches BOTH the ASCII "%" and the Arabic/Urdu percent sign "٪"
+# (U+066A). "40%" converted fine before, but if the script generator (or an
+# LLM) ever emits the Urdu-script percent sign instead, it slipped through
+# this regex untouched and the bare "٪" symbol was left for the voice to
+# guess at -- almost certainly the cause of "40%" -> garbled "چالسہ".
+_PERCENT_RE = re.compile(r"(\d[\d,.]*)\s*[%٪]")
 
 # "$500" -> "500 ڈالر" (dollar), "£500" -> "500 پاؤنڈ" (pound), "€500" -> "500
 # یورو" (euro). Same reasoning as above -- spelled out in Urdu so the whole
@@ -173,7 +178,7 @@ _PRONUNCIATION_FIXES = {
     # "ملک" (bare) is ambiguous between "مُلک" (mulk/country -- almost always
     # the intended meaning in history/finance narration) and other readings
     # like "مَلَک" (malak/angel). The damma (ُ) forces the "mulk" reading.
-    "ملک": "مُلک",
+    "ملک": "مُلْک",
     # "بنا" (banaa, "made/built" -- e.g. "بنا دیا") was being read by the
     # voice as "بن" (ban, "become"), dropping the long-vowel ending. The
     # fatha forces the intended "banaa" reading instead.
@@ -182,7 +187,54 @@ _PRONUNCIATION_FIXES = {
     # "بینک" is the standard Urdu spelling for the loanword and reads
     # correctly, so any occurrence of the shorter form is normalized to it.
     "بنک": "بینک",
+
+    # --- Added July 2026, from a real narration pass -----------------------
+    # "پلاسی" (Plassey, as in the Battle of Plassey) was collapsing to
+    # "پلسی", dropping a syllable. Fatha forces the full three-syllable read.
+    "پلاسی": "پَلاسی",
+    # "مالیت" (value/worth) was collapsing to "ملیت". Kasra on the ی anchors
+    # the middle syllable so it doesn't get swallowed.
+    "مالیت": "مالِیت",
+    # "اسی" (assi/eighty) was being read as "isi" (this one). Fatha forces
+    # the "assi" reading. NOTE: this dict entry only fires for the standalone
+    # word "اسی" -- the actual number 80 already reads correctly via
+    # _URDU_TENS_ROUND, this only matters if "اسی" appears spelled out as a
+    # word in narration text rather than as the digit 80.
+    "اسی": "اَسی",
+    # "لائبریری" (library) was collapsing to "لابری", losing two syllables.
+    "لائبریری": "لَائِبریری",
+    # "چلانا" (chalana/to run-drive) was being read "chilana". Fatha forces
+    # the "chalana" reading.
+    "چلانا": "چَلانا",
+    # "گلی" (gali/street) was being read "gili" (damp). Fatha forces "gali".
+    "گلی": "گَلی",
+    # "چھینی" (chheeni/chisel) was picking up an extra zabar (fatha) that
+    # isn't in the word. Kasra pins the intended vowel.
+    "چھینی": "چھِینی",
+    # "بنایا"/"بناتا"/"بنانا" etc: "بنا" below already fixes the standalone
+    # word, but these inflected forms are DIFFERENT strings (not substrings
+    # matched by the "بنا" \b...\b pattern), so they need their own entries.
+    "بنایا": "بَنایا",
+    "بناتا": "بَناتا",
+    "بنانا": "بَنانا",
+    "بنائے": "بَنائے",
+    # "اوڈیسہ" was collapsing/changing to "اڈیسے". This is a place name
+    # (Odessa/Odisha) so a diacritic fix is more of a guess than the others
+    # -- best-effort attempt below, VERIFY with test_pronunciation_fixes().
+    "اوڈیسہ": "اوڈیسا",
 }
+
+# --- KNOWN LIMITATION, read before adding more entries here -----------------
+# "ملک" (-> "مُلک" above) and "بنا" (-> "بَنا" below) were BOTH already fixed
+# with diacritics, and Faisal is still hearing "مالک"/"بینا". I tested the
+# matching logic directly (word-boundary regex against Arabic script) and
+# confirmed the substitution IS firing correctly -- so this isn't a code bug,
+# it's the ur-PK neural voice not fully respecting the diacritic once it's
+# there. There's no way to fix this from here without hearing the audio, so
+# rather than guess blindly at more diacritic variants, use
+# test_pronunciation_fixes() below: it bundles every contested word into ONE
+# numbered audio file so you can listen once and report back which numbers
+# are still wrong, instead of retyping Urdu words on a phone keyboard.
 
 _PRONUNCIATION_FIX_PATTERNS = {
     re.compile(r"\b" + re.escape(word) + r"\b"): fixed
@@ -225,6 +277,11 @@ _ENGLISH_LOANWORD_URDU = {
     "minister": "منسٹر", "government": "گورنمنٹ", "empire": "ایمپائر",
     "bond": "بانڈ", "bonds": "بانڈز", "loan": "لون", "loans": "لونز",
     "inflation": "افراطِ زر", "gdp": "جی ڈی پی", "ceo": "سی ای او",
+    # Added: YouTube-channel narration words, missing before -- any Latin
+    # word not in this table is left raw (see _replace()'s unmatched-word
+    # warning below), which is what was happening to "subscribe".
+    "subscribe": "سبسکرائب", "subscribers": "سبسکرائبرز",
+    "channel": "چینل", "channels": "چینلز",
 }
 
 # Matches standalone runs of Latin letters (so Urdu/Arabic script text is
@@ -359,6 +416,49 @@ def _urdu_year_words(n: int) -> str:
     return words
 
 
+_URDU_HAZAR = "ہزار"   # thousand
+_URDU_LAKH = "لاکھ"    # 100,000
+_URDU_CROR = "کروڑ"    # 10,000,000
+
+
+def _urdu_large_number_words(n: int) -> str:
+    """Converts numbers outside the year/hundreds/two-digit ranges above
+    using the South Asian hazar/lakh/crore system Urdu speakers actually
+    use for quantities -- e.g. 100000 -> 'ایک لاکھ', 20000 -> 'بیس ہزار',
+    42000 -> 'بیالیس ہزار', 250000 -> 'دو لاکھ پچاس ہزار'.
+
+    FIX: this used to not exist -- any number outside 0-2099 fell straight
+    to digit-by-digit reading ("1 لاکھ" written in the script as "100000"
+    was coming out as "ایک صفر صفر صفر صفر صفر"). Words like "1 لاکھ",
+    "بیس ہزار", and "42000" are exactly the numbers this was breaking on.
+
+    Covers 0 to 99,99,99,999 (99 crore), comfortably beyond any figure this
+    pipeline is likely to narrate. Above that, falls back to digit-by-digit
+    (rare enough, and "X ارب" (billion) phrasing isn't implemented yet --
+    report the specific number if this comes up)."""
+    if n == 0:
+        return _URDU_ONES[0]
+    if n > 999999999:
+        return " ".join(_URDU_ONES[int(d)] for d in str(n))
+
+    crore, n = divmod(n, 10000000)
+    lakh, n = divmod(n, 100000)
+    hazar, n = divmod(n, 1000)
+    rest = n  # 0-999
+
+    parts = []
+    if crore:
+        parts.append(f"{_urdu_two_digit_words(crore)} {_URDU_CROR}")
+    if lakh:
+        parts.append(f"{_urdu_two_digit_words(lakh)} {_URDU_LAKH}")
+    if hazar:
+        parts.append(f"{_urdu_two_digit_words(hazar)} {_URDU_HAZAR}")
+    if rest:
+        parts.append(_urdu_hundreds_words(rest) if rest >= 100 else _urdu_two_digit_words(rest))
+
+    return " ".join(parts)
+
+
 def _number_to_urdu_words(num_str: str) -> str:
     """Converts a digit string to Urdu words. Leaves decimals/malformed
     numbers as-is rather than guessing (decimal number words are a rarer
@@ -375,11 +475,7 @@ def _number_to_urdu_words(num_str: str) -> str:
     if 0 <= n <= 99:
         return _urdu_two_digit_words(n)
 
-    # Outside the ranges handled naturally above (very large numbers) --
-    # read each digit separately rather than guess thousand/lakh/crore
-    # phrasing, which varies by context (financial amounts often keep
-    # "ملین"/"بلین" as loanwords rather than translating to لاکھ/کروڑ).
-    return " ".join(_URDU_ONES[int(d)] for d in clean)
+    return _urdu_large_number_words(n)
 
 
 _NUMBER_RE = re.compile(r"\b\d[\d,]*\b")
@@ -722,4 +818,33 @@ def test_voice(text: str = "اسلام علیکم۔ یہ ایک ٹیسٹ ہے۔"
     """
     voice = _resolve_voice("ur", voice_gender)
     asyncio.run(_tts_edge_async(text, out_path, voice))
+    return out_path
+
+
+def test_pronunciation_fixes(out_path: str = "pronunciation_test.mp3",
+                              voice_gender: str = "male") -> str:
+    """
+    Diagnostic utility: bundles every word/number that's been reported as
+    mispronounced into ONE audio file, each preceded by its number spoken
+    aloud ("Number 1 ... Number 2 ..."), so a single listen-through tells you
+    which fixes actually worked. Report back just the NUMBERS that still
+    sound wrong -- no need to retype Urdu words on a phone keyboard -- and
+    the next fix can be targeted precisely instead of guessed at blind.
+
+    Run this after pulling the updated tts_generator.py, before regenerating
+    a full video, so we don't burn a whole render cycle on words that still
+    need another pass.
+    """
+    test_items = [
+        "پلاسی", "1 لاکھ", "بیس ہزار", "42000", "مالیت", "اسی",
+        "لائبریری", "چلانا", "ملک", "اوڈیسہ", "چھینی", "40%",
+        "subscribe", "گلی", "بنا",
+    ]
+    voice = _resolve_voice("ur", voice_gender)
+    chunks = [
+        f"نمبر {_number_to_urdu_words(str(i))}، {word}"
+        for i, word in enumerate(test_items, start=1)
+    ]
+    text = "۔ ".join(chunks)
+    asyncio.run(_tts_edge_async(text, out_path, voice, rate="slow", pitch="default", language="ur"))
     return out_path
