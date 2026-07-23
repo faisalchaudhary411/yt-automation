@@ -35,7 +35,7 @@ from config import (
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
     LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
-    SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED,
+    SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED, WORK_DIR,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -845,7 +845,10 @@ def status_endpoint(job_id):
 
 @app.route("/output/<job_id>/<path:filename>")
 def output_file(job_id, filename):
-    directory = os.path.join(os.getcwd(), "output", job_id)
+    # Use the absolute WORK_DIR from config so this works whether the process
+    # is started from the project root (flask dev), a different cwd (gunicorn),
+    # or the Replit production container (which may have a different cwd).
+    directory = os.path.join(WORK_DIR, job_id)
     # conditional=True (Werkzeug's default, but made explicit here) is what
     # actually enables HTTP Range request handling — the browser/download
     # manager sends "Range: bytes=1234-" to resume a dropped download, and

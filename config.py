@@ -20,7 +20,6 @@ import base64
 import requests
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY", "")
@@ -142,7 +141,10 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
 GITHUB_API_BASE = "https://api.github.com"
 
-WORK_DIR = "output"  # local scratch folder on Replit (audio/images/video before upload)
+# Absolute path so gunicorn (production) and flask dev server (local) both
+# resolve output files correctly regardless of the process working directory.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WORK_DIR = os.path.join(_BASE_DIR, "output")
 
 # Optional background music track, looped and ducked under narration in every
 # generated video. Fully optional — if this file doesn't exist, video_assembler

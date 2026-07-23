@@ -676,8 +676,8 @@ def _render_title_card_png(
     title_lines = [_prepare_text_for_rendering(line, is_title_latin) for line in title_lines]
     subtitle_lines = [_prepare_text_for_rendering(line, is_sub_latin) for line in subtitle_lines]
 
-    bar_h = 6
-    bar_gap = 22  # space above and below the accent bar
+    bar_h = 4
+    bar_gap = 26  # space above and below the accent bar
     title_line_h = title_fontsize + 20
     sub_line_h = subtitle_fontsize + 14
     show_bar = bool(title_lines)  # every card with a title gets the style's accent bar
@@ -685,20 +685,35 @@ def _render_title_card_png(
     total_h = len(title_lines) * title_line_h + bar_block_h + len(subtitle_lines) * sub_line_h
     y_cursor = (height - total_h) // 2
 
+    # Title text — white with a multi-layer glow shadow for depth
     for line in title_lines:
         bb = draw.textbbox((0, 0), line, font=title_font)
         text_w = bb[2] - bb[0]
         x = (width - text_w) // 2 - bb[0]
         y = y_cursor - bb[1]
+        # Outer glow (wide, very dark)
+        for dx, dy in [(-4, -4), (-4, 4), (4, -4), (4, 4),
+                        (-4, 0), (4, 0), (0, -4), (0, 4)]:
+            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 120))
+        # Inner shadow (tight, opaque)
         for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 180))
+            draw.text((x + dx, y + dy), line, font=title_font, fill=(0, 0, 0, 200))
         draw.text((x, y), line, font=title_font, fill=(255, 255, 255, 255))
         y_cursor += title_line_h
 
     if show_bar:
         bar_y = y_cursor + bar_gap
+        # Wide accent bar (40 % of frame width) — gives each style a clear colour identity
+        bar_w = int(width * 0.40)
+        bar_x0 = (width - bar_w) // 2
+        # Thin hairline above the bar in a slightly lighter shade
+        r, g, b = accent_color
         draw.rectangle(
-            [width // 2 - 60, bar_y, width // 2 + 60, bar_y + bar_h],
+            [bar_x0, bar_y - 2, bar_x0 + bar_w, bar_y - 1],
+            fill=(min(255, r + 40), min(255, g + 40), min(255, b + 40), 120),
+        )
+        draw.rectangle(
+            [bar_x0, bar_y, bar_x0 + bar_w, bar_y + bar_h],
             fill=(*accent_color, 255),
         )
         y_cursor += bar_block_h
@@ -709,9 +724,13 @@ def _render_title_card_png(
             text_w = bb[2] - bb[0]
             x = (width - text_w) // 2 - bb[0]
             y = y_cursor - bb[1]
+            # Subtle shadow
             for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-                draw.text((x + dx, y + dy), line, font=sub_font, fill=(0, 0, 0, 160))
-            draw.text((x, y), line, font=sub_font, fill=(255, 255, 255, 255))
+                draw.text((x + dx, y + dy), line, font=sub_font, fill=(0, 0, 0, 140))
+            # Subtitle in the style's accent colour (slightly brightened) rather than plain white
+            r, g, b = accent_color
+            sub_color = (min(255, r + 50), min(255, g + 50), min(255, b + 50), 230)
+            draw.text((x, y), line, font=sub_font, fill=sub_color)
             y_cursor += sub_line_h
 
     img.save(out_path)
@@ -923,6 +942,7 @@ def _render_lower_third_png(
 def _build_scene_clip(
     scene: dict, index: int, work_dir: str, width=1920, height=1080, zoom_rate=0.0008,
     channel_name: str = None, accent_color: tuple = (198, 164, 84),
+    total_scenes: int = 0,
 ) -> str:
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
@@ -1021,6 +1041,20 @@ def _build_scene_clip(
     final_filters = []
     if watermark_filter:
         final_filters.append(watermark_filter)
+
+    # Progress bar: a thin accent-colored bar along the bottom that shows how
+    # far through the video the viewer is. Each scene clip is stamped at its
+    # starting fraction so the bar "advances" on every scene cut.
+    if total_scenes > 1:
+        fill_w = max(2, int(width * index / total_scenes))
+        r, g, b = accent_color
+        accent_hex = f"0x{r:02X}{g:02X}{b:02X}"
+        final_filters.append(
+            f"drawbox=x=0:y=h-6:w=iw:h=6:color=0x000000@0.45:t=fill"
+        )
+        final_filters.append(
+            f"drawbox=x=0:y=h-6:w={fill_w}:h=6:color={accent_hex}@0.88:t=fill"
+        )
 
     if final_filters:
         filters.append(f"{current_label}{','.join(final_filters)}[vout]")
@@ -1424,7 +1458,11 @@ def assemble_video(
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CLIPS) as executor:
         futures = {
-            executor.submit(_build_scene_clip, scene, i, work_dir, zoom_rate=zoom_rate, channel_name=channel_name, accent_color=accent_color): i
+            executor.submit(
+                _build_scene_clip, scene, i, work_dir,
+                zoom_rate=zoom_rate, channel_name=channel_name,
+                accent_color=accent_color, total_scenes=total_scenes,
+            ): i
             for i, scene in enumerate(scenes)
         }
         for future in as_completed(futures):
