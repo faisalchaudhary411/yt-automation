@@ -222,6 +222,31 @@ _PRONUNCIATION_FIXES = {
     # (Odessa/Odisha) so a diacritic fix is more of a guess than the others
     # -- best-effort attempt below, VERIFY with test_pronunciation_fixes().
     "اوڈیسہ": "اوڈیسا",
+
+    # --- Added July 2026, user-reported mispronunciations -------------------
+    # "گزری" (guzri, "passed/went by") was being read "gaazri". Damma on گ
+    # forces the short-u reading.
+    "گزری": "گُزری",
+    # "رسے" (ruse, "sulked/ropes") was being read "rosse". Damma on ر forces
+    # the short-u reading.
+    "رسے": "رُسے",
+    # "رکی" (ruki, "stopped/paused") was being read "raaki". Damma on ر
+    # forces the short-u reading.
+    "رکی": "رُکی",
+    # "گرنے" (girnay, "to fall") was being read "narqi". Kasra on گ forces
+    # the correct gi-r-nay reading.
+    "گرنے": "گِرنے",
+    # "دکھا" (dikha, "showed") was being read "dukha". Kasra on د forces the
+    # short-i reading.
+    "دکھا": "دِکھا",
+    # "دم" (dum, "breath/moment") was being read "dovom". Fatha on د anchors
+    # the short-a/u reading.
+    "دم": "دَم",
+    # "انیس" (unees, 19) was being read "anes". Damma on ا forces the
+    # correct u-nees reading. (The digit 19 is already handled by
+    # _URDU_TEENS, but the spelled-out word "انیس" needs this fix when it
+    # appears as text rather than a digit.)
+    "انیس": "اُنیس",
 }
 
 # --- KNOWN LIMITATION, read before adding more entries here -----------------
@@ -280,7 +305,9 @@ _ENGLISH_LOANWORD_URDU = {
     # Added: YouTube-channel narration words, missing before -- any Latin
     # word not in this table is left raw (see _replace()'s unmatched-word
     # warning below), which is what was happening to "subscribe".
-    "subscribe": "سبسکرائب", "subscribers": "سبسکرائبرز",
+    # "سبسکرائب" was being read "subscrabe" by the voice — the ائ diphthong
+    # was collapsing. "سبسکرائیب" adds ی before ب to anchor the ai-b ending.
+    "subscribe": "سبسکرائیب", "subscribers": "سبسکرائیبرز",
     "channel": "چینل", "channels": "چینلز",
 }
 
