@@ -767,7 +767,22 @@ _CPU_COUNT = os.cpu_count() or 2
 # contention with no upside. Tying both numbers to the real core count avoids
 # that regardless of the machine size a given deployment happens to have.
 THREADS_PER_CLIP = max(1, _CPU_COUNT // MAX_CONCURRENT_CLIPS)
-COLOR_GRADE_FILTER = "eq=contrast=1.08:saturation=0.92:brightness=0.02,vignette=PI/5"
+# Cinematic colour grade applied to every scene clip and logo sting.
+# Chain explained:
+#   eq           — lift contrast/saturation slightly; tiny brightness bump;
+#                  gamma<1 opens up shadows a little (crushed blacks look harsh)
+#   colorbalance — warm-tint shadows and midtones (add red/amber, pull blue).
+#                  Gives the "film warm" look without a full LUT.
+#   unsharp      — mild luma sharpening pass (la=0.5) for perceived crispness
+#                  without artefacts; chroma sharpening left at 0.
+#   vignette     — PI/4 ≈ 0.79 rad is noticeably stronger than the old PI/5
+#                  (0.63 rad), pulling the eye to the centre of frame.
+COLOR_GRADE_FILTER = (
+    "eq=contrast=1.12:saturation=1.05:brightness=0.015:gamma=0.97,"
+    "colorbalance=rs=0.04:gs=0.01:bs=-0.06:rm=0.02:gm=0.01:bm=-0.03,"
+    "unsharp=lx=3:ly=3:la=0.5:cx=3:cy=3:ca=0.0,"
+    "vignette=PI/4"
+)
 
 # Mid-video named chapter title cards (e.g. "The Warning Signs"). Shorter than
 # the intro/outro cards since they're a brief beat, not a full pause.
@@ -884,14 +899,73 @@ def _get_media_duration(path: str) -> float:
     return _get_duration_via_ffmpeg(path)
 
 
-def _zoompan_expr(index: int, zoom_rate: float) -> str:
-    z_expr = f"min(zoom+{zoom_rate},1.15)"
-    y_expr = "ih/2-(ih/zoom/2)"
-    if index % 2 == 1:
-        x_expr = "iw/2-(iw/zoom/2)+ceil(20*sin(on/40))"
-    else:
-        x_expr = "iw/2-(iw/zoom/2)"
-    return f"z='{z_expr}':x='{x_expr}':y='{y_expr}'"
+# Curated xfade transitions — dissolve-heavy so the overall feel stays
+# cinematic. Wipes/slides fire roughly 1-in-3 for variety without MTV energy.
+_XFADE_POOL = [
+    "fade",       # classic dissolve — most cuts
+    "fade",       # extra weight so dissolve stays dominant
+    "fade",       # keep it the clear majority
+    "wipeleft",   # cinematic page-turn wipe
+    "fadeblack",  # dip to black — emphatic beat between sections
+    "smoothleft", # subtle slide-left — reads as a natural continuation
+]
+
+_ROMAN = {
+    1: "I", 2: "II", 3: "III", 4: "IV", 5: "V",
+    6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X",
+    11: "XI", 12: "XII", 13: "XIII", 14: "XIV", 15: "XV",
+    16: "XVI", 17: "XVII", 18: "XVIII", 19: "XIX", 20: "XX",
+}
+
+def _to_roman(n: int) -> str:
+    return _ROMAN.get(n, str(n))
+
+
+def _zoompan_expr(index: int, zoom_rate: float, total_frames: int = 300) -> str:
+    """Returns zoompan parameters for one of 6 distinct Ken-Burns camera moves,
+    chosen deterministically by scene index so consecutive clips always use a
+    different move. Directions cycle through:
+      0 — zoom-in, centre (classic BBC documentary)
+      1 — zoom-in, anchored top-left corner
+      2 — zoom-in, anchored bottom-right corner
+      3 — zoom-out from 1.15x back to 1.0, centre (reveals the frame)
+      4 — slow horizontal drift left→right + mild zoom
+      5 — slow vertical drift top→bottom + mild zoom
+    """
+    r = zoom_rate
+    f = max(1, total_frames)
+    direction = index % 6
+
+    if direction == 0:   # zoom-in, centred
+        z = f"min(zoom+{r},1.15)"
+        x = "iw/2-(iw/zoom/2)"
+        y = "ih/2-(ih/zoom/2)"
+    elif direction == 1: # zoom-in, top-left anchor
+        z = f"min(zoom+{r},1.18)"
+        x = "0"
+        y = "0"
+    elif direction == 2: # zoom-in, bottom-right anchor
+        z = f"min(zoom+{r},1.18)"
+        x = "iw-(iw/zoom)"
+        y = "ih-(ih/zoom)"
+    elif direction == 3: # zoom-out, centred (reverse Ken Burns — reveals frame)
+        # `if(eq(on,1),...)` sets the initial zoom for frame 1, then decreases
+        z = f"if(eq(on,1),1.15,max(zoom-{r},1.0))"
+        x = "iw/2-(iw/zoom/2)"
+        y = "ih/2-(ih/zoom/2)"
+    elif direction == 4: # slow pan left→right + mild zoom
+        rh = round(r * 0.5, 7)
+        z = f"min(zoom+{rh},1.08)"
+        # drifts 40 px from left-of-centre to right-of-centre across the clip
+        x = f"iw/2-(iw/zoom/2)+40*((on-1)/max({f}-1,1)-0.5)"
+        y = "ih/2-(ih/zoom/2)"
+    else:                # direction 5: slow pan top→bottom + mild zoom
+        rh = round(r * 0.5, 7)
+        z = f"min(zoom+{rh},1.08)"
+        x = "iw/2-(iw/zoom/2)"
+        y = f"ih/2-(ih/zoom/2)+30*((on-1)/max({f}-1,1)-0.5)"
+
+    return f"z='{z}':x='{x}':y='{y}'"
 
 
 def _render_lower_third_png(
@@ -998,7 +1072,7 @@ def _build_scene_clip(
         cmd = [FFMPEG_BIN, "-y", "-loop", "1", "-i", scene["image_path"], "-i", scene["audio_path"]]
         base_filters = [
             f"scale={width}:{height}",
-            f"zoompan={_zoompan_expr(index, zoom_rate)}:d={total_frames}:s={width}x{height}:fps={fps}",
+            f"zoompan={_zoompan_expr(index, zoom_rate, total_frames)}:d={total_frames}:s={width}x{height}:fps={fps}",
             COLOR_GRADE_FILTER,
         ]
 
@@ -1222,8 +1296,9 @@ def _join_with_crossfades(clip_paths: list, final_path: str, crossfade_seconds: 
     for i in range(1, n):
         offset = max(0.0, running_duration - crossfade_seconds)
         out_label = f"v{i}"
+        transition = _XFADE_POOL[(i - 1) % len(_XFADE_POOL)]
         filter_parts.append(
-            f"[{prev_v_label}][{i}:v]xfade=transition=fade:"
+            f"[{prev_v_label}][{i}:v]xfade=transition={transition}:"
             f"duration={crossfade_seconds}:offset={offset:.3f}[{out_label}]"
         )
         prev_v_label = out_label
@@ -1359,21 +1434,52 @@ def _join_mixed_transitions(
     return final_path
 
 
-def _mix_background_music(video_path: str, music_path: str, output_path: str, music_volume: float = 0.12) -> str:
+def _mix_background_music(video_path: str, music_path: str, output_path: str, music_volume: float = 0.20) -> str:
+    """Mixes a looped music bed under the narration using sidechain compression.
+
+    Instead of a flat volume blend, the music ducks automatically whenever
+    narration is present (sidechaincompress threshold=0.02, ratio=6:1,
+    attack=25 ms, release=600 ms) and rises back in pauses — the standard
+    broadcast/YouTube documentary audio treatment.  music_volume controls the
+    peak level of the music when no narration is playing; during narration it
+    is compressed to roughly music_volume / 6."""
     if not music_path or not os.path.isfile(music_path):
         return video_path
 
+    duck_filter = (
+        "[0:a]asplit=2[narr][narr_sc];"
+        f"[1:a]volume={music_volume}[music_raw];"
+        "[music_raw][narr_sc]sidechaincompress="
+        "threshold=0.02:ratio=6:attack=25:release=600:makeup=1[music_duck];"
+        "[narr][music_duck]amix=inputs=2:duration=first:dropout_transition=3[aout]"
+    )
     cmd = [
         FFMPEG_BIN, "-y",
         "-i", video_path,
         "-stream_loop", "-1", "-i", music_path,
-        "-filter_complex",
-        f"[1:a]volume={music_volume}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=3[aout]",
+        "-filter_complex", duck_filter,
         "-map", "0:v", "-map", "[aout]",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         output_path,
     ]
-    _run(cmd, "Background music mix")
+    _run(cmd, "Background music mix (sidechain ducking)")
+    return output_path
+
+
+def _apply_audio_finish(video_path: str, output_path: str,
+                        fade_in: float = 1.0, fade_out: float = 2.0) -> str:
+    """Adds a 1 s audio fade-in and 2 s audio fade-out to the final deliverable.
+    Video is stream-copied (no re-encode); only the audio track is touched."""
+    duration = _get_media_duration(video_path)
+    fade_out_start = max(fade_in + 0.5, duration - fade_out)
+    cmd = [
+        FFMPEG_BIN, "-y", "-i", video_path,
+        "-af", f"afade=t=in:st=0:d={fade_in},afade=t=out:st={fade_out_start:.3f}:d={fade_out}",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    _run(cmd, "Audio fade-in / fade-out")
     return output_path
 
 
@@ -1513,13 +1619,18 @@ def assemble_video(
     else:
         groups = []
         current_group = []
+        chapter_num = 0
         for i, clip_path in enumerate(scene_clip_paths):
             if i in card_by_index and current_group:
+                chapter_num += 1
                 groups.append(("scenes", current_group))
                 current_group = []
                 card_path = os.path.join(clip_dir, f"chapter_{i}.mp4")
+                # Netflix-style: big chapter title + "PART I" Roman-numeral
+                # subtitle rendered in the style's accent colour.
                 _build_title_card(
-                    [card_by_index[i]], card_path,
+                    [card_by_index[i], f"PART {_to_roman(chapter_num)}"],
+                    card_path,
                     duration=CHAPTER_CARD_DURATION, bg_color=bg_color, accent_color=accent_color,
                 )
                 groups.append(("card", card_path))
@@ -1570,6 +1681,18 @@ def assemble_video(
         os.replace(music_mixed_path, final_path)
     elif music_path:
         print(f"[video_assembler] music_path '{music_path}' not found -- skipping background music.")
+
+    # Always apply audio fade-in (1 s) and fade-out (2 s) to the delivered
+    # file regardless of whether a music bed was mixed. This ensures the very
+    # first and last frames never hard-cut into / out of narration.
+    _audio_finish_tmp = final_path + ".audiofinish.mp4"
+    try:
+        _apply_audio_finish(final_path, _audio_finish_tmp)
+        os.replace(_audio_finish_tmp, final_path)
+    except Exception as _afe:
+        print(f"[video_assembler] Audio fade-finish failed ({_afe}) — skipping.")
+        if os.path.exists(_audio_finish_tmp):
+            os.remove(_audio_finish_tmp)
 
     if progress_callback:
         progress_callback("join", 1, 1)
