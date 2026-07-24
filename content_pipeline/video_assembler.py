@@ -741,9 +741,23 @@ def _render_title_card_png(
 # Rest of the configuration
 # ---------------------------------------------------------------------------
 
-MAX_CONCURRENT_CLIPS = max(1, os.cpu_count() or 2)
+# Hard cap at 2 concurrent ffmpeg processes.
+# On Replit the container typically exposes 4-8 logical cores but has only
+# ~1-2 GB of usable RAM.  Each Ken-Burns encode on a full-res image needs
+# ~200-400 MB, so launching all clips in parallel (old: max(1, cpu_count()))
+# for a 13-15 min video (10-13 clips) reliably OOM-kills the Flask process —
+# which is why the browser sees "lost connection" and can't reconnect: the
+# server itself is dead, not the network.  2 concurrent clips keeps peak RSS
+# under ~800 MB while still being 2× faster than pure serial.
+MAX_CONCURRENT_CLIPS = 2
 X264_PRESET = "veryfast"
-FFMPEG_TIMEOUT_SECONDS = 1200
+# Raised from 1200 s (20 min) to 3600 s (60 min).
+# For 13-15 min videos the full render pipeline (clip encoding + music
+# sidechain mix + audio finish) routinely takes 25-35 min.  The old 1200 s
+# cap would kill the ffmpeg subprocess mid-join for these longer videos,
+# producing a corrupt/empty output file and a confusing "lost connection"
+# on the frontend because the background thread crashed with an exception.
+FFMPEG_TIMEOUT_SECONDS = 3600
 SCENE_FPS = 15
 CROSSFADE_SECONDS = 0.6
 # NOTE ON SPEED vs QUALITY: x264's -preset controls encode SPEED and file-size
