@@ -55,10 +55,18 @@ LANGUAGES = {
 DEFAULT_LANGUAGE = "en"
 
 # Video length presets shown in the UI (minutes of narration to aim for).
+# Chunked generation scales linearly: every 200-word chunk = 1 LLM call.
+#   3 min  →  450 words  → 3 chunks
+#   6 min  →  900 words  → 5 chunks
+#  10 min  → 1500 words  → 8 chunks
+#  13 min  → 1950 words  → 10 chunks
+#  15 min  → 2250 words  → 12 chunks
 DURATION_PRESETS = {
     "short": 3,
     "medium": 6,
     "long": 10,
+    "extended": 13,
+    "feature": 15,
 }
 DEFAULT_DURATION_MINUTES = DURATION_PRESETS["medium"]
 
