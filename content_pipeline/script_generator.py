@@ -213,16 +213,20 @@ def _desired_chapter_count(duration_minutes: float) -> int:
 
 
 def _scene_count_for_words(word_budget: int) -> tuple:
-    # Divisors raised from (90, 50) → (200, 140).
-    # Old values told the LLM each scene only needed 50-90 words (~20-36 s of
-    # audio) — far too short for a documentary clip and the main reason a
-    # 13-min video generated 29 clips instead of ~10.  New values target
-    # 140-200 words per scene (~56-80 s of audio), which:
-    #   • gives the Ken-Burns effect enough time to look intentional
-    #   • cuts total clip count by ~3× for long videos (29 → ~10 for 13 min)
-    #   • keeps render time under ~15 min so Replit won't kill the process
-    scene_low = max(1, round(word_budget / 200))
-    scene_high = max(scene_low + 1, round(word_budget / 140))
+    # Target: each scene ≈ 90-130 words → ~36-52 s of audio at 150 WPM.
+    # That is long enough for a Ken-Burns move to feel intentional, short
+    # enough to keep the viewer engaged (image doesn't feel "stuck").
+    #
+    # With CHUNK_TARGET_WORDS=400 this produces 3-4 scenes per chunk:
+    #   • 400/130 ≈ 3.1 → scene_low  = 3
+    #   • 400/90  ≈ 4.4 → scene_high = 4
+    # Expected total clips per video length:
+    #   6 min  →  3 chunks × 3-4 = 9-12  clips (~3 min render)
+    #   10 min →  4 chunks × 3-4 = 12-16 clips (~5 min render)
+    #   13 min →  5 chunks × 3-4 = 15-20 clips (~7 min render)
+    #   15 min →  6 chunks × 3-4 = 18-24 clips (~8 min render)
+    scene_low = max(1, round(word_budget / 130))
+    scene_high = max(scene_low + 1, round(word_budget / 90))
     return scene_low, scene_high
 
 
