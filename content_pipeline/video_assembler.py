@@ -1048,6 +1048,25 @@ def _build_scene_clip(
 
     media_type = scene.get("media_type", "photo")
     duration = _get_media_duration(scene["audio_path"])
+
+    # Resume support: if a job was interrupted (Replit workspace slept, lost
+    # connection, process restarted) and re-run with the same job_id, the
+    # clips/ directory from the previous attempt is still on disk. Re-using
+    # an already-rendered clip instead of re-encoding it is what makes
+    # resuming a 25-clip render actually fast instead of starting over.
+    # A clip counts as reusable if it exists, is non-empty, and its duration
+    # is within half a second of what this scene's narration audio expects
+    # (guards against a half-written file from a render that was killed
+    # mid-clip).
+    if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        try:
+            existing_duration = _get_media_duration(out_path)
+            if abs(existing_duration - duration) < 0.5:
+                print(f"[video_assembler] Reusing existing clip {index} (resume)")
+                return out_path
+        except Exception:
+            pass  # Fall through and re-render if the existing file is unreadable/corrupt.
+
     fps = SCENE_FPS
     total_frames = int(duration * fps)
 
