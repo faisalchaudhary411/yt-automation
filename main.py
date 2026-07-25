@@ -507,7 +507,12 @@ async function poll(jobId) {
     if (data.step === "done" || data.step === "pending_approval") {
       const r = data.result;
       let extra = "";
-      if (r.preview_url) {
+      if (r.upload_error) {
+        extra += "<p style='color:#E0A15C; border:1px solid #E0A15C; border-radius:8px; padding:8px 10px;'>" +
+                 "⚠️ Rendered, but YouTube upload failed: " + r.upload_error +
+                 "<br>No Telegram approval was sent for this one — check the video below before " +
+                 "deciding whether to retry the upload.</p>";
+      } else if (r.preview_url) {
         extra = "<p>Uploaded to YouTube as <b>private</b>. A Telegram message with an " +
                 "Approve &amp; Publish button has been sent.<br>" +
                 "Private preview available.</p>" +
@@ -918,6 +923,14 @@ def run_pipeline_job(
             print(f"Warning: YouTube upload/notify failed ({e}). Video is still available locally.")
             result["upload_error"] = str(e)
             job_step = "done"
+            try:
+                send_message(
+                    f"⚠️ \"{script['title']}\" finished rendering, but upload to YouTube failed:\n"
+                    f"{e}\n\nThe local file is still available in the Studio — open it there to "
+                    "check whether it's actually a good render before re-uploading."
+                )
+            except Exception as telegram_e:
+                print(f"Warning: failure-notification Telegram message also failed ({telegram_e}).")
 
         # Log this draft to the GitHub state repo so nothing is lost between runs
         try:
@@ -1032,7 +1045,26 @@ def status_endpoint(job_id):
 def resume_job(job_id):
     """Restarts an interrupted job from its last checkpoint (skips script,
     narration, and image steps if already done; video assembly reuses
-    already-rendered scene clips and only renders the missing ones)."""
+    already-rendered scene clips and only renders the missing ones).
+
+    Safety check: if this job_id is still actively running in this same
+    process (i.e. the backend never actually restarted -- only the
+    browser's connection to it dropped), refuse to spawn a second thread.
+    Two threads rendering into the same clip_NNN.mp4 / final video files at
+    once is exactly what produces a corrupted, truncated output file."""
+    with JOBS_LOCK:
+        existing = JOBS.get(job_id)
+    if existing and existing.get("step") not in (None, "done", "error", "interrupted"):
+        message = (
+            "This job is still actively running in this process -- it wasn't actually "
+            "interrupted, only your connection to it dropped. Resuming now would start a "
+            "second render on top of the one already in progress and corrupt the output. "
+            "Just reopen /?job=" + job_id + " and let the existing render keep going."
+        )
+        if request.method == "POST":
+            return jsonify({"error": message, "still_running": True, "current_status": existing}), 409
+        return message, 409
+
     work_dir = ensure_work_dir(job_id)
     checkpoint = _load_checkpoint(work_dir)
     if not checkpoint:
