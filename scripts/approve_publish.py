@@ -26,25 +26,27 @@ matching .github/workflows/approve-publish.yml):
     TELEGRAM_BOT_TOKEN             (optional but recommended)
     TELEGRAM_CHAT_ID               (optional but recommended)
 
-Note on captions: caption upload is intentionally NOT attempted here. The
-.srt file lives on Replit's local disk (output/<job_id>/subtitles.srt),
-which this Actions runner has no access to. If you want captions to keep
-auto-uploading, either run that step while Replit happens to be online, or
-extend the pipeline to also commit .srt files into the GitHub state repo so
-this script can fetch and upload them too.
+Note on captions: this now works. The .srt file is persisted to the GitHub
+state repo (as captions/<job_id>.srt) at render time, since the Actions
+runner has no access to Replit's local disk where it was originally saved.
+This script fetches it from the state repo and uploads it as a caption
+track. If a given draft has no srt_state_path (e.g. subtitles were disabled,
+or it was rendered before this feature existed), captions are skipped for
+that video and everything else still proceeds normally.
 """
 
 import os
 import sys
+import tempfile
 
 # Make sibling modules (config.py, youtube_auth.py, youtube_uploader.py,
 # telegram_notifier.py, automation/) importable when this script is run as
 # `python scripts/approve_publish.py` from the repo root or via Actions.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import github_read_json, github_write_json
+from config import github_read_json, github_write_json, github_read_file, DEFAULT_LANGUAGE
 from youtube_auth import get_access_token
-from youtube_uploader import publish_video
+from youtube_uploader import publish_video, upload_captions
 from telegram_notifier import send_message
 
 
@@ -80,6 +82,27 @@ def main():
 
     # --- Stage 3 post-publish hooks (each independent and non-fatal) ---
     notes = []
+
+    try:
+        srt_state_path = draft.get("srt_state_path")
+        if srt_state_path:
+            srt_bytes = github_read_file(srt_state_path)
+            if srt_bytes:
+                with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
+                    tmp.write(srt_bytes)
+                    tmp_srt_path = tmp.name
+                try:
+                    upload_captions(video_id, tmp_srt_path, draft.get("language", DEFAULT_LANGUAGE), access_token)
+                    notes.append("captions uploaded")
+                finally:
+                    os.remove(tmp_srt_path)
+            else:
+                print(f"Warning: srt_state_path={srt_state_path!r} set on draft but not found in state repo.")
+        else:
+            print("No srt_state_path on this draft -- skipping captions "
+                  "(subtitles disabled, or this job predates the captions-in-state-repo fix).")
+    except Exception as e:
+        print(f"Warning: captions upload failed ({e})")
 
     try:
         from automation import comments as comment_automation
