@@ -30,7 +30,7 @@ import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
 from config import (
-    ensure_work_dir, github_write_json, github_read_json,
+    ensure_work_dir, github_write_json, github_read_json, github_write_file,
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
     LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
@@ -780,6 +780,7 @@ def run_pipeline_job(
         # Each feature is wrapped independently: none of them may break a
         # video that already rendered successfully.
         srt_url = None
+        srt_state_path = None
         try:
             if SUBTITLES_ENABLED:
                 from automation.subtitles import write_srt
@@ -789,6 +790,21 @@ def run_pipeline_job(
                     logo_sting_seconds=logo_sting_seconds,
                 )
                 srt_url = f"/output/{job_id}/{os.path.basename(srt_path)}"
+
+                # Also push the .srt content to the GitHub state repo. The
+                # local path above only exists on Replit's disk -- the
+                # "Approve & Publish Video" GitHub Actions workflow runs on
+                # a fresh runner with no access to it, so without this,
+                # caption auto-upload silently can't happen from that path.
+                try:
+                    with open(srt_path, "r", encoding="utf-8") as f:
+                        srt_content = f.read()
+                    srt_state_path = f"captions/{job_id}.srt"
+                    github_write_file(srt_state_path, srt_content, message=f"Add captions: {script['title']}")
+                except Exception as e:
+                    print(f"Warning: could not persist .srt to state repo ({e}). "
+                          "Captions won't auto-upload via the GitHub Actions approval flow.")
+                    srt_state_path = None
         except Exception as e:
             print(f"Warning: subtitle generation failed ({e}). Continuing without SRT.")
 
@@ -853,6 +869,7 @@ def run_pipeline_job(
             "tags": script["tags"],
             "video_url": f"/output/{job_id}/{os.path.basename(video_path)}",
             "srt_url": srt_url,
+            "srt_state_path": srt_state_path,
             "thumbnail_url": thumbnail_url,
             "status": "ready_for_review",
         }

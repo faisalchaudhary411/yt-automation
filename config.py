@@ -256,6 +256,64 @@ def github_read_json(path, default=None):
     return json.loads(content)
 
 
+def github_write_file(path, content, message="update state"):
+    """Write/overwrite an arbitrary (non-JSON) file in the state repo -- used
+    for the .srt caption file, so it's available to the "Approve & Publish
+    Video" GitHub Actions workflow, which has no access to Replit's local
+    disk. `content` may be a str (encoded as utf-8) or raw bytes. Falls back
+    to a local copy under WORK_DIR if the GitHub API fails."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}"
+    raw = content.encode("utf-8") if isinstance(content, str) else content
+
+    sha = None
+    try:
+        get_resp = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH})
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+        elif get_resp.status_code != 404:
+            print(f"Warning: GitHub GET {path} returned {get_resp.status_code}: {get_resp.text[:200]}")
+    except Exception as e:
+        print(f"Warning: GitHub GET failed ({e}), will try local fallback")
+
+    payload = {
+        "message": message,
+        "content": base64.b64encode(raw).decode("utf-8"),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    try:
+        put_resp = requests.put(url, headers=_gh_headers(), json=payload)
+        if put_resp.status_code in (200, 201):
+            return put_resp.json()
+        print(f"Warning: GitHub PUT {path} returned {put_resp.status_code}: {put_resp.text[:300]}")
+    except Exception as e:
+        print(f"Warning: GitHub PUT failed ({e})")
+
+    local_path = os.path.join(WORK_DIR, path)
+    dir_name = os.path.dirname(local_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    else:
+        os.makedirs(WORK_DIR, exist_ok=True)
+    with open(local_path, "wb") as f:
+        f.write(raw)
+    print(f"Saved {path} locally to {local_path} (GitHub unavailable)")
+    return {"local_path": local_path}
+
+
+def github_read_file(path):
+    """Read an arbitrary (non-JSON) file's raw bytes from the state repo.
+    Returns None if it doesn't exist."""
+    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{path}"
+    resp = requests.get(url, headers=_gh_headers(), params={"ref": GITHUB_BRANCH})
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return base64.b64decode(resp.json()["content"])
+
+
 def github_write_json(path, data, message="update state"):
     """Write/overwrite a JSON file in the state repo (creates it if missing).
     Falls back to local file if GitHub API fails."""
