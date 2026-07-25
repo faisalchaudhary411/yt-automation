@@ -26,7 +26,6 @@ import json
 import time
 import uuid
 import threading
-import secrets as pysecrets
 import traceback
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
@@ -35,7 +34,7 @@ from config import (
     CHANNEL_NAME, LANGUAGES, DEFAULT_LANGUAGE, DURATION_PRESETS, DEFAULT_DURATION_MINUTES,
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
     LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
-    SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED, WORK_DIR,
+    SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED, WORK_DIR, APP_GITHUB_REPO,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -44,7 +43,7 @@ from content_pipeline.video_assembler import assemble_video, _get_media_duration
 from automation.subtitles import compute_scene_start_times
 from youtube_auth import build_authorize_url, exchange_code_for_tokens, get_access_token, REPL_URL, build_callback_html
 from youtube_uploader import upload_video, publish_video, set_thumbnail, upload_captions
-from telegram_notifier import send_approval_request, send_message
+from telegram_notifier import send_approval_request_actions, send_message
 
 app = Flask(__name__)
 
@@ -295,6 +294,7 @@ PAGE = """
     <p class="eyebrow">{{ channel_name }} · Video Studio</p>
     <h1>Generate a video draft</h1>
     <a class="connect-link" href="/authorize" target="_blank">Connect / reconnect YouTube channel</a>
+    <a class="connect-link" href="/resumable" style="margin-left:8px;">Resume interrupted job</a>
   </div>
 </div>
 
@@ -394,6 +394,16 @@ const btn = document.getElementById("genBtn");
 const prefillTopic = new URLSearchParams(window.location.search).get("topic");
 if (prefillTopic) { document.getElementById("topic").value = prefillTopic; }
 
+// If we just got redirected here from /resume/<job_id>, jump straight into
+// polling that job instead of showing an empty form.
+const resumeJobId = new URLSearchParams(window.location.search).get("job");
+if (resumeJobId) {
+  btn.disabled = true;
+  document.getElementById("progressWrap").style.display = "block";
+  progressLabel.textContent = "Resuming…";
+  poll(resumeJobId);
+}
+
 const STEP_LABELS = {
   queued: "Queued…",
   script: "Generating script…",
@@ -403,6 +413,7 @@ const STEP_LABELS = {
   uploading: "Uploading to YouTube (private)…",
   pending_approval: "Uploaded! Check Telegram to approve publishing.",
   done: "Done!",
+  interrupted: "Connection lost — resumable, no work is lost.",
   error: "Failed."
 };
 
@@ -452,7 +463,41 @@ form.addEventListener("submit", async (e) => {
 async function poll(jobId) {
   try {
     const resp = await fetch("/status/" + jobId);
+
+    if (resp.status === 404) {
+      // Truly gone -- no checkpoint on disk either, nothing to resume.
+      document.getElementById("progressWrap").style.display = "none";
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorStep").textContent = "Connection lost";
+      document.getElementById("errorMessage").textContent =
+        "This job is no longer running and left no checkpoint to resume. You'll need to start a new one.";
+      btn.disabled = false;
+      return;
+    }
+
     const data = await resp.json();
+
+    if (data.step === "interrupted") {
+      // Process restarted mid-job, but a checkpoint survived on disk --
+      // offer a one-tap resume instead of polling a dead job forever.
+      document.getElementById("progressWrap").style.display = "none";
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorStep").textContent = "Connection lost, but nothing is lost";
+      document.getElementById("errorMessage").textContent = data.detail || "";
+      const errBox = document.getElementById("errorBox");
+      if (!document.getElementById("resumeBtn")) {
+        const resumeBtn = document.createElement("a");
+        resumeBtn.id = "resumeBtn";
+        resumeBtn.className = "action-link";
+        resumeBtn.style.marginTop = "10px";
+        resumeBtn.style.display = "inline-block";
+        resumeBtn.href = data.resume_url;
+        resumeBtn.textContent = "▶ Resume this job";
+        errBox.appendChild(resumeBtn);
+      }
+      btn.disabled = false;
+      return;
+    }
 
     const pct = typeof data.progress === "number" ? Math.max(0, Math.min(100, data.progress)) : 0;
     document.getElementById("progressFill").style.width = pct + "%";
@@ -530,6 +575,73 @@ def _set_progress(job_id: str, step: str, fraction: float, detail: str = None):
     _set_job(job_id, **fields)
 
 
+CHECKPOINT_FILENAME = "checkpoint.json"
+
+
+def _checkpoint_path(work_dir: str) -> str:
+    return os.path.join(work_dir, CHECKPOINT_FILENAME)
+
+
+def _save_checkpoint(work_dir: str, stage: str, script: dict, params: dict):
+    """Persists enough state to resume this job from the given stage without
+    redoing already-completed work (script generation, narration audio,
+    image fetching -- and any scene clips already rendered to disk, which
+    video_assembler.py itself now detects and reuses). Written to local
+    disk under the job's work_dir, which survives a Replit workspace
+    sleep/restart even though the in-memory JOBS dict does not."""
+    data = {"stage": stage, "script": script, "params": params}
+    path = _checkpoint_path(work_dir)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, path)  # atomic -- avoids a half-written checkpoint if the process dies mid-write
+
+
+def _load_checkpoint(work_dir: str):
+    path = _checkpoint_path(work_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _clear_checkpoint(work_dir: str):
+    try:
+        os.remove(_checkpoint_path(work_dir))
+    except FileNotFoundError:
+        pass
+
+
+def list_resumable_jobs():
+    """Scans WORK_DIR for interrupted jobs (checkpoint.json present, meaning
+    a previous attempt got past script generation but the process never
+    reached the end of run_pipeline_job to clear it)."""
+    jobs = []
+    if not os.path.isdir(WORK_DIR):
+        return jobs
+    for job_id in os.listdir(WORK_DIR):
+        work_dir = os.path.join(WORK_DIR, job_id)
+        checkpoint = _load_checkpoint(work_dir)
+        if not checkpoint:
+            continue
+        params = checkpoint.get("params", {})
+        try:
+            mtime = os.path.getmtime(_checkpoint_path(work_dir))
+        except OSError:
+            mtime = 0
+        jobs.append({
+            "job_id": job_id,
+            "topic": params.get("topic", "(unknown topic)"),
+            "stage": checkpoint.get("stage", "unknown"),
+            "updated_at": mtime,
+        })
+    jobs.sort(key=lambda j: j["updated_at"], reverse=True)
+    return jobs
+
+
 def run_pipeline_job(
     job_id: str,
     topic: str,
@@ -541,47 +653,81 @@ def run_pipeline_job(
     include_intro: bool = True,
     include_outro: bool = True,
 ):
-    """Runs the full Stage 1 pipeline for one topic inside a background thread."""
+    """Runs the full Stage 1 pipeline for one topic inside a background thread.
+
+    Resumable: if work_dir/checkpoint.json already exists for this job_id
+    (saved by a previous attempt that got interrupted -- Replit workspace
+    sleeping, lost connection, process restart, etc.), already-completed
+    stages are skipped entirely and video assembly picks up using whatever
+    scene clips already exist on disk, instead of starting the whole
+    15-30+ minute pipeline over from scratch.
+    """
     try:
         work_dir = ensure_work_dir(job_id)
-
-        _set_progress(job_id, "script", 0.0, detail="Starting script generation…")
-        print(f"[1/4] Generating script for: {topic} (brief={'yes' if brief else 'no'}, "
-              f"lang={language}, ~{duration_minutes}min, style={style})")
-
-        def _script_progress(chunks_done, total_chunks):
-            frac = chunks_done / total_chunks if total_chunks else 0.0
-            _set_progress(job_id, "script", frac, detail=f"Writing script: chunk {chunks_done}/{total_chunks}")
-
-        script = generate_script(
-            topic, brief=brief, language=language, duration_minutes=duration_minutes, style=style,
-            progress_callback=_script_progress,
+        params = dict(
+            topic=topic, brief=brief, language=language, duration_minutes=duration_minutes,
+            voice_gender=voice_gender, style=style, include_intro=include_intro, include_outro=include_outro,
         )
 
-        _set_progress(job_id, "audio", 0.0, detail=f"Generating narration audio ({len(script['scenes'])} scenes)…")
-        print(f"[2/4] Generating narration audio ({len(script['scenes'])} scenes, voice={voice_gender})")
+        checkpoint = _load_checkpoint(work_dir)
+        script = checkpoint["script"] if checkpoint else None
+        stage = checkpoint["stage"] if checkpoint else None
 
-        def _audio_progress(done, total):
-            frac = done / total if total else 0.0
-            _set_progress(job_id, "audio", frac, detail=f"Narration audio: {done}/{total} scenes")
+        if script and stage in ("script_done", "audio_done", "images_done"):
+            print(f"[resume] Found checkpoint at stage={stage} for job {job_id}; skipping completed steps.")
 
-        script["scenes"] = generate_all_scene_audio(
-            script["scenes"], work_dir, language=language, voice_gender=voice_gender,
-            progress_callback=_audio_progress,
-        )
-        _set_progress(job_id, "audio", 1.0, detail="Narration audio complete")
+        if stage in ("script_done", "audio_done", "images_done"):
+            _set_progress(job_id, "script", 1.0, detail="Resumed: script already generated")
+        else:
+            _set_progress(job_id, "script", 0.0, detail="Starting script generation…")
+            print(f"[1/4] Generating script for: {topic} (brief={'yes' if brief else 'no'}, "
+                  f"lang={language}, ~{duration_minutes}min, style={style})")
 
-        _set_progress(job_id, "images", 0.0, detail="Fetching scene images…")
-        print("[3/4] Fetching scene images")
+            def _script_progress(chunks_done, total_chunks):
+                frac = chunks_done / total_chunks if total_chunks else 0.0
+                _set_progress(job_id, "script", frac, detail=f"Writing script: chunk {chunks_done}/{total_chunks}")
 
-        def _images_progress(phase, done, total):
-            # Search and download are each half of this step.
-            frac = (0.5 * (done / total if total else 0.0)) if phase == "search" else (0.5 + 0.5 * (done / total if total else 0.0))
-            label = "Searching images" if phase == "search" else "Downloading images"
-            _set_progress(job_id, "images", frac, detail=f"{label}: {done}/{total} scenes")
+            script = generate_script(
+                topic, brief=brief, language=language, duration_minutes=duration_minutes, style=style,
+                progress_callback=_script_progress,
+            )
+            stage = "script_done"
+            _save_checkpoint(work_dir, stage, script, params)
 
-        script["scenes"] = fetch_all_scene_images(script["scenes"], work_dir, progress_callback=_images_progress)
-        _set_progress(job_id, "images", 1.0, detail="Scene images complete")
+        if stage in ("audio_done", "images_done"):
+            _set_progress(job_id, "audio", 1.0, detail="Resumed: narration audio already generated")
+        else:
+            _set_progress(job_id, "audio", 0.0, detail=f"Generating narration audio ({len(script['scenes'])} scenes)…")
+            print(f"[2/4] Generating narration audio ({len(script['scenes'])} scenes, voice={voice_gender})")
+
+            def _audio_progress(done, total):
+                frac = done / total if total else 0.0
+                _set_progress(job_id, "audio", frac, detail=f"Narration audio: {done}/{total} scenes")
+
+            script["scenes"] = generate_all_scene_audio(
+                script["scenes"], work_dir, language=language, voice_gender=voice_gender,
+                progress_callback=_audio_progress,
+            )
+            _set_progress(job_id, "audio", 1.0, detail="Narration audio complete")
+            stage = "audio_done"
+            _save_checkpoint(work_dir, stage, script, params)
+
+        if stage == "images_done":
+            _set_progress(job_id, "images", 1.0, detail="Resumed: scene images already fetched")
+        else:
+            _set_progress(job_id, "images", 0.0, detail="Fetching scene images…")
+            print("[3/4] Fetching scene images")
+
+            def _images_progress(phase, done, total):
+                # Search and download are each half of this step.
+                frac = (0.5 * (done / total if total else 0.0)) if phase == "search" else (0.5 + 0.5 * (done / total if total else 0.0))
+                label = "Searching images" if phase == "search" else "Downloading images"
+                _set_progress(job_id, "images", frac, detail=f"{label}: {done}/{total} scenes")
+
+            script["scenes"] = fetch_all_scene_images(script["scenes"], work_dir, progress_callback=_images_progress)
+            _set_progress(job_id, "images", 1.0, detail="Scene images complete")
+            stage = "images_done"
+            _save_checkpoint(work_dir, stage, script, params)
 
         _set_progress(job_id, "video", 0.0, detail="Assembling final video…")
         print("[4/4] Assembling final video")
@@ -625,6 +771,10 @@ def run_pipeline_job(
             music_path=music_path,
             chapters=script.get("chapters"),
         )
+        # The video is fully rendered -- clear the checkpoint. Anything that
+        # fails past this point (upload, Telegram, SEO enhancement, etc.) is
+        # non-fatal and unrelated to the long, resumable part of the job.
+        _clear_checkpoint(work_dir)
 
         # --- Stage 3a: subtitles, SEO metadata, thumbnail (merged features) ---
         # Each feature is wrapped independently: none of them may break a
@@ -730,18 +880,19 @@ def run_pipeline_job(
                     print(f"Warning: thumbnail upload failed ({e}). "
                           "Custom thumbnails require a phone-verified YouTube channel.")
 
-            approval_token = pysecrets.token_urlsafe(16)
-            approve_url = f"{REPL_URL}/approve/{video_id}?token={approval_token}"
             preview_url = f"https://youtube.com/watch?v={video_id}"
 
             result.update({
                 "video_id": video_id,
                 "preview_url": preview_url,
                 "status": "pending_approval",
-                "approval_token": approval_token,
             })
 
-            send_approval_request(script["title"], approve_url, preview_url)
+            # Approval now happens via the "Approve & Publish Video" GitHub
+            # Actions workflow (scripts/approve_publish.py), not this Replit
+            # route -- that way publishing works even if the Replit
+            # workspace is asleep or the preview URL has changed.
+            send_approval_request_actions(script["title"], video_id, preview_url, APP_GITHUB_REPO)
             job_step = "pending_approval"
             _set_progress(job_id, "uploading", 1.0, detail="Uploaded, awaiting approval")
         except Exception as e:
@@ -838,9 +989,115 @@ def generate_endpoint():
 def status_endpoint(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job:
-        return jsonify({"error": "Unknown job_id"}), 404
-    return jsonify(job)
+    if job:
+        return jsonify(job)
+
+    # Not in memory -- most likely the process restarted (Replit workspace
+    # slept, connection dropped, etc.) and the in-memory JOBS dict was lost.
+    # Check whether this job has a checkpoint on disk before giving up, so
+    # the frontend can offer to resume instead of polling a dead job_id
+    # forever.
+    work_dir = os.path.join(WORK_DIR, job_id)
+    checkpoint = _load_checkpoint(work_dir)
+    if checkpoint:
+        return jsonify({
+            "step": "interrupted",
+            "progress": None,
+            "detail": "Connection was lost before this finished. It can be resumed without starting over.",
+            "resumable": True,
+            "resume_url": f"/resume/{job_id}",
+        })
+
+    return jsonify({"error": "Unknown job_id"}), 404
+
+
+@app.route("/resume/<job_id>", methods=["GET", "POST"])
+def resume_job(job_id):
+    """Restarts an interrupted job from its last checkpoint (skips script,
+    narration, and image steps if already done; video assembly reuses
+    already-rendered scene clips and only renders the missing ones)."""
+    work_dir = ensure_work_dir(job_id)
+    checkpoint = _load_checkpoint(work_dir)
+    if not checkpoint:
+        return jsonify({"error": f"No resumable checkpoint found for job_id={job_id}."}), 404
+
+    params = checkpoint.get("params", {})
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "step": "queued", "topic": params.get("topic", ""), "created_at": time.time(),
+            "progress": 0.0, "detail": "Resuming from checkpoint…",
+        }
+
+    thread = threading.Thread(
+        target=run_pipeline_job,
+        args=(
+            job_id,
+            params.get("topic", ""),
+            params.get("brief", ""),
+            params.get("language", DEFAULT_LANGUAGE),
+            params.get("duration_minutes", DEFAULT_DURATION_MINUTES),
+            params.get("voice_gender", DEFAULT_VOICE_GENDER),
+            params.get("style", DEFAULT_VIDEO_STYLE),
+            params.get("include_intro", True),
+            params.get("include_outro", True),
+        ),
+        daemon=True,
+    )
+    thread.start()
+
+    if request.method == "POST":
+        return jsonify({"job_id": job_id, "resumed": True})
+    return redirect(f"/?job={job_id}")
+
+
+RESUMABLE_PAGE = """
+<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Resume a job — {{ channel_name }}</title>
+<style>
+  body { margin:0; background:#0B1220; color:#EDEAE2;
+         font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif; }
+  .container { max-width:640px; margin:0 auto; padding:20px; }
+  h1 { font-family:Georgia,serif; font-weight:400; font-size:24px; }
+  .eyebrow { font-size:12px; letter-spacing:0.16em; text-transform:uppercase;
+             color:#C6A454; font-weight:600; margin:18px 0 6px 0; }
+  .job { background:#141B2D; border:1px solid rgba(198,164,84,0.22);
+         border-radius:12px; padding:14px 16px; margin-bottom:12px; }
+  .job .title { font-size:15px; margin:0 0 6px 0; }
+  .job .meta { font-size:12px; color:#8B93A6; margin-bottom:10px; }
+  a.resume { font-size:13px; color:#1A1305; text-decoration:none; font-weight:600;
+             background:#C6A454; padding:8px 14px; border-radius:20px; display:inline-block; }
+  a.resume:hover { background:#DFC078; }
+  .nav { margin:16px 0; }
+  .nav a { color:#DFC078; font-size:13px; text-decoration:none; }
+</style>
+</head>
+<body>
+<div class=\"container\">
+  <p class=\"eyebrow\">{{ channel_name }}</p>
+  <h1>Interrupted jobs</h1>
+  <div class=\"nav\"><a href=\"/\">&larr; Back to studio</a></div>
+  {% for j in jobs %}
+  <div class=\"job\">
+    <p class=\"title\">{{ j.topic }}</p>
+    <p class=\"meta\">Stage reached: {{ j.stage }} · job_id: {{ j.job_id }}</p>
+    <a class=\"resume\" href=\"/resume/{{ j.job_id }}\">Resume this job &rarr;</a>
+  </div>
+  {% else %}
+  <p style=\"color:#8B93A6;\">No interrupted jobs found — anything that got cut off should show up here.</p>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/resumable")
+def resumable_page():
+    return render_template_string(RESUMABLE_PAGE, jobs=list_resumable_jobs(), channel_name=CHANNEL_NAME)
 
 
 @app.route("/output/<job_id>/<path:filename>")
