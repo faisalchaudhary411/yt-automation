@@ -147,6 +147,12 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PERSONAL
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
+# The CODE repo (owner/reponame) that holds this app + the
+# .github/workflows/approve-publish.yml workflow -- NOT necessarily the same
+# as GITHUB_REPO above, which is the state repo storing drafts.json etc.
+# Used only to build the "Open Actions to Approve" link sent via Telegram.
+APP_GITHUB_REPO = os.environ.get("APP_GITHUB_REPO", "")
+
 GITHUB_API_BASE = "https://api.github.com"
 
 # Absolute path so gunicorn (production) and flask dev server (local) both
