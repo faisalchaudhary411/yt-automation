@@ -35,6 +35,7 @@ from config import (
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
     LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
     SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED, WORK_DIR, APP_GITHUB_REPO,
+    EXTRA_SUBTITLE_LANGUAGES,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -775,6 +776,7 @@ def run_pipeline_job(
             progress_callback=_video_progress,
             music_path=music_path,
             chapters=script.get("chapters"),
+            language=language,
         )
         # The video is fully rendered -- clear the checkpoint. Anything that
         # fails past this point (upload, Telegram, SEO enhancement, etc.) is
@@ -786,6 +788,7 @@ def run_pipeline_job(
         # video that already rendered successfully.
         srt_url = None
         srt_state_path = None
+        extra_srt_state_paths = {}
         try:
             if SUBTITLES_ENABLED:
                 from automation.subtitles import write_srt
@@ -810,6 +813,37 @@ def run_pipeline_job(
                     print(f"Warning: could not persist .srt to state repo ({e}). "
                           "Captions won't auto-upload via the GitHub Actions approval flow.")
                     srt_state_path = None
+
+                # Extra (translated, not re-narrated) caption tracks --
+                # opt-in via EXTRA_SUBTITLE_LANGUAGES in config.py. Each
+                # language is independent: one failing (a bad translation
+                # call, a state-repo hiccup) never blocks the others or the
+                # main .srt above.
+                for extra_lang in EXTRA_SUBTITLE_LANGUAGES:
+                    if extra_lang == language:
+                        continue  # nothing to translate -- it's already the narration language
+                    try:
+                        from automation.subtitles import write_extra_language_srt
+                        extra_srt_path = write_extra_language_srt(
+                            script["scenes"], work_dir,
+                            source_language_name=LANGUAGES.get(language, language),
+                            target_language=extra_lang,
+                            target_language_name=LANGUAGES.get(extra_lang, extra_lang),
+                            include_intro=include_intro, include_outro=include_outro,
+                            chapters=script.get("chapters"), crossfade_seconds=crossfade_seconds,
+                            logo_sting_seconds=logo_sting_seconds,
+                        )
+                        with open(extra_srt_path, "r", encoding="utf-8") as f:
+                            extra_srt_content = f.read()
+                        extra_state_path = f"captions/{job_id}_{extra_lang}.srt"
+                        github_write_file(
+                            extra_state_path, extra_srt_content,
+                            message=f"Add {extra_lang} captions: {script['title']}",
+                        )
+                        extra_srt_state_paths[extra_lang] = extra_state_path
+                    except Exception as e:
+                        print(f"Warning: extra subtitle language '{extra_lang}' failed ({e}). "
+                              "Skipping just this one language.")
         except Exception as e:
             print(f"Warning: subtitle generation failed ({e}). Continuing without SRT.")
 
@@ -834,7 +868,7 @@ def run_pipeline_job(
 
                 thumbnail_path = os.path.join(work_dir, "thumbnail.jpg")
                 generate_thumbnail(
-                    script["title"], thumb_bg, thumbnail_path,
+                    script.get("thumbnail_text") or script["title"], thumb_bg, thumbnail_path,
                     stat_text=script.get("thumbnail_stat", ""),
                     accent_color=style_conf.get("accent_color", (198, 164, 84)),
                 )
@@ -875,6 +909,7 @@ def run_pipeline_job(
             "video_url": f"/output/{job_id}/{os.path.basename(video_path)}",
             "srt_url": srt_url,
             "srt_state_path": srt_state_path,
+            "extra_srt_state_paths": extra_srt_state_paths,
             "thumbnail_url": thumbnail_url,
             "status": "ready_for_review",
         }

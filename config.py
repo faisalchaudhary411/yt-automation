@@ -51,6 +51,14 @@ LANGUAGES = {
     "ru": "Russian",
     "it": "Italian",
     "id": "Indonesian",
+    # South Asia region additions
+    "bn": "Bengali",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "ne": "Nepali",
+    "si": "Sinhala",
 }
 DEFAULT_LANGUAGE = "en"
 
@@ -85,7 +93,43 @@ EDGE_VOICES = {
     "ru": {"female": "ru-RU-SvetlanaNeural", "male": "ru-RU-DmitryNeural"},
     "it": {"female": "it-IT-ElsaNeural", "male": "it-IT-DiegoNeural"},
     "id": {"female": "id-ID-GadisNeural", "male": "id-ID-ArdiNeural"},
+    # South Asia region additions (voice names verified against Microsoft's
+    # current edge-tts neural voice list). Bengali defaults to the
+    # Bangladesh accent (bn-BD) rather than the West Bengal/India one
+    # (bn-IN) -- swap if you're targeting West Bengal specifically.
+    "bn": {"female": "bn-BD-NabanitaNeural", "male": "bn-BD-PradeepNeural"},
+    "ta": {"female": "ta-IN-PallaviNeural", "male": "ta-IN-ValluvarNeural"},
+    "te": {"female": "te-IN-ShrutiNeural", "male": "te-IN-MohanNeural"},
+    "mr": {"female": "mr-IN-AarohiNeural", "male": "mr-IN-ManoharNeural"},
+    "gu": {"female": "gu-IN-DhwaniNeural", "male": "gu-IN-NiranjanNeural"},
+    "ne": {"female": "ne-NP-HemkalaNeural", "male": "ne-NP-SagarNeural"},
+    "si": {"female": "si-LK-ThiliniNeural", "male": "si-LK-SameeraNeural"},
 }
+
+# Languages with a VERIFIED working font for burned-in on-screen captions
+# (video_assembler.py's Pillow caption/stat-overlay text). Font resolution
+# there only knows two script families -- Latin and Arabic/Urdu -- so
+# Devanagari (hi/mr/ne), Bengali (bn), Tamil (ta), Telugu (te), Gujarati
+# (gu), and Sinhala (si) are deliberately left OUT here: burning their text
+# onto video frames with the current fonts would either crash the render or
+# show broken tofu-box glyphs. Narration audio and the downloadable/uploaded
+# .srt file are unaffected either way -- those are plain text with no font
+# rendering involved, so every language in LANGUAGES above works for them
+# regardless of this list.
+CAPTION_FONT_SUPPORTED_LANGUAGES = {
+    "en", "es", "fr", "de", "pt", "ur", "ar", "tr", "ru", "it", "id",
+}
+
+# Extra YouTube caption tracks to auto-generate for EVERY video, in addition
+# to its own narration language. These are TRANSLATED (not re-narrated) --
+# same scene timing as the main .srt, just different displayed text -- and
+# uploaded as additional caption tracks so the video reaches viewers in
+# languages it wasn't spoken in. Empty by default (opt-in): each language
+# costs one extra LLM call per video. Use codes from LANGUAGES above, e.g.:
+#   EXTRA_SUBTITLE_LANGUAGES = ["en", "hi"]
+# A language equal to the video's own narration language is skipped
+# automatically (nothing to translate).
+EXTRA_SUBTITLE_LANGUAGES = []
 DEFAULT_VOICE_GENDER = "female"
 
 # Video style presets: each shapes the narrator's tone (via the script prompt)
