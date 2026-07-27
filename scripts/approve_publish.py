@@ -104,6 +104,27 @@ def main():
     except Exception as e:
         print(f"Warning: captions upload failed ({e})")
 
+    # Extra (translated) caption tracks, if any were generated for this
+    # video -- each one is a separate, independent YouTube caption track in
+    # a language the video wasn't narrated in.
+    for extra_lang, extra_state_path in (draft.get("extra_srt_state_paths") or {}).items():
+        try:
+            extra_bytes = github_read_file(extra_state_path)
+            if not extra_bytes:
+                print(f"Warning: extra_srt_state_paths[{extra_lang!r}]={extra_state_path!r} not found in state repo.")
+                continue
+            with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
+                tmp.write(extra_bytes)
+                tmp_extra_path = tmp.name
+            try:
+                upload_captions(video_id, tmp_extra_path, extra_lang, access_token,
+                                 name=f"{extra_lang} (auto-translated)")
+                notes.append(f"{extra_lang} captions uploaded")
+            finally:
+                os.remove(tmp_extra_path)
+        except Exception as e:
+            print(f"Warning: extra caption upload for '{extra_lang}' failed ({e})")
+
     try:
         from automation import comments as comment_automation
         if comment_automation.maybe_post_welcome_comment(video_id):
