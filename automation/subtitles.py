@@ -102,17 +102,31 @@ def compute_scene_start_times(
 
 def build_srt(scenes: list, include_intro: bool = True, include_outro: bool = True,
               chapters: list = None, crossfade_seconds: float = CROSSFADE_SECONDS,
-              logo_sting_seconds: float = 0.0) -> str:
-    """Builds SRT content from scene dicts (needs narration + audio_path)."""
+              logo_sting_seconds: float = 0.0, translated_texts: list = None) -> str:
+    """Builds SRT content from scene dicts (needs narration + audio_path).
+
+    translated_texts: if given, an EXTRA-language subtitle track uses this
+    text instead of each scene's own narration -- same length/order as
+    `scenes`, same timing either way (translation doesn't change audio, so
+    the original narration's timing still applies)."""
     durations = [_get_media_duration(s["audio_path"]) for s in scenes]
     starts = compute_scene_start_times(
         durations, include_intro, include_outro, chapters, crossfade_seconds, logo_sting_seconds,
     )
 
+    if translated_texts is not None and len(translated_texts) != len(scenes):
+        raise ValueError(
+            f"translated_texts has {len(translated_texts)} items but there are {len(scenes)} scenes -- "
+            "refusing to build a subtitle track with mismatched, misaligned lines."
+        )
+
     entries = []
     idx = 1
-    for scene, start, dur in zip(scenes, starts, durations):
-        text = _strip_narration_markers_for_captions(scene.get("narration", ""))
+    for i, (scene, start, dur) in enumerate(zip(scenes, starts, durations)):
+        if translated_texts is not None:
+            text = translated_texts[i].strip()
+        else:
+            text = _strip_narration_markers_for_captions(scene.get("narration", ""))
         if not text.strip():
             continue
         entries.append(
@@ -133,4 +147,31 @@ def write_srt(scenes: list, work_dir: str, include_intro: bool = True,
             scenes, include_intro, include_outro, chapters, crossfade_seconds, logo_sting_seconds,
         ))
     print(f"[subtitles] SRT written: {srt_path}")
+    return srt_path
+
+
+def write_extra_language_srt(
+    scenes: list, work_dir: str, source_language_name: str, target_language: str,
+    target_language_name: str, include_intro: bool = True, include_outro: bool = True,
+    chapters: list = None, crossfade_seconds: float = CROSSFADE_SECONDS,
+    logo_sting_seconds: float = 0.0,
+) -> str:
+    """Translates every scene's narration into target_language and writes it
+    as an EXTRA subtitle track (subtitles_<target_language>.srt), reusing
+    the exact same scene timing as the main .srt -- only the displayed text
+    changes, not the audio or timing. Meant for uploading as an additional
+    YouTube caption track alongside the video's own narration language, so
+    the video reaches viewers in languages it wasn't narrated in."""
+    from content_pipeline.script_generator import translate_narrations
+
+    narrations = [_strip_narration_markers_for_captions(s.get("narration", "")) for s in scenes]
+    translated = translate_narrations(narrations, source_language_name, target_language_name)
+
+    srt_path = os.path.join(work_dir, f"subtitles_{target_language}.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(build_srt(
+            scenes, include_intro, include_outro, chapters, crossfade_seconds, logo_sting_seconds,
+            translated_texts=translated,
+        ))
+    print(f"[subtitles] Extra-language SRT written ({target_language}): {srt_path}")
     return srt_path

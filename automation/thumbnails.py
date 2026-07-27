@@ -61,6 +61,10 @@ def _add_gradient(img: Image.Image) -> Image.Image:
 
 
 def _draw_title(img: Image.Image, title: str, accent_color: tuple = GOLD[:3]) -> Image.Image:
+    """Draws the thumbnail headline. Expects a SHORT hook (script's
+    thumbnail_text, ~2-5 words) rather than the full video title -- real
+    high-CTR thumbnails use a handful of huge words, not a wrapped sentence.
+    Falls back gracefully if an older script only has a full title."""
     draw = ImageDraw.Draw(img)
     is_latin = _is_latin_text(title)
     font_path = _resolve_font_path(for_latin=is_latin)
@@ -68,25 +72,33 @@ def _draw_title(img: Image.Image, title: str, accent_color: tuple = GOLD[:3]) ->
         print("[thumbnails] No verified font — skipping title text.")
         return img
 
-    fontsize = 64
-    max_chars = max(12, int(THUMB_SIZE[0] * 0.9 / (fontsize * 0.6)))
-    lines = textwrap.wrap(title, width=max_chars, break_long_words=False)[:3]
+    # Bigger than before (was 64px) -- a short hook can afford to be much
+    # larger and still fit, which is exactly what makes it readable at
+    # thumbnail size on a phone feed.
+    fontsize = 92
+    max_chars = max(8, int(THUMB_SIZE[0] * 0.92 / (fontsize * 0.58)))
+    lines = textwrap.wrap(title, width=max_chars, break_long_words=False)[:2]
     if not lines:
         return img
 
     font = ImageFont.truetype(font_path, fontsize)
-    line_h = int(fontsize * 1.25)
+    line_h = int(fontsize * 1.22)
     total_h = len(lines) * line_h
     y = THUMB_SIZE[1] - total_h - 70
+
+    # Bright, near-white yellow reads as more "urgent/clickable" than pure
+    # white against a dark-gradient photo background, and still pairs with
+    # the channel's gold accent rather than clashing with it.
+    HEADLINE_COLOR = (255, 240, 200, 255)
 
     for line in lines:
         prepared = _prepare_text_for_rendering(line, is_latin)
         bb = draw.textbbox((0, 0), prepared, font=font)
         w = bb[2] - bb[0]
         x = (THUMB_SIZE[0] - w) // 2 - bb[0]
-        for dx, dy in [(-3, -3), (-3, 3), (3, -3), (3, 3), (0, 4), (4, 0), (-4, 0), (0, -4)]:
-            draw.text((x + dx, y + dy - bb[1]), prepared, font=font, fill=(0, 0, 0, 200))
-        draw.text((x, y - bb[1]), prepared, font=font, fill=(255, 255, 255, 255))
+        for dx, dy in [(-4, -4), (-4, 4), (4, -4), (4, 4), (0, 5), (5, 0), (-5, 0), (0, -5)]:
+            draw.text((x + dx, y + dy - bb[1]), prepared, font=font, fill=(0, 0, 0, 220))
+        draw.text((x, y - bb[1]), prepared, font=font, fill=HEADLINE_COLOR)
         y += line_h
 
     # Accent bar above the title — matches the video's own style accent color.
@@ -152,8 +164,8 @@ def generate_thumbnail(title: str, background_image_path: str, out_path: str,
     if background_image_path and os.path.isfile(background_image_path):
         img = Image.open(background_image_path).convert("RGB")
         img = _cover_crop(img).convert("RGBA")
-        img = ImageEnhance.Contrast(img).enhance(1.05)
-        img = ImageEnhance.Color(img).enhance(1.1)
+        img = ImageEnhance.Contrast(img).enhance(1.18)
+        img = ImageEnhance.Color(img).enhance(1.3)
         img = img.filter(ImageFilter.GaussianBlur(radius=0.4))
     else:
         # Fallback: brand-colored backdrop if no scene image is available.
