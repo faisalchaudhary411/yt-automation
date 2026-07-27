@@ -300,6 +300,13 @@ TITLE RULES (very important):
 THUMBNAIL FIELDS (separate from the video itself — used only for the clickable
 YouTube thumbnail image, which needs its own dedicated background photo and a
 bold number, not whatever image a random narration scene happened to use):
+- "thumbnail_text": a SHORT, punchy thumbnail headline — 2-5 words, ALL CAPS
+  in {language_name}, the kind of huge-bold-text hook real top-performing
+  history/finance YouTube thumbnails use (e.g. "TULIPS WORTH MORE THAN
+  HOUSES", "THE $2 BILLION MISTAKE", "RICHEST MAN, WORST DECISION"). This is
+  NOT the video title shortened — write it fresh as a standalone visual
+  hook. HARD CAP: 40 characters. Must create curiosity or shock on its own,
+  readable at a glance on a small phone screen thumbnail.
 - "thumbnail_keywords": a 2-4 word ENGLISH photo-search query for a striking,
   dramatic, ON-TOPIC background image representing the WHOLE story at a
   glance — think "what single image would make someone stop scrolling",
@@ -317,6 +324,7 @@ Return ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
   "title": "SEO-friendly YouTube title following the TITLE RULES above, written in {language_name}",
   "description": "2-3 sentence YouTube description, written in {language_name}",
   "tags": ["tag1", "tag2", "..."],
+  "thumbnail_text": "short punchy ALL CAPS thumbnail hook, see THUMBNAIL FIELDS above",
   "thumbnail_keywords": "2-4 word English photo search query, see THUMBNAIL FIELDS above",
   "thumbnail_stat": "short bold stat for the thumbnail, see THUMBNAIL FIELDS above"
 }}
@@ -960,6 +968,9 @@ def _generate_metadata(client: Groq, topic: str, brief: str, language_name: str,
         "title": part.get("title") or topic,
         "description": part.get("description") or "",
         "tags": part.get("tags") or [],
+        # Falls back to the title itself (better than nothing, though less
+        # punchy than a dedicated hook) if the model omits this.
+        "thumbnail_text": (part.get("thumbnail_text") or part.get("title") or topic).strip(),
         # Falls back to the topic itself as a search query, and no stat
         # overlay, if the model omits these -- generate_thumbnail() already
         # handles a missing/empty stat gracefully.
@@ -1160,10 +1171,52 @@ def generate_script(
         "tags": metadata["tags"],
         "scenes": all_scenes,
         "chapters": chapters,
+        "thumbnail_text": metadata["thumbnail_text"],
         "thumbnail_keywords": metadata["thumbnail_keywords"],
         "thumbnail_stat": metadata["thumbnail_stat"],
         "narrative_frame": narrative_frame["name"],
     }
+
+
+def translate_narrations(narrations: list, source_language_name: str, target_language_name: str) -> list:
+    """Translates a list of scene narration strings into another language for
+    an EXTRA subtitle track (not re-narration -- the audio/timing stays the
+    same, only the displayed text changes). Uses the same
+    Cerebras -> SambaNova -> Groq provider chain as script generation.
+    Returns a list the same length as `narrations`, in the same order.
+
+    Note: sent as a single call, so very long videos (15+ scenes) may need
+    this split into batches if it ever hits a provider's output token
+    ceiling -- fine for the duration presets this pipeline currently offers.
+    """
+    if not narrations:
+        return []
+
+    system_prompt = (
+        f"You are translating video narration from {source_language_name} to "
+        f"{target_language_name} for a YouTube subtitle track.\n\n"
+        "Translate each numbered line faithfully and naturally -- keep it "
+        "conversational and roughly the same length/pacing as the original "
+        "(these will be shown as timed subtitles matching the original "
+        "audio, so overly long translations will run past their time slot).\n"
+        "Do not add, remove, or merge lines. Do not translate proper nouns "
+        "that wouldn't normally be translated (names, places) unless "
+        f"{target_language_name} has a standard localized form.\n\n"
+        "Return ONLY valid JSON, no markdown fences, no preamble, in this "
+        'exact shape: {"translations": ["line 1 translated", "line 2 translated", ...]}\n'
+        f"The array MUST have exactly {len(narrations)} items, in the same order as the input."
+    )
+    numbered = "\n".join(f"{i + 1}. {text}" for i, text in enumerate(narrations))
+    client = Groq(api_key=GROQ_API_KEY)
+    result = _call_llm(client, system_prompt, numbered, max_tokens=8192)
+    translations = result.get("translations") or []
+
+    if len(translations) != len(narrations):
+        raise RuntimeError(
+            f"Translation to {target_language_name} returned {len(translations)} lines, "
+            f"expected {len(narrations)}. Not using a partial/misaligned result."
+        )
+    return translations
 
 
 if __name__ == "__main__":

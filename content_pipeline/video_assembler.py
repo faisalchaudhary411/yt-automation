@@ -1037,7 +1037,7 @@ def _render_lower_third_png(
 def _build_scene_clip(
     scene: dict, index: int, work_dir: str, width=SCENE_WIDTH, height=SCENE_HEIGHT, zoom_rate=0.0008,
     channel_name: str = None, accent_color: tuple = (198, 164, 84),
-    total_scenes: int = 0,
+    total_scenes: int = 0, burn_captions: bool = True,
 ) -> str:
     clip_dir = os.path.join(work_dir, "clips")
     os.makedirs(clip_dir, exist_ok=True)
@@ -1074,14 +1074,21 @@ def _build_scene_clip(
     narration_text = _strip_narration_markers_for_captions(scene.get("narration", ""))
     is_latin = _is_latin_text(narration_text)
 
-    caption_pngs = _write_caption_pngs(
-        narration_text, width, height, fontsize, bottom_margin=90,
-        duration=duration, out_dir=clip_dir, prefix=f"scene_{index:03d}", for_latin=is_latin,
-    )
+    if burn_captions:
+        caption_pngs = _write_caption_pngs(
+            narration_text, width, height, fontsize, bottom_margin=90,
+            duration=duration, out_dir=clip_dir, prefix=f"scene_{index:03d}", for_latin=is_latin,
+        )
+    else:
+        # No verified font for this language's script -- skip burning any
+        # text onto the frame rather than risk a broken render or tofu-box
+        # glyphs. The narration audio and the separate .srt file are both
+        # unaffected by this; only the on-screen overlay is skipped.
+        caption_pngs = []
 
     from config import LOWER_THIRDS_ENABLED
     lower_third_info = None
-    if LOWER_THIRDS_ENABLED and duration >= 2.5:
+    if burn_captions and LOWER_THIRDS_ENABLED and duration >= 2.5:
         stat_text = _extract_stat(narration_text)
         if stat_text:
             lt_start = 0.3
@@ -1562,10 +1569,17 @@ def assemble_video(
     progress_callback=None,
     music_path: str = None,
     chapters: list = None,
+    language: str = None,
 ) -> str:
     from config import (
         VIDEO_STYLES, DEFAULT_VIDEO_STYLE, LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
+        CAPTION_FONT_SUPPORTED_LANGUAGES,
     )
+    # Skip burning captions/stat overlays onto the frame for languages whose
+    # script has no verified working font in this file (see
+    # CAPTION_FONT_SUPPORTED_LANGUAGES in config.py). Defaults to True (old
+    # behavior) if language isn't passed, for any other caller.
+    burn_captions = (language in CAPTION_FONT_SUPPORTED_LANGUAGES) if language else True
     style_conf = VIDEO_STYLES.get(style, VIDEO_STYLES[DEFAULT_VIDEO_STYLE])
     bg_color = style_conf["bg_color"]
     zoom_rate = style_conf["zoom_rate"]
@@ -1608,6 +1622,7 @@ def assemble_video(
                 _build_scene_clip, scene, i, work_dir,
                 zoom_rate=zoom_rate, channel_name=channel_name,
                 accent_color=accent_color, total_scenes=total_scenes,
+                burn_captions=burn_captions,
             ): i
             for i, scene in enumerate(scenes)
         }
