@@ -40,19 +40,24 @@ def send_approval_request_actions(title: str, video_id: str, youtube_preview_url
         return
 
     actions_url = f"https://github.com/{app_repo}/actions/workflows/approve-publish.yml"
+    # Deliberately plain text, no parse_mode. AI-generated titles can contain
+    # underscores, asterisks, brackets, etc. that Telegram's Markdown parser
+    # treats as (unbalanced) formatting -- that mismatch is exactly what
+    # caused a 400 "can't parse entities" error here before, which then got
+    # mislabeled as a YouTube upload failure since it happened right after
+    # a successful upload. Plain text can never hit that failure mode.
     text = (
         f"🎬 New video ready for review:\n\n"
-        f"*{title}*\n\n"
+        f"{title}\n\n"
         f"Preview (private, only you can see it): {youtube_preview_url}\n\n"
-        f"To publish: open Actions, run *Approve & Publish Video*, and paste this video ID:\n"
-        f"`{video_id}`\n\n"
+        f"To publish: open Actions, run \"Approve & Publish Video\", and paste this video ID:\n"
+        f"{video_id}\n\n"
         f"Ignore this message to leave it private."
     )
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
         "reply_markup": {
             "inline_keyboard": [[{"text": "▶️ Open Actions to Approve", "url": actions_url}]]
         },
