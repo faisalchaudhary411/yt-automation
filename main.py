@@ -601,6 +601,7 @@ def _save_checkpoint(work_dir: str, stage: str, script: dict, params: dict):
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     os.replace(tmp_path, path)  # atomic -- avoids a half-written checkpoint if the process dies mid-write
+    print(f"[checkpoint] Saved at stage={stage} -> {path}")
 
 
 def _load_checkpoint(work_dir: str):
@@ -914,7 +915,8 @@ def run_pipeline_job(
             "status": "ready_for_review",
         }
 
-        # --- Stage 2: upload as private + Telegram approval gate ---
+        # --- Stage 2: upload as private ---
+        upload_succeeded = False
         try:
             _set_progress(job_id, "uploading", 0.0, detail="Uploading to YouTube as private…")
             print("[5/5] Uploading to YouTube as private")
@@ -944,18 +946,13 @@ def run_pipeline_job(
                 "preview_url": preview_url,
                 "status": "pending_approval",
             })
-
-            # Approval now happens via the "Approve & Publish Video" GitHub
-            # Actions workflow (scripts/approve_publish.py), not this Replit
-            # route -- that way publishing works even if the Replit
-            # workspace is asleep or the preview URL has changed.
-            send_approval_request_actions(script["title"], video_id, preview_url, APP_GITHUB_REPO)
+            upload_succeeded = True
             job_step = "pending_approval"
             _set_progress(job_id, "uploading", 1.0, detail="Uploaded, awaiting approval")
         except Exception as e:
             # Upload failing shouldn't hide the fact that the video itself rendered fine —
             # the local file is still downloadable from the UI either way.
-            print(f"Warning: YouTube upload/notify failed ({e}). Video is still available locally.")
+            print(f"Warning: YouTube upload failed ({e}). Video is still available locally.")
             result["upload_error"] = str(e)
             job_step = "done"
             try:
@@ -966,6 +963,24 @@ def run_pipeline_job(
                 )
             except Exception as telegram_e:
                 print(f"Warning: failure-notification Telegram message also failed ({telegram_e}).")
+
+        # --- Telegram approval notification -- deliberately its own try/except ---
+        # so that a Telegram-side failure (bad chat ID, message formatting
+        # error, etc.) can never get mislabeled as a YouTube upload failure,
+        # and never rolls back an upload that actually succeeded.
+        if upload_succeeded:
+            try:
+                # Approval happens via the "Approve & Publish Video" GitHub
+                # Actions workflow (scripts/approve_publish.py), not this
+                # Replit route -- that way publishing works even if the
+                # Replit workspace is asleep or the preview URL has changed.
+                send_approval_request_actions(script["title"], video_id, preview_url, APP_GITHUB_REPO)
+            except Exception as e:
+                print(f"Warning: Telegram approval notification failed ({e}). "
+                      "The video uploaded fine and is waiting privately on YouTube -- "
+                      "open the Actions tab manually and run Approve & Publish Video with "
+                      f"this video ID: {video_id}")
+                result["telegram_error"] = str(e)
 
         # Log this draft to the GitHub state repo so nothing is lost between runs
         try:
