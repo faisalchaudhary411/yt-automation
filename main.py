@@ -1088,6 +1088,28 @@ def status_endpoint(job_id):
             "resume_url": f"/resume/{job_id}",
         })
 
+    # No checkpoint either -- but that's ALSO what a job that finished
+    # completely looks like (checkpoints get cleared on success). Before
+    # reporting a scary "failed, nothing to resume" message for a job that
+    # actually succeeded, check whether it shows up as a completed draft in
+    # the state repo. This is exactly the confusing case that happens when
+    # the workspace goes to sleep shortly *after* a render finishes (upload
+    # done, checkpoint cleared) but before you checked back in on it.
+    try:
+        history = github_read_json("drafts.json", default=[])
+        matching = [d for d in history if d.get("job_id") == job_id]
+    except Exception:
+        matching = []
+    if matching:
+        draft = matching[-1]
+        return jsonify({
+            "step": draft.get("status", "done"),
+            "progress": 100,
+            "detail": "This job actually finished successfully before the connection dropped -- "
+                      "it wasn't lost, it just wasn't shown to you.",
+            "result": draft,
+        })
+
     return jsonify({"error": "Unknown job_id"}), 404
 
 
