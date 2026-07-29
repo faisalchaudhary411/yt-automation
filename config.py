@@ -139,7 +139,7 @@ EXTRA_SUBTITLE_LANGUAGES = []
 SHORTS_ENABLED = True
 SHORTS_COUNT = 1
 SHORTS_DURATION_SECONDS = 45
-DEFAULT_VOICE_GENDER = "male"
+DEFAULT_VOICE_GENDER = "female"
 
 # Video style presets: each shapes the narrator's tone (via the script prompt)
 # AND the visual/audio treatment -- intro/outro/chapter card color + accent bar,
