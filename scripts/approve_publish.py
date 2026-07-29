@@ -26,27 +26,24 @@ matching .github/workflows/approve-publish.yml):
     TELEGRAM_BOT_TOKEN             (optional but recommended)
     TELEGRAM_CHAT_ID               (optional but recommended)
 
-Note on captions: this now works. The .srt file is persisted to the GitHub
-state repo (as captions/<job_id>.srt) at render time, since the Actions
-runner has no access to Replit's local disk where it was originally saved.
-This script fetches it from the state repo and uploads it as a caption
-track. If a given draft has no srt_state_path (e.g. subtitles were disabled,
-or it was rendered before this feature existed), captions are skipped for
-that video and everything else still proceeds normally.
+Note on captions: captions are now attached immediately when the video is
+first uploaded as private, back in main.py -- not deferred to this
+approval step anymore. This script no longer touches captions at all, so a
+draft's srt_state_path/extra_srt_state_paths fields are only used by
+main.py, not read here.
 """
 
 import os
 import sys
-import tempfile
 
 # Make sibling modules (config.py, youtube_auth.py, youtube_uploader.py,
 # telegram_notifier.py, automation/) importable when this script is run as
 # `python scripts/approve_publish.py` from the repo root or via Actions.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import github_read_json, github_write_json, github_read_file, DEFAULT_LANGUAGE
+from config import github_read_json, github_write_json
 from youtube_auth import get_access_token
-from youtube_uploader import publish_video, upload_captions
+from youtube_uploader import publish_video
 from telegram_notifier import send_message
 
 
@@ -76,54 +73,22 @@ def main():
     publish_video(video_id, access_token)
     print("Publish call succeeded.")
 
+    published_shorts = []
+    for short_video_id in (draft.get("shorts_video_ids") or []):
+        try:
+            publish_video(short_video_id, access_token)
+            published_shorts.append(short_video_id)
+            print(f"Published short: {short_video_id}")
+        except Exception as e:
+            print(f"Warning: publishing short {short_video_id} failed ({e}). "
+                  "It stays private -- publish it manually on YouTube if needed.")
+
     draft["status"] = "published"
     github_write_json("drafts.json", history, message=f"Mark published: {draft.get('title', video_id)}")
     print("drafts.json updated in state repo.")
 
     # --- Stage 3 post-publish hooks (each independent and non-fatal) ---
     notes = []
-
-    try:
-        srt_state_path = draft.get("srt_state_path")
-        if srt_state_path:
-            srt_bytes = github_read_file(srt_state_path)
-            if srt_bytes:
-                with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
-                    tmp.write(srt_bytes)
-                    tmp_srt_path = tmp.name
-                try:
-                    upload_captions(video_id, tmp_srt_path, draft.get("language", DEFAULT_LANGUAGE), access_token)
-                    notes.append("captions uploaded")
-                finally:
-                    os.remove(tmp_srt_path)
-            else:
-                print(f"Warning: srt_state_path={srt_state_path!r} set on draft but not found in state repo.")
-        else:
-            print("No srt_state_path on this draft -- skipping captions "
-                  "(subtitles disabled, or this job predates the captions-in-state-repo fix).")
-    except Exception as e:
-        print(f"Warning: captions upload failed ({e})")
-
-    # Extra (translated) caption tracks, if any were generated for this
-    # video -- each one is a separate, independent YouTube caption track in
-    # a language the video wasn't narrated in.
-    for extra_lang, extra_state_path in (draft.get("extra_srt_state_paths") or {}).items():
-        try:
-            extra_bytes = github_read_file(extra_state_path)
-            if not extra_bytes:
-                print(f"Warning: extra_srt_state_paths[{extra_lang!r}]={extra_state_path!r} not found in state repo.")
-                continue
-            with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tmp:
-                tmp.write(extra_bytes)
-                tmp_extra_path = tmp.name
-            try:
-                upload_captions(video_id, tmp_extra_path, extra_lang, access_token,
-                                 name=f"{extra_lang} (auto-translated)")
-                notes.append(f"{extra_lang} captions uploaded")
-            finally:
-                os.remove(tmp_extra_path)
-        except Exception as e:
-            print(f"Warning: extra caption upload for '{extra_lang}' failed ({e})")
 
     try:
         from automation import comments as comment_automation
@@ -146,6 +111,8 @@ def main():
         print(f"Warning: analytics baseline failed ({e})")
 
     try:
+        if published_shorts:
+            notes.append(f"{len(published_shorts)} short(s) published")
         extra = f" ({', '.join(notes)})" if notes else ""
         send_message(f"✅ Published: {draft.get('title', video_id)}{extra}\nhttps://youtube.com/watch?v={video_id}")
     except Exception as e:
