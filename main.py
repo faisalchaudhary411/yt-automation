@@ -361,7 +361,7 @@ PAGE = """
         <label><input type="checkbox" id="includeOutro" checked> Add outro / subscribe card</label>
       </div>
 
-      <button type="submit" id="genBtn">Generate</button>
+      <button type="submit" id="genBtn" disabled>Generate (loading…)</button>
     </form>
 
     <div id="progressWrap" style="display:none;">
@@ -391,13 +391,34 @@ const progressPercent = document.getElementById("progressPercent");
 const resultEl = document.getElementById("result");
 const btn = document.getElementById("genBtn");
 
-// Prefill the topic box when arriving from the Trending ideas page (/?topic=…)
-const prefillTopic = new URLSearchParams(window.location.search).get("topic");
-if (prefillTopic) { document.getElementById("topic").value = prefillTopic; }
+// This script only starts running once it's fully downloaded and parsed --
+// on a slow connection there's a real window where the page is visible and
+// tappable before that happens. Tapping Generate during that window used to
+// fall through to the browser's native form submission (a GET to "/" with
+// every field crammed into the query string, and none of your selections
+// preserved except topic) instead of the JS-driven request. The button now
+// starts disabled in the HTML itself and is only enabled here, once this
+// line has actually run -- closing that race condition completely.
+btn.disabled = false;
+btn.textContent = "Generate";
+
+// Restore every field from the URL if present -- not just topic. This is
+// defense-in-depth for the case above: if a native fallback submission ever
+// still happens, this makes sure Male/Urdu/duration/etc. come back exactly
+// as you left them instead of silently resetting to defaults.
+const params = new URLSearchParams(window.location.search);
+if (params.get("topic")) { document.getElementById("topic").value = params.get("topic"); }
+if (params.get("brief")) { document.getElementById("brief").value = params.get("brief"); }
+if (params.get("language")) { document.getElementById("language").value = params.get("language"); }
+if (params.get("duration")) { document.getElementById("duration").value = params.get("duration"); }
+if (params.get("voiceGender")) { document.getElementById("voiceGender").value = params.get("voiceGender"); }
+if (params.get("videoStyle")) { document.getElementById("videoStyle").value = params.get("videoStyle"); }
+if (params.has("includeIntro")) { document.getElementById("includeIntro").checked = params.get("includeIntro") === "on"; }
+if (params.has("includeOutro")) { document.getElementById("includeOutro").checked = params.get("includeOutro") === "on"; }
 
 // If we just got redirected here from /resume/<job_id>, jump straight into
 // polling that job instead of showing an empty form.
-const resumeJobId = new URLSearchParams(window.location.search).get("job");
+const resumeJobId = params.get("job");
 if (resumeJobId) {
   btn.disabled = true;
   document.getElementById("progressWrap").style.display = "block";
