@@ -136,10 +136,10 @@ EXTRA_SUBTITLE_LANGUAGES = []
 # video. Each short is a vertical 9:16 clip cut from the finished long-form
 # video, uploaded privately alongside it, and published together with the
 # main video when you approve it.
-SHORTS_ENABLED = False
-SHORTS_COUNT = 3
+SHORTS_ENABLED = True
+SHORTS_COUNT = 1
 SHORTS_DURATION_SECONDS = 45
-DEFAULT_VOICE_GENDER = "female"
+DEFAULT_VOICE_GENDER = "male"
 
 # Video style presets: each shapes the narrator's tone (via the script prompt)
 # AND the visual/audio treatment -- intro/outro/chapter card color + accent bar,
