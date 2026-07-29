@@ -35,7 +35,7 @@ from config import (
     EDGE_VOICES, DEFAULT_VOICE_GENDER, VIDEO_STYLES, DEFAULT_VIDEO_STYLE, BACKGROUND_MUSIC_PATH,
     LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
     SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED, WORK_DIR, APP_GITHUB_REPO,
-    EXTRA_SUBTITLE_LANGUAGES,
+    EXTRA_SUBTITLE_LANGUAGES, SHORTS_ENABLED, SHORTS_COUNT, SHORTS_DURATION_SECONDS,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -514,10 +514,26 @@ async function poll(jobId) {
                  "<br>No Telegram approval was sent for this one — check the video below before " +
                  "deciding whether to retry the upload.</p>";
       } else if (r.preview_url) {
-        extra = "<p>Uploaded to YouTube as <b>private</b>. A Telegram message with an " +
-                "Approve &amp; Publish button has been sent.<br>" +
-                "Private preview available.</p>" +
-                "<a class='action-link' href='" + r.preview_url + "' target='_blank'>View on YouTube</a>";
+        if (r.telegram_error) {
+          extra += "<p style='color:#E0A15C; border:1px solid #E0A15C; border-radius:8px; padding:8px 10px;'>" +
+                   "⚠️ Uploaded to YouTube as <b>private</b> fine, but the Telegram notification failed: " +
+                   r.telegram_error + "<br>Open the Actions tab manually and run \"Approve & Publish Video\" " +
+                   "with this video ID: " + r.video_id + "</p>";
+        } else {
+          extra += "<p>Uploaded to YouTube as <b>private</b>. A Telegram message with an " +
+                  "Approve &amp; Publish button has been sent.<br>" +
+                  "Private preview available.</p>";
+        }
+        extra += "<a class='action-link' href='" + r.preview_url + "' target='_blank'>View on YouTube</a>";
+        if (r.thumbnail_error) {
+          extra += "<p style='color:#E0A15C; font-size:13px;'>⚠️ Custom thumbnail didn't upload (" +
+                   r.thumbnail_error + ") — YouTube's auto-generated thumbnail is showing instead. " +
+                   "This usually means the channel isn't phone-verified yet.</p>";
+        }
+        if (r.captions_error) {
+          extra += "<p style='color:#E0A15C; font-size:13px;'>⚠️ Captions didn't attach to the YouTube " +
+                   "video (" + r.captions_error + ") — the .srt is still downloadable below.</p>";
+        }
       }
       if (r.srt_url) {
         extra += "<a class='action-link' href='" + r.srt_url + "' download>Download subtitles (.srt)</a>";
@@ -788,8 +804,10 @@ def run_pipeline_job(
         # Each feature is wrapped independently: none of them may break a
         # video that already rendered successfully.
         srt_url = None
+        srt_path = None
         srt_state_path = None
         extra_srt_state_paths = {}
+        extra_srt_local_paths = {}
         try:
             if SUBTITLES_ENABLED:
                 from automation.subtitles import write_srt
@@ -842,6 +860,7 @@ def run_pipeline_job(
                             message=f"Add {extra_lang} captions: {script['title']}",
                         )
                         extra_srt_state_paths[extra_lang] = extra_state_path
+                        extra_srt_local_paths[extra_lang] = extra_srt_path
                     except Exception as e:
                         print(f"Warning: extra subtitle language '{extra_lang}' failed ({e}). "
                               "Skipping just this one language.")
@@ -934,10 +953,34 @@ def run_pipeline_job(
                     set_thumbnail(video_id, thumbnail_path, access_token)
                     print("[5/5] Custom thumbnail set on YouTube")
                 except Exception as e:
-                    # YouTube only accepts custom thumbnails from phone-verified
-                    # channels — the local JPG is still served in the result.
+                    # Most common cause: YouTube only accepts custom
+                    # thumbnails from phone-verified channels. Surfaced in
+                    # the result now instead of console-only, since this
+                    # silently leaving the auto-generated YouTube thumbnail
+                    # in place was easy to miss.
                     print(f"Warning: thumbnail upload failed ({e}). "
                           "Custom thumbnails require a phone-verified YouTube channel.")
+                    result["thumbnail_error"] = str(e)
+
+            # Captions -- uploaded now, immediately, rather than waiting for
+            # the "Approve & Publish" step. That way the private preview
+            # already has working subtitles even if you don't get to
+            # approving it for days; approve_publish.py no longer needs to
+            # do this at all.
+            if srt_path:
+                try:
+                    upload_captions(video_id, srt_path, language, access_token)
+                    print(f"[5/5] Captions uploaded ({language})")
+                except Exception as e:
+                    print(f"Warning: captions upload failed ({e}).")
+                    result["captions_error"] = str(e)
+            for extra_lang, extra_local_path in extra_srt_local_paths.items():
+                try:
+                    upload_captions(video_id, extra_local_path, extra_lang, access_token,
+                                     name=f"{extra_lang} (auto-translated)")
+                    print(f"[5/5] Extra captions uploaded ({extra_lang})")
+                except Exception as e:
+                    print(f"Warning: extra captions upload for '{extra_lang}' failed ({e}).")
 
             preview_url = f"https://youtube.com/watch?v={video_id}"
 
@@ -949,6 +992,39 @@ def run_pipeline_job(
             upload_succeeded = True
             job_step = "pending_approval"
             _set_progress(job_id, "uploading", 1.0, detail="Uploaded, awaiting approval")
+
+            # Shorts -- cut from the finished video, uploaded privately
+            # right alongside the main one. Each failure here is
+            # independent and non-fatal; the main video's success is never
+            # affected by this.
+            shorts_video_ids = []
+            if SHORTS_ENABLED:
+                try:
+                    _set_progress(job_id, "uploading", 0.0, detail="Generating Shorts…")
+                    from content_pipeline.shorts_generator import generate_shorts
+                    short_paths = generate_shorts(
+                        video_path, script["scenes"], script.get("chapters"), work_dir,
+                        include_intro=include_intro, include_outro=include_outro,
+                        crossfade_seconds=crossfade_seconds, logo_sting_seconds=logo_sting_seconds,
+                        count=SHORTS_COUNT, clip_duration=SHORTS_DURATION_SECONDS,
+                    )
+                    for i, short_path in enumerate(short_paths):
+                        try:
+                            short_title = f"{script['title']} #Shorts"[:100]
+                            short_video_id = upload_video(
+                                video_path=short_path,
+                                title=short_title,
+                                description=f"{script['description']}\n\n#Shorts",
+                                tags=script["tags"],
+                                access_token=access_token,
+                            )
+                            shorts_video_ids.append(short_video_id)
+                            print(f"[shorts] Uploaded short {i + 1}/{len(short_paths)} as private: {short_video_id}")
+                        except Exception as e:
+                            print(f"Warning: uploading short {i + 1} failed ({e}). Skipping just this one.")
+                except Exception as e:
+                    print(f"Warning: Shorts generation failed ({e}). Continuing without Shorts.")
+            result["shorts_video_ids"] = shorts_video_ids
         except Exception as e:
             # Upload failing shouldn't hide the fact that the video itself rendered fine —
             # the local file is still downloadable from the UI either way.
@@ -974,7 +1050,10 @@ def run_pipeline_job(
                 # Actions workflow (scripts/approve_publish.py), not this
                 # Replit route -- that way publishing works even if the
                 # Replit workspace is asleep or the preview URL has changed.
-                send_approval_request_actions(script["title"], video_id, preview_url, APP_GITHUB_REPO)
+                send_approval_request_actions(
+                    script["title"], video_id, preview_url, APP_GITHUB_REPO,
+                    shorts_count=len(result.get("shorts_video_ids") or []),
+                )
             except Exception as e:
                 print(f"Warning: Telegram approval notification failed ({e}). "
                       "The video uploaded fine and is waiting privately on YouTube -- "
