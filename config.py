@@ -130,6 +130,15 @@ CAPTION_FONT_SUPPORTED_LANGUAGES = {
 # A language equal to the video's own narration language is skipped
 # automatically (nothing to translate).
 EXTRA_SUBTITLE_LANGUAGES = []
+
+# Auto-generate YouTube Shorts from highlight windows of each finished
+# video. Off by default (opt-in) -- adds render time and extra uploads per
+# video. Each short is a vertical 9:16 clip cut from the finished long-form
+# video, uploaded privately alongside it, and published together with the
+# main video when you approve it.
+SHORTS_ENABLED = False
+SHORTS_COUNT = 3
+SHORTS_DURATION_SECONDS = 45
 DEFAULT_VOICE_GENDER = "female"
 
 # Video style presets: each shapes the narrator's tone (via the script prompt)

@@ -30,7 +30,8 @@ def send_message(text: str):
     resp.raise_for_status()
 
 
-def send_approval_request_actions(title: str, video_id: str, youtube_preview_url: str, app_repo: str):
+def send_approval_request_actions(title: str, video_id: str, youtube_preview_url: str, app_repo: str,
+                                   shorts_count: int = 0):
     """Notifies you a video is ready and tells you how to publish it via the
     'Approve & Publish Video' GitHub Actions workflow. This works even when
     Replit is offline or asleep -- GitHub Actions is what actually flips the
@@ -40,6 +41,8 @@ def send_approval_request_actions(title: str, video_id: str, youtube_preview_url
         return
 
     actions_url = f"https://github.com/{app_repo}/actions/workflows/approve-publish.yml"
+    shorts_line = f"\nPlus {shorts_count} Shorts, uploaded privately alongside it -- " \
+                  "approving the main video publishes those too.\n" if shorts_count else ""
     # Deliberately plain text, no parse_mode. AI-generated titles can contain
     # underscores, asterisks, brackets, etc. that Telegram's Markdown parser
     # treats as (unbalanced) formatting -- that mismatch is exactly what
@@ -48,7 +51,8 @@ def send_approval_request_actions(title: str, video_id: str, youtube_preview_url
     # a successful upload. Plain text can never hit that failure mode.
     text = (
         f"🎬 New video ready for review:\n\n"
-        f"{title}\n\n"
+        f"{title}\n"
+        f"{shorts_line}\n"
         f"Preview (private, only you can see it): {youtube_preview_url}\n\n"
         f"To publish: open Actions, run \"Approve & Publish Video\", and paste this video ID:\n"
         f"{video_id}\n\n"
