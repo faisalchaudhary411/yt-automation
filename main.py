@@ -361,7 +361,7 @@ PAGE = """
         <label><input type="checkbox" id="includeOutro" checked> Add outro / subscribe card</label>
       </div>
 
-      <button type="submit" id="genBtn" disabled>Generate (loading…)</button>
+      <button type="submit" id="genBtn">Generate</button>
     </form>
 
     <div id="progressWrap" style="display:none;">
@@ -391,21 +391,12 @@ const progressPercent = document.getElementById("progressPercent");
 const resultEl = document.getElementById("result");
 const btn = document.getElementById("genBtn");
 
-// This script only starts running once it's fully downloaded and parsed --
-// on a slow connection there's a real window where the page is visible and
-// tappable before that happens. Tapping Generate during that window used to
-// fall through to the browser's native form submission (a GET to "/" with
-// every field crammed into the query string, and none of your selections
-// preserved except topic) instead of the JS-driven request. The button now
-// starts disabled in the HTML itself and is only enabled here, once this
-// line has actually run -- closing that race condition completely.
-btn.disabled = false;
-btn.textContent = "Generate";
-
-// Restore every field from the URL if present -- not just topic. This is
-// defense-in-depth for the case above: if a native fallback submission ever
-// still happens, this makes sure Male/Urdu/duration/etc. come back exactly
-// as you left them instead of silently resetting to defaults.
+// Restore every field from the URL if present -- covers the case where a
+// tap on a very slow/unstable connection falls through to the browser's
+// native form submission (a GET to "/" with every field crammed into the
+// query string) before this script has even started running. That native
+// submission still carries every field correctly -- this just makes sure
+// they land back in the form instead of silently resetting to defaults.
 const params = new URLSearchParams(window.location.search);
 if (params.get("topic")) { document.getElementById("topic").value = params.get("topic"); }
 if (params.get("brief")) { document.getElementById("brief").value = params.get("brief"); }
@@ -1114,7 +1105,7 @@ def run_pipeline_job(
 
 @app.route("/")
 def index():
-    return render_template_string(
+    html = render_template_string(
         PAGE,
         channel_name=CHANNEL_NAME,
         languages=LANGUAGES,
@@ -1126,6 +1117,18 @@ def index():
         video_styles=VIDEO_STYLES,
         default_video_style=DEFAULT_VIDEO_STYLE,
     )
+    resp = app.response_class(html)
+    # Explicitly forbid caching anywhere in the chain -- browser, Replit's
+    # own edge/proxy layer, or anything else in front of this server. Flask
+    # sets no cache headers on its own by default, which left it up to
+    # whatever sits in front to decide -- and that's exactly what caused a
+    # stale pre-update copy of this page to keep being served even after
+    # the underlying file was already fixed and confirmed correct via curl
+    # directly against localhost.
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/generate", methods=["POST"])
