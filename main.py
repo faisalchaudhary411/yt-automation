@@ -436,29 +436,43 @@ form.addEventListener("submit", async (e) => {
   progressPercent.textContent = "0%";
   progressLabel.textContent = "Starting…";
 
-  const resp = await fetch("/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      topic, brief, language,
-      duration_minutes: duration,
-      voice_gender: voiceGender,
-      style: videoStyle,
-      include_intro: includeIntro,
-      include_outro: includeOutro
-    })
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({error: "Unknown error"}));
+  try {
+    const resp = await fetch("/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        topic, brief, language,
+        duration_minutes: duration,
+        voice_gender: voiceGender,
+        style: videoStyle,
+        include_intro: includeIntro,
+        include_outro: includeOutro
+      })
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({error: "Unknown error"}));
+      document.getElementById("progressWrap").style.display = "none";
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorStep").textContent = "Failed at: request validation";
+      document.getElementById("errorMessage").textContent = err.error;
+      btn.disabled = false;
+      return;
+    }
+    const { job_id } = await resp.json();
+    poll(job_id);
+  } catch (err) {
+    // The fetch itself failed -- most likely the Replit workspace was
+    // asleep or unreachable at the moment you clicked Generate. Before
+    // this fix, this left the button stuck disabled forever with no
+    // error shown, looking exactly like "nothing happened".
     document.getElementById("progressWrap").style.display = "none";
     document.getElementById("errorBox").style.display = "block";
-    document.getElementById("errorStep").textContent = "Failed at: request validation";
-    document.getElementById("errorMessage").textContent = err.error;
+    document.getElementById("errorStep").textContent = "Couldn't reach the server";
+    document.getElementById("errorMessage").textContent =
+      "The request to start this job never got a response (" + err.message + "). " +
+      "The workspace may have been asleep -- wait a few seconds for it to wake up, then try again.";
     btn.disabled = false;
-    return;
   }
-  const { job_id } = await resp.json();
-  poll(job_id);
 });
 
 async function poll(jobId) {
