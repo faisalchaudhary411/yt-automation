@@ -27,6 +27,8 @@ import time
 import uuid
 import threading
 import traceback
+import requests
+from groq import Groq
 from flask import Flask, request, jsonify, render_template_string, send_from_directory, redirect
 
 from config import (
@@ -36,6 +38,7 @@ from config import (
     LOGO_STING_ENABLED, CHANNEL_LOGO_PATH, LOGO_STING_DURATION,
     SUBTITLES_ENABLED, CAPTIONS_AUTO_UPLOAD, THUMBNAILS_ENABLED, WORK_DIR, APP_GITHUB_REPO,
     EXTRA_SUBTITLE_LANGUAGES, SHORTS_ENABLED, SHORTS_COUNT, SHORTS_DURATION_SECONDS,
+    CEREBRAS_API_KEY, SAMBANOVA_API_KEY, GROQ_API_KEY,
 )
 from content_pipeline.script_generator import generate_script
 from content_pipeline.tts_generator import generate_all_scene_audio
@@ -296,17 +299,38 @@ PAGE = """
     <h1>Generate a video draft</h1>
     <a class="connect-link" href="/authorize" target="_blank">Connect / reconnect YouTube channel</a>
     <a class="connect-link" href="/resumable" style="margin-left:8px;">Resume interrupted job</a>
+    <a class="connect-link" href="/llm-status" style="margin-left:8px;">Check LLM status</a>
   </div>
 </div>
 
 <div class="container">
-  {% if started_job_id %}
-  <div style="background:#16321F; border:1px solid #3FA35E; border-radius:12px; padding:16px; margin-bottom:16px; color:#D6F5DD;">
-    <strong>✅ Your video generation just started</strong> (job ID: {{ started_job_id }}).<br>
-    This runs on the server and takes 10-30+ minutes depending on length — you don't need to keep this
-    page open. You'll get a <strong>Telegram message</strong> when it's uploaded and ready to review.<br>
-    <a href="/status/{{ started_job_id }}" style="color:#8FE3A3;">Check raw status</a> ·
-    <a href="/resumable" style="color:#8FE3A3;">See interrupted/in-progress jobs</a>
+  {% if job_status %}
+    {% set r = job_status.result %}
+    {% if job_status.step in ("done", "pending_approval", "published") %}
+    <div style="background:#16321F; border:1px solid #3FA35E; border-radius:12px; padding:16px; margin-bottom:16px; color:#D6F5DD;">
+      <strong>✅ Finished:</strong> {{ r.title if r else viewing_job_id }}<br>
+      {% if r and r.preview_url %}<a href="{{ r.preview_url }}" style="color:#8FE3A3;" target="_blank">View on YouTube</a><br>{% endif %}
+      Check Telegram for the approval message if this just finished.
+    </div>
+    {% elif job_status.step == "interrupted" %}
+    <div style="background:#332B16; border:1px solid #C6A454; border-radius:12px; padding:16px; margin-bottom:16px; color:#F5EBD6;">
+      <strong>⏸ Connection lost, but nothing is lost:</strong> {{ job_status.detail }}<br>
+      <a href="/resumable" style="color:#F5EBD6; text-decoration:underline;">Go to Resume interrupted job</a>
+    </div>
+    {% elif job_status.step == "error" %}
+    <div style="background:#331A1A; border:1px solid #C65D5D; border-radius:12px; padding:16px; margin-bottom:16px; color:#F5D6D6;">
+      <strong>⚠️ Failed:</strong> {{ job_status.error or job_status.detail or "Unknown error." }}
+    </div>
+    {% else %}
+    <div style="background:#16321F; border:1px solid #3FA35E; border-radius:12px; padding:16px; margin-bottom:16px; color:#D6F5DD;">
+      <strong>⏳ Still running</strong> (job ID: {{ viewing_job_id }}): {{ job_status.detail or job_status.step }}<br>
+      This page doesn't auto-update without JavaScript — reload it any time to check progress again,
+      or just wait for the Telegram message when it's done.
+    </div>
+    {% endif %}
+  {% elif viewing_job_id %}
+  <div style="background:#331A1A; border:1px solid #C65D5D; border-radius:12px; padding:16px; margin-bottom:16px; color:#F5D6D6;">
+    <strong>⚠️ No record of job {{ viewing_job_id }}</strong> — it may predate a restart with nothing checkpointed.
   </div>
   {% elif form_error %}
   <div style="background:#331A1A; border:1px solid #C65D5D; border-radius:12px; padding:16px; margin-bottom:16px; color:#F5D6D6;">
@@ -702,6 +726,77 @@ def list_resumable_jobs():
         })
     jobs.sort(key=lambda j: j["updated_at"], reverse=True)
     return jobs
+
+
+def _check_cerebras_status():
+    if not CEREBRAS_API_KEY:
+        return {"name": "Cerebras", "configured": False, "reachable": None, "detail": "CEREBRAS_API_KEY not set"}
+    try:
+        resp = requests.get(
+            "https://api.cerebras.ai/v1/models",
+            headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            from content_pipeline import script_generator as _sg
+            used = getattr(_sg, "_cerebras_tokens_today", 0)
+            limit = getattr(_sg, "CEREBRAS_DAILY_TOKEN_LIMIT", None)
+            quota_note = f" — {used:,}/{limit:,} daily tokens used so far" if limit else ""
+            return {"name": "Cerebras", "configured": True, "reachable": True, "detail": f"OK{quota_note}"}
+        elif resp.status_code == 401:
+            return {"name": "Cerebras", "configured": True, "reachable": False, "detail": "401 — key invalid or expired"}
+        elif resp.status_code == 429:
+            return {"name": "Cerebras", "configured": True, "reachable": False, "detail": "429 — rate limited or quota exhausted right now"}
+        else:
+            return {"name": "Cerebras", "configured": True, "reachable": False, "detail": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"name": "Cerebras", "configured": True, "reachable": None, "detail": f"Couldn't reach Cerebras: {e}"}
+
+
+def _check_sambanova_status():
+    if not SAMBANOVA_API_KEY:
+        return {"name": "SambaNova", "configured": False, "reachable": None, "detail": "SAMBANOVA_API_KEY not set"}
+    try:
+        resp = requests.get(
+            "https://api.sambanova.ai/v1/models",
+            headers={"Authorization": f"Bearer {SAMBANOVA_API_KEY}"},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            return {"name": "SambaNova", "configured": True, "reachable": True, "detail": "OK"}
+        elif resp.status_code == 401:
+            return {"name": "SambaNova", "configured": True, "reachable": False, "detail": "401 — key invalid or expired"}
+        elif resp.status_code == 429:
+            return {"name": "SambaNova", "configured": True, "reachable": False, "detail": "429 — rate limited or quota exhausted right now"}
+        else:
+            return {"name": "SambaNova", "configured": True, "reachable": False, "detail": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"name": "SambaNova", "configured": True, "reachable": None, "detail": f"Couldn't reach SambaNova: {e}"}
+
+
+def _check_groq_status():
+    if not GROQ_API_KEY:
+        return {"name": "Groq", "configured": False, "reachable": None, "detail": "GROQ_API_KEY not set"}
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        models = client.models.list()
+        count = len(models.data) if hasattr(models, "data") else "?"
+        return {"name": "Groq", "configured": True, "reachable": True, "detail": f"OK ({count} models visible)"}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "invalid_api_key" in msg.lower():
+            return {"name": "Groq", "configured": True, "reachable": False, "detail": "401 — key invalid or expired"}
+        elif "429" in msg:
+            return {"name": "Groq", "configured": True, "reachable": False, "detail": "429 — rate limited or quota exhausted right now"}
+        return {"name": "Groq", "configured": True, "reachable": None, "detail": f"Couldn't reach Groq: {msg[:150]}"}
+
+
+def check_all_llm_status():
+    """Live-pings all three script-generation providers (Cerebras -> SambaNova
+    -> Groq is the actual fallback order used when generating a script).
+    Each check hits a lightweight /models-style endpoint rather than a real
+    chat completion, so checking status doesn't burn generation quota."""
+    return [_check_cerebras_status(), _check_sambanova_status(), _check_groq_status()]
 
 
 def run_pipeline_job(
@@ -1116,6 +1211,34 @@ def run_pipeline_job(
         _set_job(job_id, step="error", error=str(e), failed_step=failed_step)
 
 
+def _lookup_job_status_for_page(job_id):
+    """Server-side status lookup used to render a plain-HTML status banner
+    (no JS required) on a clean /?job=<id> URL. Mirrors status_endpoint's
+    logic but returns a dict for template rendering instead of a JSON
+    response."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job:
+        return job
+
+    work_dir = os.path.join(WORK_DIR, job_id)
+    checkpoint = _load_checkpoint(work_dir)
+    if checkpoint:
+        return {"step": "interrupted", "detail": "Connection was lost before this finished. "
+                "Visit /resumable to resume it.", "resumable": True}
+
+    try:
+        history = github_read_json("drafts.json", default=[])
+        matching = [d for d in history if d.get("job_id") == job_id]
+    except Exception:
+        matching = []
+    if matching:
+        draft = matching[-1]
+        return {"step": draft.get("status", "done"), "detail": "Finished.", "result": draft}
+
+    return None
+
+
 @app.route("/")
 def index():
     # If "topic" shows up as a GET query parameter, this isn't a plain page
@@ -1125,10 +1248,26 @@ def index():
     # silently discarding all of that, actually start the job from it. This
     # makes Generate work correctly even in a browser/environment where the
     # inline <script>'s submit handler never fires, for whatever reason.
-    started_job_id = None
-    form_error = None
+    #
+    # CRITICAL: redirect afterward to a clean URL with no "topic" param.
+    # GET requests are treated as safe/repeatable by browsers and OS tab
+    # managers -- reloading, tapping back, or Chrome silently restoring a
+    # discarded tab would all re-submit the SAME "?topic=..." URL and start
+    # a brand new job every single time, which is exactly what was
+    # happening (multiple jobs piling up, driving the memory usage that
+    # looked like a rendering bug but was actually this).
     if request.args.get("topic"):
-        started_job_id, form_error = _start_generation_job(lambda key, default: request.args.get(key, default))
+        job_id, error = _start_generation_job(lambda key, default: request.args.get(key, default))
+        if error:
+            return redirect(f"/?error={error}")
+        return redirect(f"/?job={job_id}")
+
+    started_job_id = None
+    form_error = request.args.get("error")
+    job_status = None
+    viewing_job_id = request.args.get("job")
+    if viewing_job_id:
+        job_status = _lookup_job_status_for_page(viewing_job_id)
 
     html = render_template_string(
         PAGE,
@@ -1141,8 +1280,10 @@ def index():
         default_voice_gender=DEFAULT_VOICE_GENDER,
         video_styles=VIDEO_STYLES,
         default_video_style=DEFAULT_VIDEO_STYLE,
-        started_job_id=started_job_id,
+        started_job_id=None,
         form_error=form_error,
+        job_status=job_status,
+        viewing_job_id=viewing_job_id,
     )
     resp = app.response_class(html)
     # Explicitly forbid caching anywhere in the chain -- browser, Replit's
@@ -1379,6 +1520,62 @@ RESUMABLE_PAGE = """
 @app.route("/resumable")
 def resumable_page():
     return render_template_string(RESUMABLE_PAGE, jobs=list_resumable_jobs(), channel_name=CHANNEL_NAME)
+
+
+LLM_STATUS_PAGE = """
+<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>LLM status — {{ channel_name }}</title>
+<style>
+  body { margin:0; background:#0B1220; color:#EDEAE2;
+         font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif; }
+  .container { max-width:640px; margin:0 auto; padding:20px; }
+  h1 { font-family:Georgia,serif; font-weight:400; font-size:24px; }
+  .eyebrow { font-size:12px; letter-spacing:0.16em; text-transform:uppercase;
+             color:#C6A454; font-weight:600; margin:18px 0 6px 0; }
+  .provider { border-radius:12px; padding:14px 16px; margin-bottom:12px; border:1px solid; }
+  .ok       { background:#16321F; border-color:#3FA35E; color:#D6F5DD; }
+  .warn     { background:#332B16; border-color:#C6A454; color:#F5EBD6; }
+  .bad      { background:#331A1A; border-color:#C65D5D; color:#F5D6D6; }
+  .provider .name { font-size:15px; font-weight:600; margin:0 0 4px 0; }
+  .provider .detail { font-size:13px; opacity:0.9; }
+  .nav { margin:16px 0; }
+  .nav a { color:#DFC078; font-size:13px; text-decoration:none; }
+  .refresh { display:inline-block; margin-top:10px; font-size:13px; color:#1A1305;
+             background:#C6A454; padding:8px 14px; border-radius:20px; text-decoration:none; font-weight:600; }
+</style>
+</head>
+<body>
+<div class=\"container\">
+  <p class=\"eyebrow\">{{ channel_name }}</p>
+  <h1>Script-generation providers</h1>
+  <div class=\"nav\"><a href=\"/\">&larr; Back to studio</a></div>
+  <p style=\"color:#8B93A6; font-size:13px;\">
+    Checked in fallback order — Cerebras is tried first, then SambaNova, then Groq.
+    As long as at least one shows OK, script generation will work.
+  </p>
+  {% for p in providers %}
+  <div class=\"provider {% if not p.configured %}warn{% elif p.reachable %}ok{% elif p.reachable is none %}warn{% else %}bad{% endif %}\">
+    <p class=\"name\">
+      {% if not p.configured %}⚪{% elif p.reachable %}✅{% elif p.reachable is none %}⚠️{% else %}❌{% endif %}
+      {{ p.name }}
+    </p>
+    <p class=\"detail\">{{ p.detail }}</p>
+  </div>
+  {% endfor %}
+  <a class=\"refresh\" href=\"/llm-status\">↻ Re-check now</a>
+</div>
+</body>
+</html>
+"""
+
+
+@app.route("/llm-status")
+def llm_status_page():
+    return render_template_string(LLM_STATUS_PAGE, providers=check_all_llm_status(), channel_name=CHANNEL_NAME)
 
 
 @app.route("/output/<job_id>/<path:filename>")
