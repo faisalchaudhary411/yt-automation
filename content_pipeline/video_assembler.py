@@ -742,14 +742,17 @@ def _render_title_card_png(
 # ---------------------------------------------------------------------------
 
 # 3 concurrent ffmpeg processes.
-# RAM is confirmed 7.8 GB on this Replit container (6 GB headroom available).
-# Dropping to 1280×720 (from 1920×1080) cuts per-clip memory from ~400 MB to
-# ~175 MB, so 3 simultaneous encodes peak at ~525 MB — well within budget and
-# 3× faster than serial.  Previously set to 2 after an OOM investigation;
-# the real root cause was 29 clips per 13-min video (fixed via scene formula),
-# not concurrency per se.  With 18-24 clips at 720p, 3 concurrent keeps total
-# render time for a 15-min video under ~8 minutes.
-MAX_CONCURRENT_CLIPS = 3
+# RAM budget varies enormously across where this pipeline actually runs --
+# Replit's workspace has ~7.8 GB, while Render's free tier caps out at
+# 512 MB total for the whole process. At 720p, each concurrent ffmpeg encode
+# peaks at roughly ~175 MB; 3 at once (~525 MB) is comfortable headroom on
+# Replit but exceeds Render free tier's ENTIRE memory budget before Python,
+# Pillow, or anything else even runs -- confirmed by an actual OOM kill
+# there. Defaults conservatively to 1 (fully sequential, safest on any
+# machine) and can be raised via the MAX_CONCURRENT_CLIPS env var on a
+# deployment with more RAM to spare (e.g. set to 3 on Replit's workspace,
+# or a paid Render plan with 2GB+).
+MAX_CONCURRENT_CLIPS = int(os.environ.get("MAX_CONCURRENT_CLIPS", "1"))
 X264_PRESET = "veryfast"
 # Raised from 1200 s (20 min) to 3600 s (60 min).
 # For 13-15 min videos the full render pipeline (clip encoding + music
