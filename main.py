@@ -300,6 +300,19 @@ PAGE = """
 </div>
 
 <div class="container">
+  {% if started_job_id %}
+  <div style="background:#16321F; border:1px solid #3FA35E; border-radius:12px; padding:16px; margin-bottom:16px; color:#D6F5DD;">
+    <strong>✅ Your video generation just started</strong> (job ID: {{ started_job_id }}).<br>
+    This runs on the server and takes 10-30+ minutes depending on length — you don't need to keep this
+    page open. You'll get a <strong>Telegram message</strong> when it's uploaded and ready to review.<br>
+    <a href="/status/{{ started_job_id }}" style="color:#8FE3A3;">Check raw status</a> ·
+    <a href="/resumable" style="color:#8FE3A3;">See interrupted/in-progress jobs</a>
+  </div>
+  {% elif form_error %}
+  <div style="background:#331A1A; border:1px solid #C65D5D; border-radius:12px; padding:16px; margin-bottom:16px; color:#F5D6D6;">
+    <strong>⚠️ Couldn't start that job:</strong> {{ form_error }}
+  </div>
+  {% endif %}
   <div class="card">
     <form id="genForm">
       <div class="field">
@@ -1105,6 +1118,18 @@ def run_pipeline_job(
 
 @app.route("/")
 def index():
+    # If "topic" shows up as a GET query parameter, this isn't a plain page
+    # load -- it's the browser's own native form submission (no JS
+    # intercepted it, or JS never ran at all) landing here with every field
+    # crammed into the URL. Rather than just re-showing an empty form and
+    # silently discarding all of that, actually start the job from it. This
+    # makes Generate work correctly even in a browser/environment where the
+    # inline <script>'s submit handler never fires, for whatever reason.
+    started_job_id = None
+    form_error = None
+    if request.args.get("topic"):
+        started_job_id, form_error = _start_generation_job(lambda key, default: request.args.get(key, default))
+
     html = render_template_string(
         PAGE,
         channel_name=CHANNEL_NAME,
@@ -1116,6 +1141,8 @@ def index():
         default_voice_gender=DEFAULT_VOICE_GENDER,
         video_styles=VIDEO_STYLES,
         default_video_style=DEFAULT_VIDEO_STYLE,
+        started_job_id=started_job_id,
+        form_error=form_error,
     )
     resp = app.response_class(html)
     # Explicitly forbid caching anywhere in the chain -- browser, Replit's
@@ -1131,31 +1158,35 @@ def index():
     return resp
 
 
-@app.route("/generate", methods=["POST"])
-def generate_endpoint():
-    body = request.get_json(silent=True) or {}
-    topic = request.form.get("topic") or body.get("topic")
+def _start_generation_job(get_value):
+    """Validates fields and starts a generation job. `get_value(key, default)`
+    abstracts over where the fields come from (JSON body, form POST, or GET
+    query string), so this one function backs both the JS-driven /generate
+    endpoint and the plain-HTML native-form-submission fallback on /.
+    Returns (job_id, None) on success, or (None, error_message) on failure.
+    """
+    topic = get_value("topic", None)
     if not topic:
-        return jsonify({"error": "Missing 'topic'"}), 400
+        return None, "Missing 'topic'"
 
-    brief = request.form.get("brief") or body.get("brief") or ""
+    brief = get_value("brief", "") or ""
 
-    language = request.form.get("language") or body.get("language") or DEFAULT_LANGUAGE
+    language = get_value("language", None) or DEFAULT_LANGUAGE
     if language not in LANGUAGES:
-        return jsonify({"error": f"Unsupported language '{language}'"}), 400
+        return None, f"Unsupported language '{language}'"
 
-    voice_gender = request.form.get("voice_gender") or body.get("voice_gender") or DEFAULT_VOICE_GENDER
+    voice_gender = get_value("voice_gender", None) or get_value("voiceGender", None) or DEFAULT_VOICE_GENDER
     if voice_gender not in ("female", "male"):
-        return jsonify({"error": f"Unsupported voice_gender '{voice_gender}'"}), 400
+        return None, f"Unsupported voice_gender '{voice_gender}'"
 
-    style = request.form.get("style") or body.get("style") or DEFAULT_VIDEO_STYLE
+    style = get_value("style", None) or get_value("videoStyle", None) or DEFAULT_VIDEO_STYLE
     if style not in VIDEO_STYLES:
-        return jsonify({"error": f"Unsupported style '{style}'"}), 400
+        return None, f"Unsupported style '{style}'"
 
     try:
-        duration_minutes = float(request.form.get("duration_minutes") or body.get("duration_minutes") or DEFAULT_DURATION_MINUTES)
+        duration_minutes = float(get_value("duration_minutes", None) or get_value("duration", None) or DEFAULT_DURATION_MINUTES)
     except (TypeError, ValueError):
-        return jsonify({"error": "Invalid duration_minutes"}), 400
+        return None, "Invalid duration_minutes"
     duration_minutes = max(2, min(20, duration_minutes))  # sane guardrails
 
     def _as_bool(value, default=True):
@@ -1163,10 +1194,10 @@ def generate_endpoint():
             return default
         if isinstance(value, bool):
             return value
-        return str(value).lower() not in ("false", "0", "no")
+        return str(value).lower() not in ("false", "0", "no", "off")
 
-    include_intro = _as_bool(request.form.get("include_intro") if "include_intro" in request.form else body.get("include_intro"))
-    include_outro = _as_bool(request.form.get("include_outro") if "include_outro" in request.form else body.get("include_outro"))
+    include_intro = _as_bool(get_value("include_intro", None) if get_value("include_intro", None) is not None else get_value("includeIntro", None))
+    include_outro = _as_bool(get_value("include_outro", None) if get_value("include_outro", None) is not None else get_value("includeOutro", None))
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
@@ -1178,7 +1209,19 @@ def generate_endpoint():
         daemon=True,
     )
     thread.start()
+    return job_id, None
 
+
+@app.route("/generate", methods=["POST"])
+def generate_endpoint():
+    body = request.get_json(silent=True) or {}
+
+    def get_value(key, default):
+        return request.form.get(key) or body.get(key) or default
+
+    job_id, error = _start_generation_job(get_value)
+    if error:
+        return jsonify({"error": error}), 400
     return jsonify({"job_id": job_id})
 
 
