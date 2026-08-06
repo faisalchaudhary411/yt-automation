@@ -129,7 +129,7 @@ CAPTION_FONT_SUPPORTED_LANGUAGES = {
 #   EXTRA_SUBTITLE_LANGUAGES = ["en", "hi"]
 # A language equal to the video's own narration language is skipped
 # automatically (nothing to translate).
-EXTRA_SUBTITLE_LANGUAGES = []
+EXTRA_SUBTITLE_LANGUAGES = [en]
 
 # Auto-generate YouTube Shorts from highlight windows of each finished
 # video. Off by default (opt-in) -- adds render time and extra uploads per
